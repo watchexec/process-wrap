@@ -62,7 +62,7 @@ job-object = ["dep:winapi"]
 process-group = ["dep:nix"]
 
 ## Wrapper: Process Session
-process-session = ["dep:nix"]
+process-session = ["dep:nix", "process-group"]
 
 ## Wrapper: Pty (TODO)
 pty = []

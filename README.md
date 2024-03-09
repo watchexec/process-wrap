@@ -84,15 +84,15 @@ let status = child.wait().await?;
 dbg!(status);
 ```
 
-### or with sessions and groups
+### or with sessions and kill-on-drop
 
 ```rust
 use tokio::process::Command;
-use process_wrap::tokio::TokioCommandWrap;
+use process_wrap::tokio::*;
 
 let mut child = TokioCommandWrap::new(Command::new("watch").arg("ls"))
-  .wrap(ProcessSession::leader())
-  .wrap(ProcessGroup::leader())
+  .wrap(ProcessSession)
+  .wrap(KillOnDrop)
   .spawn()?;
 let status = child.wait().await?;
 dbg!(status);
@@ -133,6 +133,15 @@ For Windows process groups, use `CreationFlags::NEW_PROCESS_GROUP` and/or `JobOb
 - Platforms: POSIX (Linux, Mac, BSDs...)
 - Like command-group <5.0.0.
 - Feature: `process-session` (default)
+
+This combines creating a new session and a new group, and setting this process as leader.
+To join the session from another process, use `ProcessGroup::attach_to()` instead.
+
+```rust
+TokioCommandWrap::new(Command::new("watch").arg("ls"))
+  .wrap(ProcessSession)
+  .spawn()?;
+```
 
 ### Pseudo terminal (pty)
 

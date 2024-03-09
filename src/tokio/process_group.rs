@@ -40,8 +40,8 @@ impl ProcessGroup {
 
 #[derive(Debug)]
 pub struct ProcessGroupChild {
-	inner: Box<dyn super::core::TokioChildWrapper>,
-	pgid: Pid,
+	pub(crate) inner: Box<dyn super::core::TokioChildWrapper>,
+	pub(crate) pgid: Pid,
 }
 
 impl super::core::TokioCommandWrapper for ProcessGroup {

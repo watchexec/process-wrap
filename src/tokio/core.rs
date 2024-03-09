@@ -125,11 +125,7 @@ pub trait TokioChildWrapper: std::fmt::Debug {
 	#[cfg(unix)]
 	fn signal(&self, sig: Signal) -> Result<()> {
 		if let Some(id) = self.id() {
-			kill(
-				Pid::from_raw(i32::try_from(id).map_err(|e| Error::other(e))?),
-				sig,
-			)
-			.map_err(Error::from)
+			kill(Pid::from_raw(i32::try_from(id).map_err(Error::other)?), sig).map_err(Error::from)
 		} else {
 			Ok(())
 		}
