@@ -28,6 +28,6 @@ impl super::core::TokioCommandWrapper for ProcessSession {
 			.expect("Command PID > i32::MAX"),
 		);
 
-		Ok(Box::new(super::ProcessGroupChild { inner, pgid }))
+		Ok(Box::new(super::ProcessGroupChild::new(inner, pgid)))
 	}
 }

@@ -98,7 +98,7 @@ pub trait TokioCommandWrapper: std::fmt::Debug {
 	}
 }
 
-pub trait TokioChildWrapper: std::fmt::Debug {
+pub trait TokioChildWrapper: std::fmt::Debug + Send + Sync {
 	fn inner(&self) -> &Child;
 	fn inner_mut(&mut self) -> &mut Child;
 	fn into_inner(self: Box<Self>) -> Child;
