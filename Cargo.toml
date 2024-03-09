@@ -77,21 +77,3 @@ all-features = true
 [dependencies]
 indexmap = "2.2.5"
 tracing = "0.1.40"
-
-[[example]]
-name = "basic"
-
-[[example]]
-name = "builder"
-
-[[example]]
-name = "async"
-required-features = ["tokio1"]
-
-[[example]]
-name = "kill_on_drop"
-required-features = ["tokio1"]
-
-[[example]]
-name = "daemon"
-required-features = ["tokio1"]
