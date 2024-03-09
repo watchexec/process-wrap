@@ -54,7 +54,7 @@ use process_wrap::tokio::*;
 let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessGroup::leader())
   .spawn()?;
-let status = child.wait().await?;
+let status = Box::into_pin(child.wait()).await?;
 dbg!(status);
 ```
 
@@ -67,7 +67,7 @@ use process_wrap::tokio::*;
 let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(JobObject::new())
   .spawn()?;
-let status = child.wait().await?;
+let status = Box::into_pin(child.wait()).await?;
 dbg!(status);
 ```
 
@@ -80,7 +80,7 @@ use process_wrap::tokio::*;
 let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessSession::leader())
   .spawn()?;
-let status = child.wait().await?;
+let status = Box::into_pin(child.wait()).await?;
 dbg!(status);
 ```
 
@@ -94,7 +94,7 @@ let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"
   .wrap(ProcessSession)
   .wrap(KillOnDrop)
   .spawn()?;
-let status = child.wait().await?;
+let status = Box::into_pin(child.wait()).await?;
 dbg!(status);
 ```
 
