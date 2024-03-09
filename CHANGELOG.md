@@ -2,6 +2,8 @@
 
 ## Next (YYYY-MM-DD)
 
+- Rename to `process-wrap` and rearchitect.
+
 ## v5.0.1 (2023-11-18)
 
 - Use [std's `process_group()`](doc.rust-lang.org/std/os/unix/process/trait.CommandExt.html#tymethod.process_group) ([#16](https://github.com/watchexec/command-group/issues/16)).

@@ -1,26 +1,23 @@
 [package]
-name = "command-group"
+name = "process-wrap"
 version = "5.0.1"
 
 authors = ["Félix Saparelli <felix@passcod.name>"]
 license = "Apache-2.0 OR MIT"
-description = "Extension to Command to spawn in a process group"
-keywords = ["command", "extension", "process", "group"]
+description = "Wrap a Command, to spawn processes in a group or session or pty etc"
+keywords = ["command", "process", "group", "session", "pty"]
 
-documentation = "https://docs.rs/command-group"
-homepage = "https://github.com/watchexec/command-group"
-repository = "https://github.com/watchexec/command-group"
+documentation = "https://docs.rs/process-wrap"
+homepage = "https://github.com/watchexec/process-wrap"
+repository = "https://github.com/watchexec/process-wrap"
 readme = "README.md"
 
 edition = "2021"
 exclude = ["/bin", "/.github"]
-rust-version = "1.68.0"
+rust-version = "1.72.0"
 
 # there are a few windows-specific ones
 autoexamples = false
-
-[dependencies]
-async-trait = { version = "0.1.74", optional = true }
 
 [dependencies.tokio]
 version = "1.33.0"
@@ -31,6 +28,7 @@ optional = true
 version = "0.27.1"
 default-features = false
 features = ["fs", "poll", "signal"]
+optional = true
 
 [target.'cfg(windows)'.dependencies.winapi]
 version = "0.3.9"
@@ -43,16 +41,42 @@ features = [
 	"tlhelp32",
 	"winbase",
 ]
+optional = true
 
 [features]
-default = []
-with-tokio = ["async-trait", "tokio"]
+default = ["std", "tokio1", "creation-flags", "job-object", "process-group", "process-session", "pty"]
+
+## Frontend: StdCommandWrap
+std = []
+
+## Frontend: TokioCommandWrap
+tokio1 = ["dep:tokio"]
+
+## Wrapper: Creation Flags
+creation-flags = ["dep:winapi"]
+
+## Wrapper: Job Object
+job-object = ["dep:winapi"]
+
+## Wrapper: Process Group
+process-group = ["dep:nix"]
+
+## Wrapper: Process Session
+process-session = ["dep:nix"]
+
+## Wrapper: Pty (TODO)
+pty = []
+
 
 [dev-dependencies]
 tokio = { version = "1.10.0", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
 
 [package.metadata.docs.rs]
 all-features = true
+
+[dependencies]
+indexmap = "2.2.5"
+tracing = "0.1.40"
 
 [[example]]
 name = "basic"
@@ -62,16 +86,12 @@ name = "builder"
 
 [[example]]
 name = "async"
-required-features = ["with-tokio"]
+required-features = ["tokio1"]
 
 [[example]]
 name = "kill_on_drop"
-required-features = ["with-tokio"]
+required-features = ["tokio1"]
 
 [[example]]
 name = "daemon"
-required-features = ["with-tokio"]
-
-[[target.'cfg(windows)'.example]]
-name = "with_flags"
-required-features = ["with-tokio"]
+required-features = ["tokio1"]
