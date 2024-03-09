@@ -16,10 +16,9 @@ jobs:
           - windows
         toolchain:
           - stable
-          - 1.68.0
+          - 1.75.0
         features:
           - default
-          - with-tokio
 
     name: "Test on ${{ matrix.platform }} with Rust ${{ matrix.toolchain }} (feat: ${{ matrix.features }})"
     runs-on: "${{ matrix.platform }}-latest"
