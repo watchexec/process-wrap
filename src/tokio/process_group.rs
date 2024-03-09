@@ -86,7 +86,7 @@ impl ProcessGroupChild {
 		killpg(self.pgid, sig).map_err(Error::from)
 	}
 
-	fn wait_imp(pgid: i32, flag: WaitPidFlag) -> Result<ControlFlow<Option<ExitStatus>>> {
+	fn wait_imp(pgid: Pid, flag: WaitPidFlag) -> Result<ControlFlow<Option<ExitStatus>>> {
 		// Wait for processes in a loop until every process in this
 		// process group has exited (this ensures that we reap any
 		// zombies that may have been created if the parent exited after
@@ -98,7 +98,7 @@ impl ProcessGroupChild {
 			// return the raw status, and we need it to convert to the
 			// std's ExitStatus.
 			let mut status: i32 = 0;
-			match unsafe { libc::waitpid(-pgid, &mut status as *mut libc::c_int, flag.bits()) } {
+			match unsafe { libc::waitpid(-pgid.as_raw(), &mut status as *mut libc::c_int, flag.bits()) } {
 				0 => {
 					// Zero should only happen if WNOHANG was passed in,
 					// and means that no processes have yet to exit.
@@ -121,7 +121,7 @@ impl ProcessGroupChild {
 					// that we started? If so, collect the exit signal,
 					// otherwise we reaped a zombie process and should
 					// continue in the loop.
-					if pgid == pid {
+					if pgid == Pid::from_raw(pid) {
 						parent_exit_status = Some(ExitStatus::from_raw(status));
 					} else {
 						// Reaped a zombie child; keep looping.
@@ -165,14 +165,13 @@ impl super::core::TokioChildWrapper for ProcessGroupChild {
 			// the time the parent exits.
 			let status = Box::into_pin(self.inner.wait()).await?;
 
-			let pgid = self.pgid.as_raw();
-
 			// Try reaping all children, if there are some that are still alive after
 			// several attempts, then spawn a blocking task to reap them.
 			for retry_attempt in 1..=MAX_RETRY_ATTEMPT {
-				if Self::wait_imp(pgid, WaitPidFlag::WNOHANG)?.is_break() {
+				if Self::wait_imp(self.pgid, WaitPidFlag::WNOHANG)?.is_break() {
 					break;
 				} else if retry_attempt == MAX_RETRY_ATTEMPT {
+					let pgid = self.pgid;
 					pin!(spawn_blocking(move || Self::wait_imp(
 						pgid,
 						WaitPidFlag::empty()
@@ -186,7 +185,7 @@ impl super::core::TokioChildWrapper for ProcessGroupChild {
 	}
 
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		match Self::wait_imp(self.pgid.as_raw(), WaitPidFlag::WNOHANG)? {
+		match Self::wait_imp(self.pgid, WaitPidFlag::WNOHANG)? {
 			ControlFlow::Break(res) => Ok(res),
 			ControlFlow::Continue(()) => self.inner.try_wait(),
 		}
