@@ -3,9 +3,10 @@ use std::{
 	io::{Error, Result},
 	ops::ControlFlow,
 	os::unix::process::ExitStatusExt,
-	process::ExitStatus,
+	process::{ExitStatus, Output},
 };
 
+use futures::future::try_join3;
 use nix::{
 	errno::Errno,
 	libc,
@@ -16,6 +17,7 @@ use nix::{
 	unistd::{setpgid, Pid},
 };
 use tokio::{
+	io::{AsyncRead, AsyncReadExt},
 	process::{Child, Command},
 	task::spawn_blocking,
 };
@@ -219,6 +221,37 @@ impl TokioChildWrapper for ProcessGroupChild {
 				Ok(exited)
 			}
 		}
+	}
+
+	fn wait_with_output(mut self: Box<Self>) -> Box<dyn Future<Output = Result<Output>>> {
+		Box::new(async move {
+			async fn read_to_end<A: AsyncRead + Unpin>(io: &mut Option<A>) -> Result<Vec<u8>> {
+				let mut vec = Vec::new();
+				if let Some(io) = io.as_mut() {
+					io.read_to_end(&mut vec).await?;
+				}
+				Ok(vec)
+			}
+
+			let mut stdout_pipe = self.stdout().take();
+			let mut stderr_pipe = self.stderr().take();
+
+			let stdout_fut = read_to_end(&mut stdout_pipe);
+			let stderr_fut = read_to_end(&mut stderr_pipe);
+
+			let (status, stdout, stderr) =
+				try_join3(Box::into_pin(self.wait()), stdout_fut, stderr_fut).await?;
+
+			// Drop happens after `try_join` due to <https://github.com/tokio-rs/tokio/issues/4309>
+			drop(stdout_pipe);
+			drop(stderr_pipe);
+
+			Ok(Output {
+				status,
+				stdout,
+				stderr,
+			})
+		})
 	}
 
 	fn signal(&self, sig: Signal) -> Result<()> {

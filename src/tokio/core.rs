@@ -3,7 +3,7 @@ use std::{
 	ffi::OsStr,
 	future::Future,
 	io::{Error, Result},
-	process::ExitStatus,
+	process::{ExitStatus, Output},
 };
 
 use indexmap::IndexMap;
@@ -127,12 +127,16 @@ pub trait TokioChildWrapper: std::fmt::Debug + Send + Sync {
 		self.inner_mut().start_kill()
 	}
 
+	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+		self.inner_mut().try_wait()
+	}
+
 	fn wait(&mut self) -> Box<dyn Future<Output = Result<ExitStatus>> + '_> {
 		Box::new(self.inner_mut().wait())
 	}
 
-	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		self.inner_mut().try_wait()
+	fn wait_with_output(self: Box<Self>) -> Box<dyn Future<Output = Result<Output>>> {
+		Box::new(self.into_inner().wait_with_output())
 	}
 
 	#[cfg(unix)]
