@@ -192,4 +192,4 @@ Implementing a wrapper is done via a set of traits.
 - `kill-on-drop`: **default**, enables the [kill on drop](#kill-on-drop) wrapper.
 - `process-group`: **default**, enables the [process group](#process-group) wrapper.
 - `process-session`: **default**, enables the [process session](#process-session) wrapper.
-- `pty`: **default**, enables the [pseudo terminal](#pseudo-terminal-pty) wrapper.
+- `pty`: enables the [pseudo terminal](#pseudo-terminal-pty) wrapper.

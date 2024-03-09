@@ -44,7 +44,7 @@ features = [
 optional = true
 
 [features]
-default = ["std", "tokio1", "creation-flags", "job-object", "process-group", "process-session", "pty"]
+default = ["std", "tokio1", "creation-flags", "job-object", "process-group", "process-session"]
 
 ## Frontend: StdCommandWrap
 std = []
