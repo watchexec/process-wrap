@@ -1,8 +1,9 @@
 use std::{
-	any::TypeId,
+	any::{Any, TypeId},
 	ffi::OsStr,
 	future::Future,
 	io::{Error, Result},
+	mem::{replace, take},
 	process::{ExitStatus, Output},
 };
 
@@ -44,25 +45,58 @@ impl TokioCommandWrap {
 		self
 	}
 
-	pub fn spawn(&mut self) -> Result<Box<dyn TokioChildWrapper>> {
-		for (id, wrapper) in &mut self.wrappers {
+	// poor man's try..finally block
+	#[inline]
+	fn spawn_inner(
+		&self,
+		command: &mut Command,
+		wrappers: &mut IndexMap<TypeId, Box<dyn TokioCommandWrapper>>,
+	) -> Result<Box<dyn TokioChildWrapper>> {
+		for (id, wrapper) in wrappers.iter_mut() {
 			debug!(?id, "pre_spawn");
-			wrapper.pre_spawn(&mut self.command)?;
+			wrapper.pre_spawn(command, self)?;
 		}
 
-		let mut child = self.command.spawn()?;
-		for (id, wrapper) in &mut self.wrappers {
+		let mut child = command.spawn()?;
+		for (id, wrapper) in wrappers.iter_mut() {
 			debug!(?id, "post_spawn");
-			wrapper.post_spawn(&mut child)?;
+			wrapper.post_spawn(&mut child, self)?;
 		}
 
 		let mut child = Box::new(child) as Box<dyn TokioChildWrapper>;
-		for (id, wrapper) in &mut self.wrappers {
+		for (id, wrapper) in wrappers.iter_mut() {
 			debug!(?id, "wrap_child");
-			child = wrapper.wrap_child(child)?;
+			child = wrapper.wrap_child(child, self)?;
 		}
 
 		Ok(child)
+	}
+
+	pub fn spawn(&mut self) -> Result<Box<dyn TokioChildWrapper>> {
+		let mut command = replace(&mut self.command, Command::new(""));
+		let mut wrappers = take(&mut self.wrappers);
+
+		let res = self.spawn_inner(&mut command, &mut wrappers);
+
+		self.command = command;
+		self.wrappers = wrappers;
+
+		res
+	}
+
+	pub fn has_wrap<W: TokioCommandWrapper + 'static>(&self) -> bool {
+		let typeid = TypeId::of::<W>();
+		self.wrappers.contains_key(&typeid)
+	}
+
+	pub fn get_wrap<W: TokioCommandWrapper + 'static>(&self) -> Option<&W> {
+		let typeid = TypeId::of::<W>();
+		self.wrappers.get(&typeid).map(|w| {
+			let w_any = w as &dyn Any;
+			w_any
+				.downcast_ref()
+				.expect("downcasting is guaranteed to succeed due to wrap()'s internals")
+		})
 	}
 }
 
@@ -82,17 +116,22 @@ pub trait TokioCommandWrapper: std::fmt::Debug {
 	// downcasting fails, instead of potentially causing UB
 	fn extend(&mut self, _other: Box<dyn TokioCommandWrapper>) {}
 
-	fn pre_spawn(&mut self, _command: &mut Command) -> Result<()> {
+	fn pre_spawn(&mut self, _command: &mut Command, _core: &TokioCommandWrap) -> Result<()> {
 		Ok(())
 	}
 
-	fn post_spawn(&mut self, _child: &mut tokio::process::Child) -> Result<()> {
+	fn post_spawn(
+		&mut self,
+		_child: &mut tokio::process::Child,
+		_core: &TokioCommandWrap,
+	) -> Result<()> {
 		Ok(())
 	}
 
 	fn wrap_child(
 		&mut self,
 		child: Box<dyn TokioChildWrapper>,
+		_core: &TokioCommandWrap,
 	) -> Result<Box<dyn TokioChildWrapper>> {
 		Ok(child)
 	}

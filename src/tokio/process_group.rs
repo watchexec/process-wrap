@@ -22,7 +22,7 @@ use tokio::{
 	task::spawn_blocking,
 };
 
-use super::{TokioChildWrapper, TokioCommandWrapper};
+use super::{TokioChildWrapper, TokioCommandWrap, TokioCommandWrapper};
 
 #[derive(Debug, Clone)]
 pub struct ProcessGroup {
@@ -65,7 +65,7 @@ impl ProcessGroupChild {
 }
 
 impl TokioCommandWrapper for ProcessGroup {
-	fn pre_spawn(&mut self, command: &mut Command) -> Result<()> {
+	fn pre_spawn(&mut self, command: &mut Command, _core: &TokioCommandWrap) -> Result<()> {
 		#[cfg(tokio_unstable)]
 		{
 			command.process_group(self.leader.as_raw());
@@ -87,6 +87,7 @@ impl TokioCommandWrapper for ProcessGroup {
 	fn wrap_child(
 		&mut self,
 		inner: Box<dyn TokioChildWrapper>,
+		_core: &TokioCommandWrap,
 	) -> Result<Box<dyn TokioChildWrapper>> {
 		let pgid = Pid::from_raw(
 			i32::try_from(
