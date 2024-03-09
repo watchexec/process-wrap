@@ -38,7 +38,7 @@ process-wrap = "6.0.0"
 use std::process::Command;
 use process_wrap::std::*;
 
-let mut child = StdCommandWrap::new(Command::new("watch").arg("ls"))
+let mut child = StdCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessGroup::leader())
   .spawn()?;
 let status = child.wait()?;
@@ -51,7 +51,7 @@ dbg!(status);
 use tokio::process::Command;
 use process_wrap::tokio::*;
 
-let mut child = TokioCommandWrap::new(Command::new("watch").arg("ls"))
+let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessGroup::leader())
   .spawn()?;
 let status = child.wait().await?;
@@ -64,7 +64,7 @@ dbg!(status);
 use tokio::process::Command;
 use process_wrap::tokio::*;
 
-let mut child = TokioCommandWrap::new(Command::new("watch").arg("ls"))
+let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(JobObject::new())
   .spawn()?;
 let status = child.wait().await?;
@@ -77,20 +77,20 @@ dbg!(status);
 use tokio::process::Command;
 use process_wrap::tokio::*;
 
-let mut child = TokioCommandWrap::new(Command::new("watch").arg("ls"))
+let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessSession::leader())
   .spawn()?;
 let status = child.wait().await?;
 dbg!(status);
 ```
 
-### or with sessions and kill-on-drop
+### or with multiple wrappers
 
 ```rust
 use tokio::process::Command;
 use process_wrap::tokio::*;
 
-let mut child = TokioCommandWrap::new(Command::new("watch").arg("ls"))
+let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessSession)
   .wrap(KillOnDrop)
   .spawn()?;
@@ -113,7 +113,7 @@ dbg!(status);
 - Feature: `process-group` (default)
 
 ```rust
-TokioCommandWrap::new(Command::new("watch").arg("ls"))
+TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessGroup::leader())
   .spawn()?;
 ```
@@ -121,7 +121,7 @@ TokioCommandWrap::new(Command::new("watch").arg("ls"))
 Or join a different group instead:
 
 ```rust
-TokioCommandWrap::new(Command::new("watch").arg("ls"))
+TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessGroup::attach_to(pgid))
   .spawn()?;
 ```
@@ -138,7 +138,7 @@ This combines creating a new session and a new group, and setting this process a
 To join the session from another process, use `ProcessGroup::attach_to()` instead.
 
 ```rust
-TokioCommandWrap::new(Command::new("watch").arg("ls"))
+TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessSession)
   .spawn()?;
 ```
@@ -159,7 +159,7 @@ This is a shim to allow setting Windows process creation flags with this API, as
 Note the `CREATE_SUSPENDED` will always be set, as it is required for the crate to function.
 
 ```rust
-TokioCommandWrap::new(Command::new("watch").arg("ls"))
+TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(CreationFlags::NO_WINDOW | CreationFlags::DETACHED)
   .wrap(JobObject::new())
   .spawn()?;
@@ -168,7 +168,7 @@ TokioCommandWrap::new(Command::new("watch").arg("ls"))
 Or with custom flags:
 
 ```rust
-TokioCommandWrap::new(Command::new("watch").arg("ls"))
+TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(CreationFlags::custom(CREATE_NEW_CONSOLE | CREATE_PROTECTED_PROCESS))
   .wrap(JobObject::new())
   .spawn()?;
@@ -183,7 +183,7 @@ TokioCommandWrap::new(Command::new("watch").arg("ls"))
 This is a shim to allow wrappers to handle the kill-on-drop flag, as it can't be read from Command.
 
 ```rust
-let child = TokioCommandWrap::new(Command::new("watch").arg("ls"))
+let child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(KillOnDrop)
   .wrap(ProcessGroup::leader())
   .spawn()?;

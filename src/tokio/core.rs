@@ -1,5 +1,6 @@
 use std::{
 	any::TypeId,
+	ffi::OsStr,
 	future::Future,
 	io::{Error, Result},
 	process::ExitStatus,
@@ -20,7 +21,9 @@ pub struct TokioCommandWrap {
 }
 
 impl TokioCommandWrap {
-	pub fn new(command: Command) -> Self {
+	pub fn with_new(program: impl AsRef<OsStr>, init: impl FnOnce(&mut Command)) -> Self {
+		let mut command = Command::new(program);
+		init(&mut command);
 		Self {
 			command,
 			wrappers: IndexMap::new(),
@@ -41,14 +44,13 @@ impl TokioCommandWrap {
 		self
 	}
 
-	pub fn spawn(mut self) -> Result<Box<dyn TokioChildWrapper>> {
-		let mut command = self.command;
+	pub fn spawn(&mut self) -> Result<Box<dyn TokioChildWrapper>> {
 		for (id, wrapper) in &mut self.wrappers {
 			debug!(?id, "pre_spawn");
-			wrapper.pre_spawn(&mut command)?;
+			wrapper.pre_spawn(&mut self.command)?;
 		}
 
-		let mut child = command.spawn()?;
+		let mut child = self.command.spawn()?;
 		for (id, wrapper) in &mut self.wrappers {
 			debug!(?id, "post_spawn");
 			wrapper.post_spawn(&mut child)?;
@@ -61,6 +63,15 @@ impl TokioCommandWrap {
 		}
 
 		Ok(child)
+	}
+}
+
+impl From<Command> for TokioCommandWrap {
+	fn from(command: Command) -> Self {
+		Self {
+			command,
+			wrappers: IndexMap::new(),
+		}
 	}
 }
 
