@@ -156,20 +156,12 @@ TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
 
 This is a shim to allow setting Windows process creation flags with this API, as otherwise they'd be overwritten.
 
-Note the `CREATE_SUSPENDED` will always be set, as it is required for the crate to function.
+Note that `CREATE_SUSPENDED` will always be set, as it is required for the crate to function.
 
 ```rust
+use windows::Win32::System::Threading::*;
 TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
-  .wrap(CreationFlags::NO_WINDOW | CreationFlags::DETACHED)
-  .wrap(JobObject::new())
-  .spawn()?;
-```
-
-Or with custom flags:
-
-```rust
-TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
-  .wrap(CreationFlags::custom(CREATE_NEW_CONSOLE | CREATE_PROTECTED_PROCESS))
+  .wrap(CreationFlags(CREATE_NO_WINDOW | CREATE_DETACHED))
   .wrap(JobObject::new())
   .spawn()?;
 ```
