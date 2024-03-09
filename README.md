@@ -114,8 +114,15 @@ dbg!(status);
 
 ```rust
 TokioCommandWrap::new(Command::new("watch").arg("ls"))
-  .wrap(CreationFlags::NO_WINDOW | CreationFlags::DETACHED)
-  .wrap(JobObject::new())
+  .wrap(ProcessGroup::leader())
+  .spawn()?;
+```
+
+Or join a different group instead:
+
+```rust
+TokioCommandWrap::new(Command::new("watch").arg("ls"))
+  .wrap(ProcessGroup::attach_to(pgid))
   .spawn()?;
 ```
 
