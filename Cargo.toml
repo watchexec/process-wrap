@@ -14,7 +14,7 @@ readme = "README.md"
 
 edition = "2021"
 exclude = ["/bin", "/.github"]
-rust-version = "1.72.0"
+rust-version = "1.75.0"
 
 # there are a few windows-specific ones
 autoexamples = false
