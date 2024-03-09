@@ -27,7 +27,7 @@ impl TokioCommandWrap {
 		}
 	}
 
-	pub fn wrap<W: TokioCommandWrapper + 'static>(&mut self, wrapper: W) {
+	pub fn wrap<W: TokioCommandWrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
 		let typeid = TypeId::of::<W>();
 		let mut wrapper = Some(Box::new(wrapper));
 		let extant = self
@@ -37,6 +37,8 @@ impl TokioCommandWrap {
 		if let Some(wrapper) = wrapper {
 			extant.extend(wrapper);
 		}
+
+		self
 	}
 
 	pub fn spawn(mut self) -> Result<Box<dyn TokioChildWrapper>> {
