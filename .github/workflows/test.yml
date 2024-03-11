@@ -18,7 +18,8 @@ jobs:
           - stable
           - 1.75.0
         features:
-          - default
+          - tokio1
+          - std
 
     name: "Test on ${{ matrix.platform }} with Rust ${{ matrix.toolchain }} (feat: ${{ matrix.features }})"
     runs-on: "${{ matrix.platform }}-latest"
