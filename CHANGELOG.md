@@ -1,10 +1,6 @@
-# Changelog
-
-## Next (YYYY-MM-DD)
-
-- Rename to `process-wrap` and rearchitect.
-- Require Rust 1.75 for async trait in trait.
-- Windows: setting `CREATE_SUSPENDED` leaves the process suspended after spawn.
+- **Repo**: Rename to `process-wrap` and rearchitect.
+- **Repo**: Require Rust 1.75 for async trait in trait.
+- **Tweak**: Windows: setting `CREATE_SUSPENDED` leaves the process suspended after spawn.
 
 ## v5.0.1 (2023-11-18)
 
