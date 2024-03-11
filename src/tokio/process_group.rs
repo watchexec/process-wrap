@@ -20,6 +20,8 @@ use tokio::{
 	task::spawn_blocking,
 };
 
+use crate::ChildExitStatus;
+
 use super::{TokioChildWrapper, TokioCommandWrap, TokioCommandWrapper};
 
 #[derive(Debug, Clone)]
@@ -44,12 +46,6 @@ pub struct ProcessGroupChild {
 	inner: Box<dyn TokioChildWrapper>,
 	exit_status: ChildExitStatus,
 	pgid: Pid,
-}
-
-#[derive(Debug)]
-enum ChildExitStatus {
-	Running,
-	Exited(ExitStatus),
 }
 
 impl ProcessGroupChild {

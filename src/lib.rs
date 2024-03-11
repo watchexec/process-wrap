@@ -7,3 +7,10 @@
 
 #[cfg(feature = "tokio1")]
 pub mod tokio;
+
+/// Internal memoization of the exit status of a child process.
+#[derive(Debug)]
+pub(crate) enum ChildExitStatus {
+	Running,
+	Exited(std::process::ExitStatus),
+}
