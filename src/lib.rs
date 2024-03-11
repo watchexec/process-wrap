@@ -1,5 +1,6 @@
 #![doc(html_favicon_url = "https://watchexec.github.io/logo:command-group.svg")]
 #![doc(html_logo_url = "https://watchexec.github.io/logo:command-group.svg")]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 // #![warn(missing_docs)]
 
 // #[cfg(feature = "std")]
