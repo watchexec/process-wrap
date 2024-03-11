@@ -20,23 +20,37 @@ use crate::ChildExitStatus;
 
 use super::{StdChildWrapper, StdCommandWrap, StdCommandWrapper};
 
+/// Wrapper which sets the process group of a `Command`.
+///
+/// This wrapper is only available on Unix.
+///
+/// It sets the process group of a [`Command`], either to itself as the leader of a new group, or to
+/// an existing one by its PGID. See [setpgid(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/setpgid.html).
+///
+/// Process groups direct signals to all members of the group, and also serve to control job
+/// placement in foreground or background, among other actions.
+///
+/// This wrapper provides a child wrapper: [`ProcessGroupChild`].
 #[derive(Debug, Clone)]
 pub struct ProcessGroup {
 	leader: Pid,
 }
 
 impl ProcessGroup {
+	/// Create a process group wrapper setting up a new process group with the command as the leader.
 	pub fn leader() -> Self {
 		Self {
 			leader: Pid::from_raw(0),
 		}
 	}
 
+	/// Create a process group wrapper attaching the command to an existing process group ID.
 	pub fn attach_to(leader: Pid) -> Self {
 		Self { leader }
 	}
 }
 
+/// Wrapper for `Child` which ensures that all processes in the group are reaped.
 #[derive(Debug)]
 pub struct ProcessGroupChild {
 	inner: Box<dyn StdChildWrapper>,

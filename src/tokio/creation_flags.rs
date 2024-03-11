@@ -5,6 +5,13 @@ use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
 use super::{TokioCommandWrap, TokioCommandWrapper};
 
+/// Shim wrapper which sets Windows process creation flags.
+///
+/// This wrapper is only available on Windows.
+///
+/// It exists to be able to set creation flags on a `Command` and also store them in the wrapper, so
+/// that they're no overwritten by other wrappers. Notably this is the only way to use creation
+/// flags and the `JobObject` wrapper together.
 #[derive(Debug, Clone)]
 pub struct CreationFlags(pub PROCESS_CREATION_FLAGS);
 

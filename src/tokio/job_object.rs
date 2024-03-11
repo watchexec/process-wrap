@@ -21,6 +21,15 @@ use super::CreationFlags;
 use super::KillOnDrop;
 use super::{TokioChildWrapper, TokioCommandWrap, TokioCommandWrapper};
 
+/// Wrapper which creates a job object context for a `Command`.
+///
+/// This wrapper is only available on Windows.
+///
+/// It creates a Windows Job Object and associates the [`Command`] to it. This behaves analogously
+/// to process groups on Unix or even cgroups on Linux, with the ability to restrict resource use.
+/// See [Job Objects](https://docs.microsoft.com/en-us/windows/win32/procthread/job-objects).
+///
+/// This wrapper provides a child wrapper: [`JobObjectChild`].
 #[derive(Debug)]
 pub struct JobObject;
 
@@ -79,6 +88,7 @@ impl TokioCommandWrapper for JobObject {
 	}
 }
 
+/// Wrapper for `Child` which waits on all processes within the job.
 #[derive(Debug)]
 pub struct JobObjectChild {
 	inner: Box<dyn TokioChildWrapper>,

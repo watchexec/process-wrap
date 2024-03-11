@@ -9,6 +9,18 @@ use tracing::instrument;
 
 use super::{StdCommandWrap, StdCommandWrapper};
 
+/// Wrapper which creates a new session and group for the `Command`.
+///
+/// This wrapper is only available on Unix.
+///
+/// It creates a new session and new process group and sets the [`Command`] as its leader.
+/// See [setsid(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/setsid.html).
+///
+/// You may find that some programs behave differently or better when running in a session rather
+/// than a process group, or vice versa.
+///
+/// This wrapper uses [the same child wrapper as `ProcessGroup`](super::ProcessGroupChild) and does
+/// the same setup (plus the session setup); using both together is unnecessary and may misbehave.
 #[derive(Debug, Clone)]
 pub struct ProcessSession;
 

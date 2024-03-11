@@ -15,7 +15,7 @@ pub use core::{StdChildWrapper, StdCommandWrap, StdCommandWrapper};
 pub use creation_flags::CreationFlags;
 #[cfg(all(windows, feature = "job-object"))]
 #[doc(inline)]
-pub use job_object::JobObject;
+pub use job_object::{JobObject, JobObjectChild};
 #[cfg(feature = "kill-on-drop")]
 #[doc(inline)]
 pub use kill_on_drop::KillOnDrop;
