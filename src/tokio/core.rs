@@ -19,33 +19,10 @@ crate::generic_wrap::Wrap!(
 	TokioCommandWrap,
 	Command,
 	TokioCommandWrapper,
+	Child,
 	TokioChildWrapper,
 	|child| child
 );
-
-pub trait TokioCommandWrapper: std::fmt::Debug {
-	// process-wrap guarantees that `other` will be of the same type as `self`
-	// note that other crates that may use this trait should guarantee this, but
-	// that cannot be enforced by the type system, so you should still panic if
-	// downcasting fails, instead of potentially causing UB
-	fn extend(&mut self, _other: Box<dyn TokioCommandWrapper>) {}
-
-	fn pre_spawn(&mut self, _command: &mut Command, _core: &TokioCommandWrap) -> Result<()> {
-		Ok(())
-	}
-
-	fn post_spawn(&mut self, _child: &mut Child, _core: &TokioCommandWrap) -> Result<()> {
-		Ok(())
-	}
-
-	fn wrap_child(
-		&mut self,
-		child: Box<dyn TokioChildWrapper>,
-		_core: &TokioCommandWrap,
-	) -> Result<Box<dyn TokioChildWrapper>> {
-		Ok(child)
-	}
-}
 
 pub trait TokioChildWrapper: std::fmt::Debug + Send + Sync {
 	fn inner(&self) -> &Child;

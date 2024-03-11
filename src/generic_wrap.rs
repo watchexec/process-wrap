@@ -1,5 +1,5 @@
 macro_rules! Wrap {
-	($name:ident, $command:ty, $wrapper:ident, $childer:ident, $first_child_wrapper:expr) => {
+	($name:ident, $command:ty, $wrapper:ident, $child:ty, $childer:ident, $first_child_wrapper:expr) => {
 		#[derive(Debug)]
 		pub struct $name {
 			command: $command,
@@ -98,6 +98,30 @@ macro_rules! Wrap {
 					command,
 					wrappers: ::indexmap::IndexMap::new(),
 				}
+			}
+		}
+
+		pub trait $wrapper: ::std::fmt::Debug {
+			// process-wrap guarantees that `other` will be of the same type as `self`
+			// note that other crates that may use this trait should guarantee this, but
+			// that cannot be enforced by the type system, so you should still panic if
+			// downcasting fails, instead of potentially causing UB
+			fn extend(&mut self, _other: Box<dyn $wrapper>) {}
+
+			fn pre_spawn(&mut self, _command: &mut $command, _core: &$name) -> Result<()> {
+				Ok(())
+			}
+
+			fn post_spawn(&mut self, _child: &mut $child, _core: &$name) -> Result<()> {
+				Ok(())
+			}
+
+			fn wrap_child(
+				&mut self,
+				child: Box<dyn $childer>,
+				_core: &$name,
+			) -> Result<Box<dyn $childer>> {
+				Ok(child)
 			}
 		}
 	};
