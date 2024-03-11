@@ -107,6 +107,13 @@ dbg!(status);
 - Like command-group.
 - Feature: `job-object` (default)
 
+```rust
+use windows::Win32::System::Threading::*;
+TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+  .wrap(JobObject)
+  .spawn()?;
+```
+
 ### Process group
 
 - Platforms: POSIX (Linux, Mac, BSDs...)
@@ -156,7 +163,7 @@ This is a shim to allow setting Windows process creation flags with this API, as
 use windows::Win32::System::Threading::*;
 TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(CreationFlags(CREATE_NO_WINDOW | CREATE_DETACHED))
-  .wrap(JobObject::new())
+  .wrap(JobObject)
   .spawn()?;
 ```
 
