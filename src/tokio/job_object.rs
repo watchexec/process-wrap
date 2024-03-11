@@ -4,6 +4,7 @@ use tokio::{
 	process::{Child, Command},
 	task::spawn_blocking,
 };
+use tracing::{debug, instrument};
 use windows::Win32::{
 	Foundation::{CloseHandle, HANDLE},
 	System::Threading::CREATE_SUSPENDED,
@@ -20,10 +21,11 @@ use super::CreationFlags;
 use super::KillOnDrop;
 use super::{TokioChildWrapper, TokioCommandWrap, TokioCommandWrapper};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct JobObject;
 
 impl TokioCommandWrapper for JobObject {
+	#[instrument(level = "debug", skip(self))]
 	fn pre_spawn(&mut self, command: &mut Command, core: &TokioCommandWrap) -> Result<()> {
 		let mut flags = CREATE_SUSPENDED;
 		#[cfg(feature = "creation-flags")]
@@ -35,6 +37,7 @@ impl TokioCommandWrapper for JobObject {
 		Ok(())
 	}
 
+	#[instrument(level = "debug", skip(self))]
 	fn wrap_child(
 		&mut self,
 		inner: Box<dyn TokioChildWrapper>,
@@ -44,6 +47,19 @@ impl TokioCommandWrapper for JobObject {
 		let kill_on_drop = core.has_wrap::<KillOnDrop>();
 		#[cfg(not(feature = "kill-on-drop"))]
 		let kill_on_drop = false;
+
+		#[cfg(feature = "creation-flags")]
+		let create_suspended = core
+			.get_wrap::<CreationFlags>()
+			.map_or(false, |flags| flags.0.contains(CREATE_SUSPENDED));
+		#[cfg(not(feature = "creation-flags"))]
+		let create_suspended = false;
+
+		debug!(
+			?kill_on_drop,
+			?create_suspended,
+			"options from other wrappers"
+		);
 
 		let handle = HANDLE(
 			inner
@@ -55,14 +71,7 @@ impl TokioCommandWrapper for JobObject {
 		let job_port = make_job_object(handle, kill_on_drop)?;
 
 		// only resume if the user didn't specify CREATE_SUSPENDED
-		#[cfg(feature = "creation-flags")]
-		let resume = core
-			.get_wrap::<CreationFlags>()
-			.map_or(false, |flags| !flags.0.contains(CREATE_SUSPENDED));
-		#[cfg(not(feature = "creation-flags"))]
-		let resume = true;
-
-		if resume {
+		if !create_suspended {
 			resume_threads(handle)?;
 		}
 
@@ -78,6 +87,7 @@ pub struct JobObjectChild {
 }
 
 impl JobObjectChild {
+	#[instrument(level = "debug", skip(job_port))]
 	pub(crate) fn new(inner: Box<dyn TokioChildWrapper>, job_port: JobPort) -> Self {
 		Self {
 			inner,
@@ -104,10 +114,12 @@ impl TokioChildWrapper for JobObjectChild {
 		self.inner.into_inner()
 	}
 
+	#[instrument(level = "debug", skip(self))]
 	fn start_kill(&mut self) -> Result<()> {
 		terminate_job(self.job_port.job, 1)
 	}
 
+	#[instrument(level = "debug", skip(self))]
 	fn wait(&mut self) -> Box<dyn Future<Output = Result<ExitStatus>> + '_> {
 		Box::new(async {
 			if let ChildExitStatus::Exited(status) = &self.exit_status {
@@ -138,6 +150,7 @@ impl TokioChildWrapper for JobObjectChild {
 		})
 	}
 
+	#[instrument(level = "debug", skip(self))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
 		wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?;
 		self.inner.try_wait()

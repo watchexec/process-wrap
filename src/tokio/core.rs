@@ -20,6 +20,7 @@ use tokio::{
 };
 use tracing::debug;
 
+#[derive(Debug)]
 pub struct TokioCommandWrap {
 	command: Command,
 	wrappers: IndexMap<TypeId, Box<dyn TokioCommandWrapper>>,

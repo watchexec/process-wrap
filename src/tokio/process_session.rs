@@ -2,6 +2,7 @@ use std::io::{Error, Result};
 
 use nix::unistd::{setsid, Pid};
 use tokio::process::Command;
+use tracing::instrument;
 
 use super::{TokioCommandWrap, TokioCommandWrapper};
 
@@ -9,6 +10,7 @@ use super::{TokioCommandWrap, TokioCommandWrapper};
 pub struct ProcessSession;
 
 impl TokioCommandWrapper for ProcessSession {
+	#[instrument(level = "debug", skip(self))]
 	fn pre_spawn(&mut self, command: &mut Command, _core: &TokioCommandWrap) -> Result<()> {
 		unsafe {
 			command.pre_exec(move || setsid().map_err(Error::from).map(|_| ()));
@@ -17,6 +19,7 @@ impl TokioCommandWrapper for ProcessSession {
 		Ok(())
 	}
 
+	#[instrument(level = "debug", skip(self))]
 	fn wrap_child(
 		&mut self,
 		inner: Box<dyn super::core::TokioChildWrapper>,

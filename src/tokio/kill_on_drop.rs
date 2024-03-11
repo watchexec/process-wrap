@@ -4,7 +4,7 @@ use tokio::process::Command;
 
 use super::{TokioCommandWrap, TokioCommandWrapper};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct KillOnDrop;
 
 impl TokioCommandWrapper for KillOnDrop {

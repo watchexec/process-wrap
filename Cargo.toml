@@ -33,6 +33,7 @@ windows = { version = "0.53.0", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.33.0", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
 [features]
 default = ["creation-flags", "job-object", "process-group", "process-session"]
