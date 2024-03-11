@@ -163,7 +163,7 @@
 //!
 //! - `creation-flags`: **default**, enables the creation flags wrapper.
 //! - `job-object`: **default**, enables the job object wrapper.
-//! - `kill-on-drop`: **default**, enables the kill on drop wrapper.
+//! - `kill-on-drop`: **default**, enables the kill on drop wrapper (Tokio-only).
 //! - `process-group`: **default**, enables the process group wrapper.
 //! - `process-session`: **default**, enables the process session wrapper.
 //!

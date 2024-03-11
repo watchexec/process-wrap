@@ -170,7 +170,7 @@ TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
 
 ### Kill on drop
 
-- Platforms: all
+- Platforms: all (Tokio-only)
 - Like command-group.
 - Feature: `kill-on-drop` (default)
 
