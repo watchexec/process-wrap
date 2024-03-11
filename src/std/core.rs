@@ -234,7 +234,7 @@ fn read2(
 	use nix::{
 		errno::Errno,
 		libc,
-		poll::{poll, PollFd, PollFlags},
+		poll::{poll, PollFd, PollFlags, PollTimeout},
 	};
 	use std::{
 		io::Error,
@@ -251,12 +251,12 @@ fn read2(
 	let err_bfd = unsafe { BorrowedFd::borrow_raw(err_fd) };
 
 	let mut fds = [
-		PollFd::new(&out_bfd, PollFlags::POLLIN),
-		PollFd::new(&err_bfd, PollFlags::POLLIN),
+		PollFd::new(out_bfd, PollFlags::POLLIN),
+		PollFd::new(err_bfd, PollFlags::POLLIN),
 	];
 
 	loop {
-		poll(&mut fds, -1)?;
+		poll(&mut fds, PollTimeout::NONE)?;
 
 		if fds[0].revents().is_some() && read(&mut out_r, out_v)? {
 			set_nonblocking(err_fd, false)?;
