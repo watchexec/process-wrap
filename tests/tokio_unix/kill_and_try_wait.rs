@@ -1,4 +1,5 @@
 use super::prelude::*;
+
 #[tokio::test]
 async fn nowrap() -> Result<()> {
 	let mut child = TokioCommandWrap::with_new("yes", |command| {
@@ -18,7 +19,7 @@ async fn nowrap() -> Result<()> {
 }
 
 #[tokio::test]
-async fn group_process_group() -> Result<()> {
+async fn process_group() -> Result<()> {
 	let mut child = TokioCommandWrap::with_new("yes", |command| {
 		command.stdout(Stdio::null());
 	})
@@ -41,7 +42,7 @@ async fn group_process_group() -> Result<()> {
 }
 
 #[tokio::test]
-async fn group_process_session() -> Result<()> {
+async fn process_session() -> Result<()> {
 	let mut child = TokioCommandWrap::with_new("yes", |command| {
 		command.stdout(Stdio::null());
 	})

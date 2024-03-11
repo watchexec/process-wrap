@@ -9,7 +9,11 @@
 #[cfg(feature = "tokio1")]
 pub mod tokio;
 
-#[cfg(all(windows, feature = "job-object", any(feature = "std", feature = "tokio1")))]
+#[cfg(all(
+	windows,
+	feature = "job-object",
+	any(feature = "std", feature = "tokio1")
+))]
 mod windows;
 
 /// Internal memoization of the exit status of a child process.

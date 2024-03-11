@@ -1,4 +1,5 @@
 use super::prelude::*;
+
 #[tokio::test]
 async fn nowrap() -> Result<()> {
 	let child = TokioCommandWrap::with_new("echo", |command| {

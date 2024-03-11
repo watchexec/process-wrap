@@ -1,4 +1,5 @@
 use super::prelude::*;
+
 #[tokio::test]
 async fn nowrap() -> Result<()> {
 	let mut child = TokioCommandWrap::with_new("yes", |command| {
