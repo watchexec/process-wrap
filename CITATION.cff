@@ -1,11 +1,11 @@
 cff-version: 1.2.0
 message: If you use this software, please cite it using these metadata.
-title: "Command Group: extension to Command to spawn in a process group"
+title: "process-wrap: extensible wrappers for Rust Command APIs"
 
 version: "5.0.1"
 date-released: 2023-11-18
 
-repository-code: https://github.com/watchexec/command-group
+repository-code: https://github.com/watchexec/process-wrap
 license: Apache-2.0 OR MIT
 
 authors:

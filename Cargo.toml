@@ -4,7 +4,7 @@ version = "5.0.1"
 
 authors = ["Félix Saparelli <felix@passcod.name>"]
 license = "Apache-2.0 OR MIT"
-description = "Wrap a Command, to spawn processes in a group or session or pty etc"
+description = "Wrap a Command, to spawn processes in a group or session or job etc"
 keywords = ["command", "process", "group", "session", "pty"]
 
 documentation = "https://docs.rs/process-wrap"

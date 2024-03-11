@@ -6,5 +6,5 @@ pre-release-replacements = [
   { file = "README.md", search = "process-wrap = \\{ version = \"[0-9\\.]+\"", replace = "process-wrap = { version = \"{{version}}\"" },
   { file = "src/lib.rs", search = "process-wrap = \\{ version = \"[0-9\\.]+\"", replace = "process-wrap = { version = \"{{version}}\"" },
   { file = "CITATION.cff", search = "^version: \"[0-9\\.]+\"", replace = "version: \"{{version}}\"" },
-  { file = "CITATION.cff", search = "^date-released: [0-9-]+", replace = "date: {{date}}" },
+  { file = "CITATION.cff", search = "^date-released: [0-9-]+", replace = "date-released: {{date}}" },
 ]
