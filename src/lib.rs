@@ -73,6 +73,37 @@
 //! Methods on `Child` mimic those on `process::Child`, but may be customised by the wrappers. For
 //! example, `kill` will send a signal to the process group if the `ProcessGroup` wrapper is used.
 //!
+//! # KillOnDrop and CreationFlags
+//!
+//! The options set on an underlying `Command` are not queryable from library or user code. In most
+//! cases this is not an issue; however on Windows, the `JobObject` wrapper needs to know the value
+//! of `.kill_on_drop()` and any `.creation_flags()` set. The `KillOnDrop` and `CreationFlags` are
+//! "shims" that _should_ be used instead of the aforementioned methods on `Command`. They will
+//! internally set the values on the `Command` and also store them in the wrapper, so that wrappers
+//! are able to access them.
+//!
+//! In practice:
+//!
+//! ## Instead of `.kill_on_drop(true)`:
+//!
+//! ```rust
+//! use process_wrap::std::*;
+//! let mut command = StdCommandWrap::with_new("ls", |command| { command.arg("-l"); });
+//! command.wrap(KillOnDrop);
+//! ```
+//!
+//! ## Instead of `.creation_flags(CREATE_NO_WINDOW)`:
+//!
+//! ```rust,ignore
+//! use process_wrap::std::*;
+//! let mut command = StdCommandWrap::with_new("ls", |command| { command.arg("-l"); });
+//! command.wrap(CreationFlags(CREATE_NO_WINDOW));
+//! ```
+//!
+//! Internally the `JobObject` wrapper always sets the `CREATE_SUSPENDED` flag, but as it is able to
+//! access the `CreationFlags` value it will either resume the process after setting up, or leave it
+//! suspended if `CREATE_SUSPENDED` was explicitly set.
+//!
 //! # Extension
 //!
 //! The crate is designed to be extensible, and new wrappers can be added by implementing the
