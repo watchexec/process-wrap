@@ -1,3 +1,13 @@
+//! Tokio-based process-wrap API.
+//!
+//! See the [crate-level doc](crate) for more information.
+//!
+//! The recommended usage is to star-import this module:
+//!
+//! ```rust
+//! use process_wrap::tokio::*;
+//! ```
+
 #[doc(inline)]
 pub use core::{TokioChildWrapper, TokioCommandWrap, TokioCommandWrapper};
 #[cfg(all(windows, feature = "creation-flags"))]
