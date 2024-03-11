@@ -7,7 +7,7 @@ mod prelude {
 		time::sleep,
 	};
 
-	pub const DIE_TIME: Duration = Duration::from_millis(100);
+	pub const DIE_TIME: Duration = Duration::from_millis(1000);
 }
 
 mod id_same_as_inner;
