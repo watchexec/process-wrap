@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [6.0.1](https://github.com/watchexec/progress-wrap/compare/v6.0.0..6.0.1) - 2024-03-11
+
+
+- **Bugfix:** Std doesn't have kill-on-drop - ([5eaef93](https://github.com/watchexec/progress-wrap/commit/5eaef93d770ebd2c2307347f1d9a35b25a1dc2c1))
+- **Bugfix:** Enable kill-on-drop (tokio only) by default - ([5eaef93](https://github.com/watchexec/progress-wrap/commit/5eaef93d770ebd2c2307347f1d9a35b25a1dc2c1))
+- **Documentation:** Document that kill-on-drop is Tokio-only - ([7437914](https://github.com/watchexec/progress-wrap/commit/74379146c327d8ff68ac64ce224ec0c213af34c0))
+- **Documentation:** Fix changelog style for 6.0.0 - ([fc158c9](https://github.com/watchexec/progress-wrap/commit/fc158c90ece5ecb47f4fe014e02085d80302f660))
+
+---
 ## [6.0.0](https://github.com/watchexec/progress-wrap/compare/v5.0.1..6.0.0) - 2024-03-11
 
 
