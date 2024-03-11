@@ -8,7 +8,7 @@ use std::{
 
 use tracing::{debug, instrument};
 use windows::Win32::{
-	Foundation::{CloseHandle, HANDLE},
+	Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
 	System::{
 		Diagnostics::ToolHelp::{
 			CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
@@ -52,7 +52,7 @@ pub(crate) fn make_job_object(handle: HANDLE, kill_on_drop: bool) -> Result<JobP
 	let job = unsafe { CreateJobObjectW(None, None) }.map_err(Error::other)?;
 	debug!(?job, "done CreateJobObjectW");
 
-	let completion_port = unsafe { CreateIoCompletionPort(None, None, 0, 1) }?;
+	let completion_port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) }?;
 	debug!(?completion_port, "done CreateIoCompletionPort");
 
 	let associate_completion = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
