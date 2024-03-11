@@ -204,7 +204,11 @@ pub trait StdChildWrapper: std::fmt::Debug + Send + Sync {
 	}
 }
 
-// can't impl directly on Child as it would cause loops
+/// A thin wrapper around [`Child`].
+///
+/// This is used only because implementing [`StdChildWrapper`] directly on std's [`Child`] creates
+/// loops in the type system. It is not intended to be used directly, but only to be used internally
+/// by the library.
 #[derive(Debug)]
 pub struct StdChild(pub Child);
 

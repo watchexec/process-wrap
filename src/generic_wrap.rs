@@ -1,3 +1,8 @@
+#![cfg_attr(
+	not(any(feature = "std", feature = "tokio1")),
+	allow(unused_macros, unused_imports)
+)]
+
 macro_rules! Wrap {
 	($name:ident, $command:ty, $wrapper:ident, $child:ty, $childer:ident, $first_child_wrapper:expr) => {
 		/// A wrapper around a `Command` that allows for additional functionality to be added.
