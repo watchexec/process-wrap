@@ -5,8 +5,8 @@
 
 pub(crate) mod generic_wrap;
 
-// #[cfg(feature = "std")]
-// pub mod std;
+#[cfg(feature = "std")]
+pub mod std;
 
 #[cfg(feature = "tokio1")]
 pub mod tokio;
@@ -23,5 +23,5 @@ mod windows;
 #[derive(Debug)]
 pub(crate) enum ChildExitStatus {
 	Running,
-	Exited(std::process::ExitStatus),
+	Exited(::std::process::ExitStatus),
 }
