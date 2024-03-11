@@ -24,6 +24,7 @@ It is left to the developer to use the appropriate wrapper(s) for their use-case
 
 As the successor to (and containing a lot of the code of) command-group, versioning starts at 6.0.0.
 You can think of it as a breaking change to command-group, though the paradigm is quite different.
+The full test suite from command-group was retained: process-wrap has parity on functionality as a starting point.
 
 ## Quick start
 
@@ -78,7 +79,7 @@ use tokio::process::Command;
 use process_wrap::tokio::*;
 
 let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
-  .wrap(ProcessSession::leader())
+  .wrap(ProcessSession)
   .spawn()?;
 let status = Box::into_pin(child.wait()).await?;
 dbg!(status);
