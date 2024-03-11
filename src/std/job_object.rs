@@ -18,8 +18,6 @@ use crate::{
 
 #[cfg(feature = "creation-flags")]
 use super::CreationFlags;
-#[cfg(feature = "kill-on-drop")]
-use super::KillOnDrop;
 use super::{StdChildWrapper, StdCommandWrap, StdCommandWrapper};
 
 /// Wrapper which creates a job object context for a `Command`.
@@ -53,11 +51,6 @@ impl StdCommandWrapper for JobObject {
 		inner: Box<dyn StdChildWrapper>,
 		core: &StdCommandWrap,
 	) -> Result<Box<dyn StdChildWrapper>> {
-		#[cfg(feature = "kill-on-drop")]
-		let kill_on_drop = core.has_wrap::<KillOnDrop>();
-		#[cfg(not(feature = "kill-on-drop"))]
-		let kill_on_drop = false;
-
 		#[cfg(feature = "creation-flags")]
 		let create_suspended = core
 			.get_wrap::<CreationFlags>()
@@ -65,15 +58,11 @@ impl StdCommandWrapper for JobObject {
 		#[cfg(not(feature = "creation-flags"))]
 		let create_suspended = false;
 
-		debug!(
-			?kill_on_drop,
-			?create_suspended,
-			"options from other wrappers"
-		);
+		debug!(?create_suspended, "options from other wrappers");
 
 		let handle = HANDLE(inner.inner().as_raw_handle() as _);
 
-		let job_port = make_job_object(handle, kill_on_drop)?;
+		let job_port = make_job_object(handle, false)?;
 
 		// only resume if the user didn't specify CREATE_SUSPENDED
 		if !create_suspended {
