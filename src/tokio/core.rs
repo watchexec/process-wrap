@@ -2,18 +2,22 @@ use std::{
 	any::{Any, TypeId},
 	ffi::OsStr,
 	future::Future,
-	io::{Error, Result},
+	io::Result,
 	mem::{replace, take},
 	process::{ExitStatus, Output},
 };
 
+use futures::future::try_join3;
 use indexmap::IndexMap;
 #[cfg(unix)]
 use nix::{
 	sys::signal::{kill, Signal},
 	unistd::Pid,
 };
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::{
+	io::{AsyncRead, AsyncReadExt},
+	process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+};
 use tracing::debug;
 
 pub struct TokioCommandWrap {
@@ -174,14 +178,48 @@ pub trait TokioChildWrapper: std::fmt::Debug + Send + Sync {
 		Box::new(self.inner_mut().wait())
 	}
 
-	fn wait_with_output(self: Box<Self>) -> Box<dyn Future<Output = Result<Output>>> {
-		Box::new(self.into_inner().wait_with_output())
+	fn wait_with_output(mut self: Box<Self>) -> Box<dyn Future<Output = Result<Output>>>
+	where
+		Self: 'static,
+	{
+		Box::new(async move {
+			async fn read_to_end<A: AsyncRead + Unpin>(io: &mut Option<A>) -> Result<Vec<u8>> {
+				let mut vec = Vec::new();
+				if let Some(io) = io.as_mut() {
+					io.read_to_end(&mut vec).await?;
+				}
+				Ok(vec)
+			}
+
+			let mut stdout_pipe = self.stdout().take();
+			let mut stderr_pipe = self.stderr().take();
+
+			let stdout_fut = read_to_end(&mut stdout_pipe);
+			let stderr_fut = read_to_end(&mut stderr_pipe);
+
+			let (status, stdout, stderr) =
+				try_join3(Box::into_pin(self.wait()), stdout_fut, stderr_fut).await?;
+
+			// Drop happens after `try_join` due to <https://github.com/tokio-rs/tokio/issues/4309>
+			drop(stdout_pipe);
+			drop(stderr_pipe);
+
+			Ok(Output {
+				status,
+				stdout,
+				stderr,
+			})
+		})
 	}
 
 	#[cfg(unix)]
 	fn signal(&self, sig: Signal) -> Result<()> {
 		if let Some(id) = self.id() {
-			kill(Pid::from_raw(i32::try_from(id).map_err(Error::other)?), sig).map_err(Error::from)
+			kill(
+				Pid::from_raw(i32::try_from(id).map_err(std::io::Error::other)?),
+				sig,
+			)
+			.map_err(std::io::Error::from)
 		} else {
 			Ok(())
 		}
