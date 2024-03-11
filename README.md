@@ -110,7 +110,6 @@ dbg!(status);
 - Feature: `job-object` (default)
 
 ```rust
-use windows::Win32::System::Threading::*;
 TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(JobObject)
   .spawn()?;
