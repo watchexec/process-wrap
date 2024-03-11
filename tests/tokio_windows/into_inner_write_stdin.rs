@@ -8,7 +8,8 @@ async fn nowrap() -> Result<()> {
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped());
 	})
-	.spawn()?;
+	.spawn()?
+	.into_inner();
 
 	if let Some(mut din) = child.stdin().take() {
 		din.write_all(b"hello").await?;
