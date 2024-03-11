@@ -18,34 +18,105 @@ crate::generic_wrap::Wrap!(
 	StdChild // |child| StdChild(child)
 );
 
+/// Wrapper for `std::process::Child`.
+///
+/// This trait exposes most of the functionality of the underlying [`Child`]. It is implemented for
+/// [`StdChild`] (a thin wrapper around [`Child`]) (because implementing directly on [`Child`] would
+/// loop) and by wrappers.
+///
+/// The required methods are `inner`, `inner_mut`, and `into_inner`. That provides access to the
+/// underlying `Child` and allows the wrapper to be dropped and the `Child` to be used directly if
+/// necessary.
+///
+/// It also makes it possible for all the other methods to have default implementations. Some are
+/// direct passthroughs to the underlying `Child`, while others are more complex.
+///
+/// Here's a simple example of a wrapper:
+///
+/// ```rust
+/// use process_wrap::std::*;
+/// use std::process::Child;
+///
+/// #[derive(Debug)]
+/// pub struct YourChildWrapper(Child);
+///
+/// impl StdChildWrapper for YourChildWrapper {
+///     fn inner(&self) -> &Child {
+///         &self.0
+///     }
+///
+///     fn inner_mut(&mut self) -> &mut Child {
+///         &mut self.0
+///     }
+///
+///     fn into_inner(self: Box<Self>) -> Child {
+///         (*self).0
+///     }
+/// }
+/// ```
 pub trait StdChildWrapper: std::fmt::Debug + Send + Sync {
+	/// Obtain a reference to the underlying `Child`.
 	fn inner(&self) -> &Child;
+
+	/// Obtain a mutable reference to the underlying `Child`.
 	fn inner_mut(&mut self) -> &mut Child;
+
+	/// Consume the wrapper and return the underlying `Child`.
+	///
+	/// Note that this may disrupt whatever the wrappers were doing. However, wrappers must ensure
+	/// that the `Child` is in a consistent state when this is called or they are dropped, so that
+	/// this is always safe.
 	fn into_inner(self: Box<Self>) -> Child;
 
+	/// Obtain the `Child`'s stdin.
+	///
+	/// By default this is a passthrough to the underlying `Child`.
 	fn stdin(&mut self) -> &mut Option<ChildStdin> {
 		&mut self.inner_mut().stdin
 	}
 
+	/// Obtain the `Child`'s stdout.
+	///
+	/// By default this is a passthrough to the underlying `Child`.
 	fn stdout(&mut self) -> &mut Option<ChildStdout> {
 		&mut self.inner_mut().stdout
 	}
 
+	/// Obtain the `Child`'s stderr.
+	///
+	/// By default this is a passthrough to the underlying `Child`.
 	fn stderr(&mut self) -> &mut Option<ChildStderr> {
 		&mut self.inner_mut().stderr
 	}
 
+	/// Obtain the `Child`'s process ID.
+	///
+	/// In general this should be the PID of the top-level spawned process that was spawned
+	/// However, that may vary depending on what a wrapper does.
 	fn id(&self) -> u32 {
 		self.inner().id()
 	}
 
+	/// Kill the `Child` and wait for it to exit.
+	///
+	/// By default this calls `start_kill()` and then `wait()`, which is the same way it is done on
+	/// the underlying `Child`, but that way implementing either or both of those methods will use
+	/// them when calling `kill()`, instead of requiring a stub implementation.
 	fn kill(&mut self) -> Result<()> {
-		eprintln!("kill");
 		self.start_kill()?;
 		self.wait()?;
 		Ok(())
 	}
 
+	/// Kill the `Child` without waiting for it to exit.
+	///
+	/// By default this is:
+	/// - on Unix, sending a `SIGKILL` signal to the process;
+	/// - otherwise, a passthrough to the underlying `kill()` method.
+	///
+	/// The `start_kill()` method doesn't exist on std's `Child`, and was introduced by Tokio. This
+	/// library uses it to provide a consistent API across both std and Tokio (and because it's a
+	/// generally useful API).
 	fn start_kill(&mut self) -> Result<()> {
 		#[cfg(unix)]
 		{
@@ -58,15 +129,35 @@ pub trait StdChildWrapper: std::fmt::Debug + Send + Sync {
 		}
 	}
 
+	/// Check if the `Child` has exited without blocking, and if so, return its exit status.
+	///
+	/// Wrappers must ensure that repeatedly calling this (or other wait methods) after the child
+	/// has exited will always return the same result.
+	///
+	/// By default this is a passthrough to the underlying `Child`.
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
 		self.inner_mut().try_wait()
 	}
 
+	/// Wait for the `Child` to exit and return its exit status.
+	///
+	/// Wrappers must ensure that repeatedly calling this (or other wait methods) after the child
+	/// has exited will always return the same result.
+	///
+	/// By default this is a passthrough to the underlying `Child`.
 	fn wait(&mut self) -> Result<ExitStatus> {
-		eprintln!("wait");
 		self.inner_mut().wait()
 	}
 
+	/// Wait for the `Child` to exit and return its exit status and outputs.
+	///
+	/// Note that this method reads the child's stdout and stderr to completion into memory.
+	///
+	/// On Unix, this reads from stdout and stderr simultaneously. On other platforms, it reads from
+	/// stdout first, then stderr (pull requests welcome to improve this).
+	///
+	/// By default this is a reimplementation of the std method, so that it can use the wrapper's
+	/// `wait()` method instead of the underlying `Child`'s `wait()`.
 	fn wait_with_output(mut self: Box<Self>) -> Result<Output>
 	where
 		Self: 'static,
@@ -98,6 +189,11 @@ pub trait StdChildWrapper: std::fmt::Debug + Send + Sync {
 		})
 	}
 
+	/// Send a signal to the `Child`.
+	///
+	/// This method is only available on Unix. It doesn't exist on std's `Child`, nor on Tokio's. It
+	/// was introduced by command-group to abstract over the signal behaviour between process groups
+	/// and unwrapped processes.
 	#[cfg(unix)]
 	fn signal(&self, sig: Signal) -> Result<()> {
 		kill(
