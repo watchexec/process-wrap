@@ -30,23 +30,11 @@ The full test suite from command-group was retained: process-wrap has parity on 
 
 ```toml
 [dependencies]
-process-wrap = "6.0.0"
+process-wrap = { version = "6.0.0", features = ["tokio1"] }
 ```
 
-### with std
-
-```rust
-use std::process::Command;
-use process_wrap::std::*;
-
-let mut child = StdCommandWrap::with_new("watch", |command| { command.arg("ls"); })
-  .wrap(ProcessGroup::leader())
-  .spawn()?;
-let status = child.wait()?;
-dbg!(status);
-```
-
-### or with Tokio
+By default, the crate does nothing, you need to enable either the std or Tokio "frontend". A default
+set of wrappers are enabled; you may choose to only compile those you need, see [the features list].
 
 ```rust
 use tokio::process::Command;
@@ -96,6 +84,24 @@ let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"
   .wrap(KillOnDrop)
   .spawn()?;
 let status = Box::into_pin(child.wait()).await?;
+dbg!(status);
+```
+
+### or with std
+
+```toml
+[dependencies]
+process-wrap = { version = "6.0.0", features = ["std"] }
+```
+
+```rust
+use std::process::Command;
+use process_wrap::std::*;
+
+let mut child = StdCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+  .wrap(ProcessGroup::leader())
+  .spawn()?;
+let status = child.wait()?;
 dbg!(status);
 ```
 
@@ -228,11 +234,14 @@ The trait provides extension or hook points into the lifecycle of a `Command`:
 Refer to [the API documentation][docs] for more detail and the specifics of child wrapper traits.
 
 ## Features
+[the features list]: #features
 
 ### Frontends
 
-- `std`: **default**, enables the std-based API.
-- `tokio1`: **default**, enables the Tokio-based API.
+- `std`: enables the std-based API.
+- `tokio1`: enables the Tokio-based API.
+
+Both can exist at the same time, but generally you should use one or the other.
 
 ### Wrappers
 

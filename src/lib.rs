@@ -8,10 +8,11 @@
 #[cfg(feature = "tokio1")]
 pub mod tokio;
 
-#[cfg(all(windows, feature = "job-object"))]
+#[cfg(all(windows, feature = "job-object", any(feature = "std", feature = "tokio1")))]
 mod windows;
 
 /// Internal memoization of the exit status of a child process.
+#[allow(dead_code)] // easier than listing exactly which featuresets use it
 #[derive(Debug)]
 pub(crate) enum ChildExitStatus {
 	Running,
