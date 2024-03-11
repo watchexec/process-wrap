@@ -12,8 +12,8 @@ Not ready for use.
 - [Dual-licensed][copyright] with Apache 2.0 and MIT.
 - Successor to [command-group](https://github.com/watchexec/command-group).
 - Minimum Supported Rust Version: 1.75.0.
-  - Only the last two stable versions are supported.
-  - MSRV increases within that range at publish time will not incur major version bumps.
+  - Only the latest stable rustc version is supported.
+  - MSRV increases will not incur major version bumps.
 
 [copyright]: ./COPYRIGHT
 [docs]: https://docs.rs/process-wrap
@@ -143,11 +143,6 @@ TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .spawn()?;
 ```
 
-### Pseudo terminal (pty)
-
-- Platforms: Linux, Mac
-- Feature: `pty`
-
 ### Creation flags
 
 - Platforms: Windows
@@ -198,4 +193,3 @@ Implementing a wrapper is done via a set of traits.
 - `kill-on-drop`: **default**, enables the [kill on drop](#kill-on-drop) wrapper.
 - `process-group`: **default**, enables the [process group](#process-group) wrapper.
 - `process-session`: **default**, enables the [process session](#process-session) wrapper.
-- `pty`: enables the [pseudo terminal](#pseudo-terminal-pty) wrapper.
