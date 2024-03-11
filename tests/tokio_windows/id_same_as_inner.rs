@@ -13,7 +13,7 @@ async fn nowrap() -> Result<()> {
 }
 
 #[tokio::test]
-async fn process_job_object() -> Result<()> {
+async fn job_object() -> Result<()> {
 	let child = TokioCommandWrap::with_new("powershell.exe", |command| {
 		command.arg("/C").arg("echo hello").stdout(Stdio::null());
 	})

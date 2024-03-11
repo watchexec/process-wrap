@@ -12,12 +12,12 @@ async fn nowrap() -> Result<()> {
 		out.read_to_string(&mut output).await?;
 	}
 
-	assert_eq!(output.as_str(), "hello\n");
+	assert_eq!(output.as_str(), "hello\r\n");
 	Ok(())
 }
 
 #[tokio::test]
-async fn process_job_object() -> Result<()> {
+async fn job_object() -> Result<()> {
 	let mut child = TokioCommandWrap::with_new("powershell.exe", |command| {
 		command.arg("/C").arg("echo hello").stdout(Stdio::piped());
 	})
@@ -29,6 +29,6 @@ async fn process_job_object() -> Result<()> {
 		out.read_to_string(&mut output).await?;
 	}
 
-	assert_eq!(output.as_str(), "hello\n");
+	assert_eq!(output.as_str(), "hello\r\n");
 	Ok(())
 }
