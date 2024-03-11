@@ -1,5 +1,5 @@
 macro_rules! Wrap {
-	($name:ident, $command:ty, $wrapper:ident, $childer:ident) => {
+	($name:ident, $command:ty, $wrapper:ident, $childer:ident, $first_child_wrapper:expr) => {
 		#[derive(Debug)]
 		pub struct $name {
 			command: $command,
@@ -51,7 +51,11 @@ macro_rules! Wrap {
 					wrapper.post_spawn(&mut child, self)?;
 				}
 
-				let mut child = Box::new(child) as Box<dyn $childer>;
+				let mut child = Box::new(
+					#[allow(clippy::redundant_closure_call)]
+					$first_child_wrapper(child),
+				) as Box<dyn $childer>;
+
 				for (id, wrapper) in wrappers.iter_mut() {
 					::tracing::debug!(?id, "wrap_child");
 					child = wrapper.wrap_child(child, self)?;

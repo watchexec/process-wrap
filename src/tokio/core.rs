@@ -19,7 +19,8 @@ crate::generic_wrap::Wrap!(
 	TokioCommandWrap,
 	Command,
 	TokioCommandWrapper,
-	TokioChildWrapper
+	TokioChildWrapper,
+	|child| child
 );
 
 pub trait TokioCommandWrapper: std::fmt::Debug {
