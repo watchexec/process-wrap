@@ -1,3 +1,21 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
+
+---
+## [6.0.0](https://github.com/watchexec/progress-wrap/compare/v5.0.1..6.0.0) - 2024-03-11
+
+
+- **Bugfix:** Restore Signal re-export on unix - ([fe62ff2](https://github.com/watchexec/progress-wrap/commit/fe62ff22bf24a079569a081d34f7c60e068d6e54))
+- **Deps:** Upgrade nix to 0.28 and windows to 0.54 - ([0d24385](https://github.com/watchexec/progress-wrap/commit/0d243853cf99324a46f32cc6f08a2a6b27c9b91d))
+- **Documentation:** Enable doc_auto_cfg for docsrs - ([d143b09](https://github.com/watchexec/progress-wrap/commit/d143b090207608a7ec1c93df125bb096a15d2e8a))
+- **Documentation:** Correct COPYRIGHT and CITATION.cff for new name - ([a04124f](https://github.com/watchexec/progress-wrap/commit/a04124f0597a41ee01c63634592a971b955e659d))
+- **Feature:** Instrument internals (with tracing) - ([5ee79a7](https://github.com/watchexec/progress-wrap/commit/5ee79a722efcdda10776cf2c70563cc4b00cc33b))
+- **Repo:** Do versions with cargo-release and git-cliff - ([869dbf8](https://github.com/watchexec/progress-wrap/commit/869dbf8477f1448fb17738bf6e46785f2e8b1044))
+- **Repo:** Add dependabot config - ([5a881b2](https://github.com/watchexec/progress-wrap/commit/5a881b2b87ec3752f221be5c46146432b3ced3e8))
+
 - **Repo**: Rename to `process-wrap` and rearchitect.
 - **Repo**: Require Rust 1.75 for async trait in trait.
 - **Tweak**: Windows: setting `CREATE_SUSPENDED` leaves the process suspended after spawn.
