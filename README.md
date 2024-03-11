@@ -178,6 +178,46 @@ drop(child);
 ### Your own
 
 Implementing a wrapper is done via a set of traits.
+The std and Tokio sides are completely separate, due to the different underlying APIs.
+Of course you can (and should) re-use/share code wherever possible if implementing both.
+
+At minimum, you must implement `StdCommandWrapper` and/or `TokioCommandWrapper`.
+These provide the same functionality, but differ in the exact types specified.
+Here's the most basic impl (shown for Tokio):
+
+```rust
+#[derive(Debug)]
+pub struct YourWrapper;
+impl TokioCommandWrapper for YourWrapper {}
+```
+
+That's right, all member methods are optional.
+The trait provides extension or hook points into the lifecycle of a `Command`:
+
+- **`fn extend(&mut self, other: Box<dyn TokioCommandWrapper>)`** is called if `.wrap(YourWrapper)`
+  is done twice. Only one of a wrapper type can exist, so this gives the opportunity to incorporate
+  all or part of the second wrapper instance into the first. By default, this does nothing (ie only
+  the first registered wrapper instance of a type does anything).
+
+- **`fn pre_spawn(&mut self, command: &mut Command, core: &TokioCommandWrap)`** is called before the
+  command is spawned, and gives mutable access to it. It also gives mutable access to the wrapper
+  instance, so state can be stored if needed. The `core` reference gives access to data from other
+  wrappers; for example, that's how `CreationFlags` on Windows works along with `JobObject`. Noop by
+  default.
+
+- **`fn post_spawn(&mut self, child: &mut tokio::process::Child, core: &TokioCommandWrap)`** is
+  called after spawn, and should be used for any necessary cleanups. It is offered for completedness
+  but is expected to be less used than `wrap_child()`. Noop by default.
+
+- **`fn wrap_child(&mut self, child: Box<dyn TokioChildWrapper>, core: &TokioCommandWrap)`** is
+  called after all `post_spawn()`s have run. If your wrapper needs to override the methods on Child,
+  then it should create an instance of its own type implementing `TokioChildWrapper` and return it
+  here. Child wraps are _in order_: you may end up with a `Foo(Bar(Child))` or a `Bar(Foo(Child))`
+  depending on if `.wrap(Foo).wrap(Bar)` or `.wrap(Bar).wrap(Foo)` was called. If your functionality
+  is order-dependent, make sure to specify so in your documentation! Default is noop: no wrapping is
+  performed and the input `child` is returned as-is.
+
+Refer to [the API documentation][docs] for more detail and the specifics of child wrapper traits.
 
 ## Features
 
