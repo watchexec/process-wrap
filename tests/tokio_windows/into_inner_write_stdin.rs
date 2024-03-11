@@ -19,7 +19,7 @@ async fn nowrap() -> Result<()> {
 		out.read_to_string(&mut output).await?;
 	}
 
-	assert_eq!(output.as_str(), "hello");
+	assert_eq!(output.as_str(), "hello\r\n");
 	Ok(())
 }
 
@@ -44,6 +44,6 @@ async fn job_object() -> Result<()> {
 		out.read_to_string(&mut output).await?;
 	}
 
-	assert_eq!(output.as_str(), "hello");
+	assert_eq!(output.as_str(), "hello\r\n");
 	Ok(())
 }
