@@ -8,6 +8,9 @@
 #[cfg(feature = "tokio1")]
 pub mod tokio;
 
+#[cfg(all(windows, feature = "job-object"))]
+mod windows;
+
 /// Internal memoization of the exit status of a child process.
 #[derive(Debug)]
 pub(crate) enum ChildExitStatus {

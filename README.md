@@ -156,8 +156,6 @@ TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
 
 This is a shim to allow setting Windows process creation flags with this API, as otherwise they'd be overwritten.
 
-Note that `CREATE_SUSPENDED` will always be set, as it is required for the crate to function.
-
 ```rust
 use windows::Win32::System::Threading::*;
 TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
