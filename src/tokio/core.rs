@@ -163,7 +163,11 @@ pub trait TokioChildWrapper: std::fmt::Debug + Send + Sync {
 	}
 
 	fn kill(&mut self) -> Box<dyn Future<Output = Result<()>> + '_> {
-		Box::new(self.inner_mut().kill())
+		Box::new(async {
+			self.start_kill()?;
+			Box::into_pin(self.wait()).await?;
+			Ok(())
+		})
 	}
 
 	fn start_kill(&mut self) -> Result<()> {

@@ -160,14 +160,6 @@ impl TokioChildWrapper for ProcessGroupChild {
 		self.signal_imp(Signal::SIGKILL)
 	}
 
-	fn kill(&mut self) -> Box<dyn Future<Output = Result<()>> + '_> {
-		Box::new(async {
-			self.start_kill()?;
-			Box::into_pin(self.wait()).await?;
-			Ok(())
-		})
-	}
-
 	fn wait(&mut self) -> Box<dyn Future<Output = Result<ExitStatus>> + '_> {
 		Box::new(async {
 			if let ChildExitStatus::Exited(status) = &self.exit_status {
