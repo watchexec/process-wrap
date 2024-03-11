@@ -35,10 +35,10 @@ tokio = { version = "1.36.0", features = ["io-util", "macros", "process", "rt", 
 default = ["creation-flags", "job-object", "process-group", "process-session"]
 
 ## Frontend: StdCommandWrap
-std = []
+std = ["dep:nix"]
 
 ## Frontend: TokioCommandWrap
-tokio1 = ["dep:tokio"]
+tokio1 = ["dep:nix", "dep:tokio"]
 
 ## Wrapper: Creation Flags
 creation-flags = ["dep:windows", "windows/Win32_System_Threading"]
@@ -50,10 +50,10 @@ job-object = ["dep:windows", "windows/Win32_Security", "windows/Win32_System_Dia
 kill-on-drop = []
 
 ## Wrapper: Process Group
-process-group = ["dep:nix"]
+process-group = []
 
 ## Wrapper: Process Session
-process-session = ["dep:nix", "process-group"]
+process-session = ["process-group"]
 
 [package.metadata.docs.rs]
 all-features = true
