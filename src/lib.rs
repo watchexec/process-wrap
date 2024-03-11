@@ -3,6 +3,8 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 // #![warn(missing_docs)]
 
+pub(crate) mod generic_wrap;
+
 // #[cfg(feature = "std")]
 // pub mod std;
 

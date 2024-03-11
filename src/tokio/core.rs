@@ -1,14 +1,10 @@
 use std::{
-	any::{Any, TypeId},
-	ffi::OsStr,
 	future::Future,
 	io::Result,
-	mem::{replace, take},
 	process::{ExitStatus, Output},
 };
 
 use futures::future::try_join3;
-use indexmap::IndexMap;
 #[cfg(unix)]
 use nix::{
 	sys::signal::{kill, Signal},
@@ -18,101 +14,13 @@ use tokio::{
 	io::{AsyncRead, AsyncReadExt},
 	process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
 };
-use tracing::debug;
 
-#[derive(Debug)]
-pub struct TokioCommandWrap {
-	command: Command,
-	wrappers: IndexMap<TypeId, Box<dyn TokioCommandWrapper>>,
-}
-
-impl TokioCommandWrap {
-	pub fn with_new(program: impl AsRef<OsStr>, init: impl FnOnce(&mut Command)) -> Self {
-		let mut command = Command::new(program);
-		init(&mut command);
-		Self {
-			command,
-			wrappers: IndexMap::new(),
-		}
-	}
-
-	pub fn wrap<W: TokioCommandWrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
-		let typeid = TypeId::of::<W>();
-		let mut wrapper = Some(Box::new(wrapper));
-		let extant = self
-			.wrappers
-			.entry(typeid)
-			.or_insert_with(|| wrapper.take().unwrap());
-		if let Some(wrapper) = wrapper {
-			extant.extend(wrapper);
-		}
-
-		self
-	}
-
-	// poor man's try..finally block
-	#[inline]
-	fn spawn_inner(
-		&self,
-		command: &mut Command,
-		wrappers: &mut IndexMap<TypeId, Box<dyn TokioCommandWrapper>>,
-	) -> Result<Box<dyn TokioChildWrapper>> {
-		for (id, wrapper) in wrappers.iter_mut() {
-			debug!(?id, "pre_spawn");
-			wrapper.pre_spawn(command, self)?;
-		}
-
-		let mut child = command.spawn()?;
-		for (id, wrapper) in wrappers.iter_mut() {
-			debug!(?id, "post_spawn");
-			wrapper.post_spawn(&mut child, self)?;
-		}
-
-		let mut child = Box::new(child) as Box<dyn TokioChildWrapper>;
-		for (id, wrapper) in wrappers.iter_mut() {
-			debug!(?id, "wrap_child");
-			child = wrapper.wrap_child(child, self)?;
-		}
-
-		Ok(child)
-	}
-
-	pub fn spawn(&mut self) -> Result<Box<dyn TokioChildWrapper>> {
-		let mut command = replace(&mut self.command, Command::new(""));
-		let mut wrappers = take(&mut self.wrappers);
-
-		let res = self.spawn_inner(&mut command, &mut wrappers);
-
-		self.command = command;
-		self.wrappers = wrappers;
-
-		res
-	}
-
-	pub fn has_wrap<W: TokioCommandWrapper + 'static>(&self) -> bool {
-		let typeid = TypeId::of::<W>();
-		self.wrappers.contains_key(&typeid)
-	}
-
-	pub fn get_wrap<W: TokioCommandWrapper + 'static>(&self) -> Option<&W> {
-		let typeid = TypeId::of::<W>();
-		self.wrappers.get(&typeid).map(|w| {
-			let w_any = w as &dyn Any;
-			w_any
-				.downcast_ref()
-				.expect("downcasting is guaranteed to succeed due to wrap()'s internals")
-		})
-	}
-}
-
-impl From<Command> for TokioCommandWrap {
-	fn from(command: Command) -> Self {
-		Self {
-			command,
-			wrappers: IndexMap::new(),
-		}
-	}
-}
+crate::generic_wrap::Wrap!(
+	TokioCommandWrap,
+	Command,
+	TokioCommandWrapper,
+	TokioChildWrapper
+);
 
 pub trait TokioCommandWrapper: std::fmt::Debug {
 	// process-wrap guarantees that `other` will be of the same type as `self`
@@ -125,11 +33,7 @@ pub trait TokioCommandWrapper: std::fmt::Debug {
 		Ok(())
 	}
 
-	fn post_spawn(
-		&mut self,
-		_child: &mut tokio::process::Child,
-		_core: &TokioCommandWrap,
-	) -> Result<()> {
+	fn post_spawn(&mut self, _child: &mut Child, _core: &TokioCommandWrap) -> Result<()> {
 		Ok(())
 	}
 
