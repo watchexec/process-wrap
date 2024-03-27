@@ -34,6 +34,21 @@ macro_rules! Wrap {
 				}
 			}
 
+			/// Get a reference to the wrapped command.
+			pub fn command(&self) -> &$command {
+				&self.command
+			}
+
+			/// Get a mutable reference to the wrapped command.
+			pub fn command_mut(&mut self) -> &mut $command {
+				&mut self.command
+			}
+
+			/// Get the wrapped command.
+			pub fn into_command(self) -> $command {
+				self.command
+			}
+
 			/// Add a wrapper to the command.
 			///
 			/// This is a lazy method, and the wrapper is not actually applied until `spawn` is

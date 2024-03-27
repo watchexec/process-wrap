@@ -67,6 +67,13 @@ impl ProcessGroupChild {
 			pgid,
 		}
 	}
+
+	/// Get the process group ID of this child process.
+	///
+	/// See: [`man 'setpgid(2)'`](https://www.man7.org/linux/man-pages/man2/setpgid.2.html)
+	pub fn pgid(&self) -> Pid {
+		self.pgid
+	}
 }
 
 impl StdCommandWrapper for ProcessGroup {
