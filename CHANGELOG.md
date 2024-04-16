@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
-## [7.0.0](https://github.com/watchexec/process-wrap/compare/v6.0.1..7.0.0) - 2024-04-16
+## ~~[7.0.0](https://github.com/watchexec/process-wrap/compare/v6.0.1..7.0.0) - 2024-04-16~~ yanked
 
 
 - **API change:** Remove nix types from public API - ([7de6ac0](https://github.com/watchexec/process-wrap/commit/7de6ac0a3d331d471e6cf09f0d565547cc49708f))
