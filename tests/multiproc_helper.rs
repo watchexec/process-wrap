@@ -18,7 +18,15 @@ fn main() {
 		})
 		.collect::<Vec<_>>();
 
-	println!("{}:{}", std::process::id(), children.iter().map(|c| c.id().to_string()).collect::<Vec<_>>().join(","));
+	println!(
+		"{}:{}",
+		std::process::id(),
+		children
+			.iter()
+			.map(|c| c.id().to_string())
+			.collect::<Vec<_>>()
+			.join(",")
+	);
 
 	if let Some(timeout) = timeout {
 		std::thread::sleep(timeout);

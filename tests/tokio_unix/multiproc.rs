@@ -3,7 +3,11 @@ use super::prelude::*;
 #[tokio::test]
 async fn process_group_kill_leader() -> Result<()> {
 	let mut leader = TokioCommandWrap::with_new("tests/multiproc_helper.rs", |command| {
-		command.arg("1").arg("10").stdout(Stdio::piped()).stderr(Stdio::null());
+		command
+			.arg("1")
+			.arg("10")
+			.stdout(Stdio::piped())
+			.stderr(Stdio::null());
 	})
 	.wrap(KillOnDrop)
 	.wrap(ProcessGroup::leader())
@@ -12,7 +16,10 @@ async fn process_group_kill_leader() -> Result<()> {
 
 	sleep(DIE_TIME).await;
 
-	let stdout = leader.stdout().take().expect("Option.unwrap(): get leader stdout");
+	let stdout = leader
+		.stdout()
+		.take()
+		.expect("Option.unwrap(): get leader stdout");
 	let mut lines = BufReader::new(stdout).lines();
 	let Some(line) = lines.next_line().await? else {
 		panic!("expected line with child pid");
@@ -39,7 +46,11 @@ async fn process_group_kill_leader() -> Result<()> {
 #[tokio::test]
 async fn process_group_kill_group() -> Result<()> {
 	let mut leader = TokioCommandWrap::with_new("tests/multiproc_helper.rs", |command| {
-		command.arg("1").arg("10").stdout(Stdio::piped()).stderr(Stdio::null());
+		command
+			.arg("1")
+			.arg("10")
+			.stdout(Stdio::piped())
+			.stderr(Stdio::null());
 	})
 	.wrap(KillOnDrop)
 	.wrap(ProcessGroup::leader())
@@ -48,7 +59,10 @@ async fn process_group_kill_group() -> Result<()> {
 
 	sleep(DIE_TIME).await;
 
-	let stdout = leader.stdout().take().expect("Option.unwrap(): get leader stdout");
+	let stdout = leader
+		.stdout()
+		.take()
+		.expect("Option.unwrap(): get leader stdout");
 	let mut lines = BufReader::new(stdout).lines();
 	let Some(line) = lines.next_line().await? else {
 		panic!("expected line with child pid");
@@ -76,7 +90,11 @@ async fn process_group_kill_group() -> Result<()> {
 #[tokio::test]
 async fn process_session_kill_leader() -> Result<()> {
 	let mut leader = TokioCommandWrap::with_new("tests/multiproc_helper.rs", |command| {
-		command.arg("1").arg("10").stdout(Stdio::piped()).stderr(Stdio::null());
+		command
+			.arg("1")
+			.arg("10")
+			.stdout(Stdio::piped())
+			.stderr(Stdio::null());
 	})
 	.wrap(KillOnDrop)
 	.wrap(ProcessSession)
@@ -85,7 +103,10 @@ async fn process_session_kill_leader() -> Result<()> {
 
 	sleep(DIE_TIME).await;
 
-	let stdout = leader.stdout().take().expect("Option.unwrap(): get leader stdout");
+	let stdout = leader
+		.stdout()
+		.take()
+		.expect("Option.unwrap(): get leader stdout");
 	let mut lines = BufReader::new(stdout).lines();
 	let Some(line) = lines.next_line().await? else {
 		panic!("expected line with child pid");
@@ -112,7 +133,11 @@ async fn process_session_kill_leader() -> Result<()> {
 #[tokio::test]
 async fn process_session_kill_group() -> Result<()> {
 	let mut leader = TokioCommandWrap::with_new("tests/multiproc_helper.rs", |command| {
-		command.arg("1").arg("10").stdout(Stdio::piped()).stderr(Stdio::null());
+		command
+			.arg("1")
+			.arg("10")
+			.stdout(Stdio::piped())
+			.stderr(Stdio::null());
 	})
 	.wrap(KillOnDrop)
 	.wrap(ProcessSession)
@@ -121,7 +146,10 @@ async fn process_session_kill_group() -> Result<()> {
 
 	sleep(DIE_TIME).await;
 
-	let stdout = leader.stdout().take().expect("Option.unwrap(): get leader stdout");
+	let stdout = leader
+		.stdout()
+		.take()
+		.expect("Option.unwrap(): get leader stdout");
 	let mut lines = BufReader::new(stdout).lines();
 	let Some(line) = lines.next_line().await? else {
 		panic!("expected line with child pid");
