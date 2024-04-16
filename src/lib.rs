@@ -8,15 +8,17 @@
 //! ```
 //!
 //! ```rust,no_run
+//! # fn main() -> std::io::Result<()> {
 //! use std::process::Command;
 //! use process_wrap::std::*;
 //!
 //! let mut command = StdCommandWrap::with_new("watch", |command| { command.arg("ls"); });
 //! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
 //! #[cfg(windows)] { command.wrap(JobObject); }
-//! let child = command.spawn()?;
+//! let mut child = command.spawn()?;
 //! let status = child.wait()?;
 //! dbg!(status);
+//! # Ok(()) }
 //! ```
 //!
 //! ## Migrating from command-group
@@ -84,15 +86,15 @@
 //!
 //! In practice:
 //!
-//! ## Instead of `.kill_on_drop(true)`:
+//! ## Instead of `.kill_on_drop(true)` (Tokio-only):
 //!
 //! ```rust
-//! use process_wrap::std::*;
-//! let mut command = StdCommandWrap::with_new("ls", |command| { command.arg("-l"); });
+//! use process_wrap::tokio::*;
+//! let mut command = TokioCommandWrap::with_new("ls", |command| { command.arg("-l"); });
 //! command.wrap(KillOnDrop);
 //! ```
 //!
-//! ## Instead of `.creation_flags(CREATE_NO_WINDOW)`:
+//! ## Instead of `.creation_flags(CREATE_NO_WINDOW)` (Windows-only):
 //!
 //! ```rust,ignore
 //! use process_wrap::std::*;
