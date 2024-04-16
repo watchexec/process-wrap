@@ -194,6 +194,3 @@ pub(crate) enum ChildExitStatus {
 	Running,
 	Exited(::std::process::ExitStatus),
 }
-
-#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
-pub use nix::sys::signal::Signal;
