@@ -45,8 +45,10 @@ impl ProcessGroup {
 	}
 
 	/// Create a process group wrapper attaching the command to an existing process group ID.
-	pub fn attach_to(leader: Pid) -> Self {
-		Self { leader }
+	pub fn attach_to(leader: u32) -> Self {
+		Self {
+			leader: Pid::from_raw(leader as _),
+		}
 	}
 }
 
@@ -71,8 +73,8 @@ impl ProcessGroupChild {
 	/// Get the process group ID of this child process.
 	///
 	/// See: [`man 'setpgid(2)'`](https://www.man7.org/linux/man-pages/man2/setpgid.2.html)
-	pub fn pgid(&self) -> Pid {
-		self.pgid
+	pub fn pgid(&self) -> u32 {
+		self.pgid.as_raw() as _
 	}
 }
 
@@ -215,7 +217,7 @@ impl StdChildWrapper for ProcessGroupChild {
 		}
 	}
 
-	fn signal(&self, sig: Signal) -> Result<()> {
-		self.signal_imp(sig)
+	fn signal(&self, sig: i32) -> Result<()> {
+		self.signal_imp(Signal::try_from(sig)?)
 	}
 }

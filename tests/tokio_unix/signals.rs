@@ -7,11 +7,11 @@ async fn nowrap() -> Result<()> {
 	})
 	.spawn()?;
 
-	child.signal(Signal::SIGCONT)?;
+	child.signal(Signal::SIGCONT as _)?;
 	sleep(DIE_TIME).await;
 	assert!(child.try_wait()?.is_none(), "not exited with sigcont");
 
-	child.signal(Signal::SIGTERM)?;
+	child.signal(Signal::SIGTERM as _)?;
 	sleep(DIE_TIME).await;
 	assert!(child.try_wait()?.is_some(), "exited with sigterm");
 
@@ -26,11 +26,11 @@ async fn process_group() -> Result<()> {
 	.wrap(ProcessGroup::leader())
 	.spawn()?;
 
-	child.signal(Signal::SIGCONT)?;
+	child.signal(Signal::SIGCONT as _)?;
 	sleep(DIE_TIME).await;
 	assert!(child.try_wait()?.is_none(), "not exited with sigcont");
 
-	child.signal(Signal::SIGTERM)?;
+	child.signal(Signal::SIGTERM as _)?;
 	sleep(DIE_TIME).await;
 	assert!(child.try_wait()?.is_some(), "exited with sigterm");
 
@@ -45,11 +45,11 @@ async fn process_session() -> Result<()> {
 	.wrap(ProcessSession)
 	.spawn()?;
 
-	child.signal(Signal::SIGCONT)?;
+	child.signal(Signal::SIGCONT as _)?;
 	sleep(DIE_TIME).await;
 	assert!(child.try_wait()?.is_none(), "not exited with sigcont");
 
-	child.signal(Signal::SIGTERM)?;
+	child.signal(Signal::SIGTERM as _)?;
 	sleep(DIE_TIME).await;
 	assert!(child.try_wait()?.is_some(), "exited with sigterm");
 

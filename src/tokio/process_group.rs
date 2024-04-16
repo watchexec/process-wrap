@@ -78,8 +78,8 @@ impl ProcessGroupChild {
 	/// Get the process group ID of this child process.
 	///
 	/// See: [`man 'setpgid(2)'`](https://www.man7.org/linux/man-pages/man2/setpgid.2.html)
-	pub fn pgid(&self) -> Pid {
-		self.pgid
+	pub fn pgid(&self) -> u32 {
+		self.pgid.as_raw() as _
 	}
 }
 
@@ -242,7 +242,7 @@ impl TokioChildWrapper for ProcessGroupChild {
 		}
 	}
 
-	fn signal(&self, sig: Signal) -> Result<()> {
-		self.signal_imp(sig)
+	fn signal(&self, sig: i32) -> Result<()> {
+		self.signal_imp(Signal::try_from(sig)?)
 	}
 }

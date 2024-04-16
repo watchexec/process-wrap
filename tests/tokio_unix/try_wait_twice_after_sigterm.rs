@@ -8,7 +8,7 @@ async fn nowrap() -> Result<()> {
 	.spawn()?;
 	assert!(child.try_wait()?.is_none(), "pre sigterm");
 
-	child.signal(Signal::SIGTERM)?;
+	child.signal(Signal::SIGTERM as _)?;
 	sleep(DIE_TIME).await;
 	assert!(child.try_wait()?.is_some(), "try_wait() one");
 
@@ -27,7 +27,7 @@ async fn process_group() -> Result<()> {
 	.spawn()?;
 	assert!(child.try_wait()?.is_none(), "pre sigterm");
 
-	child.signal(Signal::SIGTERM)?;
+	child.signal(Signal::SIGTERM as _)?;
 	sleep(DIE_TIME).await;
 	assert!(child.try_wait()?.is_some(), "try_wait() one");
 
@@ -46,7 +46,7 @@ async fn process_session() -> Result<()> {
 	.spawn()?;
 	assert!(child.try_wait()?.is_none(), "pre sigterm");
 
-	child.signal(Signal::SIGTERM)?;
+	child.signal(Signal::SIGTERM as _)?;
 	sleep(DIE_TIME).await;
 	assert!(child.try_wait()?.is_some(), "try_wait() one");
 

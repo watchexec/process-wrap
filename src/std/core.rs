@@ -120,7 +120,7 @@ pub trait StdChildWrapper: std::fmt::Debug + Send + Sync {
 	fn start_kill(&mut self) -> Result<()> {
 		#[cfg(unix)]
 		{
-			self.signal(Signal::SIGKILL)
+			self.signal(Signal::SIGKILL as _)
 		}
 
 		#[cfg(not(unix))]
@@ -195,10 +195,10 @@ pub trait StdChildWrapper: std::fmt::Debug + Send + Sync {
 	/// was introduced by command-group to abstract over the signal behaviour between process groups
 	/// and unwrapped processes.
 	#[cfg(unix)]
-	fn signal(&self, sig: Signal) -> Result<()> {
+	fn signal(&self, sig: i32) -> Result<()> {
 		kill(
 			Pid::from_raw(i32::try_from(self.id()).map_err(std::io::Error::other)?),
-			sig,
+			Signal::try_from(sig)?,
 		)
 		.map_err(std::io::Error::from)
 	}

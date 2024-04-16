@@ -8,7 +8,7 @@ fn nowrap() -> Result<()> {
 	.spawn()?;
 	assert!(child.try_wait()?.is_none(), "pre sigterm");
 
-	child.signal(Signal::SIGTERM)?;
+	child.signal(Signal::SIGTERM as _)?;
 
 	let status = (child.wait())?;
 	assert_eq!(status.signal(), Some(Signal::SIGTERM as i32), "wait() one");
@@ -28,7 +28,7 @@ fn process_group() -> Result<()> {
 	.spawn()?;
 	assert!(child.try_wait()?.is_none(), "pre sigterm");
 
-	child.signal(Signal::SIGTERM)?;
+	child.signal(Signal::SIGTERM as _)?;
 
 	let status = (child.wait())?;
 	assert_eq!(status.signal(), Some(Signal::SIGTERM as i32), "wait() one");
@@ -48,7 +48,7 @@ fn process_session() -> Result<()> {
 	.spawn()?;
 	assert!(child.try_wait()?.is_none(), "pre sigterm");
 
-	child.signal(Signal::SIGTERM)?;
+	child.signal(Signal::SIGTERM as _)?;
 
 	let status = (child.wait())?;
 	assert_eq!(status.signal(), Some(Signal::SIGTERM as i32), "wait() one");
