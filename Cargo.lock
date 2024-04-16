@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "process-wrap"
-version = "6.0.1"
+version = "7.0.0"
 dependencies = [
  "futures",
  "indexmap",

@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [7.0.0](https://github.com/watchexec/process-wrap/compare/v6.0.1..7.0.0) - 2024-04-16
+
+
+- **API change:** Remove nix types from public API - ([7de6ac0](https://github.com/watchexec/process-wrap/commit/7de6ac0a3d331d471e6cf09f0d565547cc49708f))
+- **Deps:** Bump the cargo group with 1 update - ([d542c6e](https://github.com/watchexec/process-wrap/commit/d542c6ed922c8508f6af8366801c59d144330ead))
+- **Deps:** Bump the cargo group with 1 update (#4) - ([fa44e91](https://github.com/watchexec/process-wrap/commit/fa44e91d0f8ba8d463812896a634a2380f4ef7f9))
+- **Deps:** Upgrade windows to 0.56 - ([7f2a280](https://github.com/watchexec/process-wrap/commit/7f2a28098bb3cf028609d59a24ebd7f91a45e22c))
+- **Documentation:** Fix progress->process in repo name in changelog - ([e8fb3a1](https://github.com/watchexec/process-wrap/commit/e8fb3a1ce81587f809a6773ce17297f1935e42f8))
+- **Feature:** Add underlying Command accessors to *CommandWrap - ([2e2f548](https://github.com/watchexec/process-wrap/commit/2e2f548083cf2fe895c4cb03648138a89c569e2a))
+- **Feature:** Add pgid accessor to ProcessGroupChild - ([2e2f548](https://github.com/watchexec/process-wrap/commit/2e2f548083cf2fe895c4cb03648138a89c569e2a))
+- **Refactor:** Don't require nix::Pid on the public API - ([fd5f5e3](https://github.com/watchexec/process-wrap/commit/fd5f5e32fb9ae902e6cec2d18fe74f54b05c6dac))
+- **Test:** Multiprocess behaviour - ([bbe9eed](https://github.com/watchexec/process-wrap/commit/bbe9eede1b6bb6fb522bcc80ebd21210f42c0882))
+- **Test:** Multiproc tests for linux specifically - ([bd268d2](https://github.com/watchexec/process-wrap/commit/bd268d228cf0083decce6c72ff13a7ed60b74d4d))
+- **Test:** Multiproc for std - ([35270b8](https://github.com/watchexec/process-wrap/commit/35270b82b9f1e5b5aa569103cfafd07ed85e9f74))
+
+---
 ## [6.0.1](https://github.com/watchexec/process-wrap/compare/v6.0.0..6.0.1) - 2024-03-11
 
 
