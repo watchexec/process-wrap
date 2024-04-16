@@ -36,6 +36,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - run: tests/multiproc_helper.rs 1 1
       - run: cargo test --features ${{ matrix.features }} --all-targets
       - run: cargo clippy --features ${{ matrix.features }}
 
