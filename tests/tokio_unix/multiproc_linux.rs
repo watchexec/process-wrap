@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use super::prelude::*;
 
 #[tokio::test]

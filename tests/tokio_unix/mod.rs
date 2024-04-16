@@ -26,7 +26,7 @@ mod id_same_as_inner;
 mod inner_read_stdout;
 mod into_inner_write_stdin;
 mod kill_and_try_wait;
-mod multiproc;
+mod multiproc_linux;
 mod signals;
 mod try_wait_after_die;
 mod try_wait_twice_after_sigterm;
