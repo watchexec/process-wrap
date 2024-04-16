@@ -50,8 +50,8 @@ impl ProcessGroup {
 	}
 
 	/// Create a process group wrapper attaching the command to an existing process group ID.
-	pub fn attach_to(leader: Pid) -> Self {
-		Self { leader }
+	pub fn attach_to(leader: u32) -> Self {
+		Self { leader: Pid::from_raw(leader as i32) }
 	}
 }
 
