@@ -29,6 +29,7 @@ jobs:
 
       - name: Configure Rust
         run: |
+          rustup toolchain install --profile minimal --no-self-update nightly
           rustup toolchain install --profile minimal --no-self-update ${{ matrix.toolchain }}
           rustup default ${{ matrix.toolchain }}
           rustup component add clippy
