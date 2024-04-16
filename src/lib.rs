@@ -4,7 +4,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! process-wrap = { version = "7.0.0", features = ["std"] }
+//! process-wrap = { version = "7.0.1", features = ["std"] }
 //! ```
 //!
 //! ```rust,no_run

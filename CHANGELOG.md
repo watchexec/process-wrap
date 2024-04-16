@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [7.0.1](https://github.com/watchexec/process-wrap/compare/v7.0.0..7.0.1) - 2024-04-16
+
+
+- **API change:** Remove re-export of nix Signal - ([a1066a7](https://github.com/watchexec/process-wrap/commit/a1066a795fe3279d7e43071ffc536082041fb16a))
+- **Documentation:** Yank 7.0.0 - ([f7bbb36](https://github.com/watchexec/process-wrap/commit/f7bbb36c77618a91947fa84029cd47e7241e6fd7))
+- **Documentation:** Fix doctests - ([191b8d6](https://github.com/watchexec/process-wrap/commit/191b8d61a51acbd43339aeae2f60aeb278ccef15))
+
+---
 ## ~~[7.0.0](https://github.com/watchexec/process-wrap/compare/v6.0.1..7.0.0) - 2024-04-16~~ yanked
 
 
