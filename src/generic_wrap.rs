@@ -167,7 +167,7 @@ macro_rules! Wrap {
 		/// #[derive(Debug)]
 		/// pub struct YourWrapper;
 		#[doc = concat!("impl ", stringify!($wrapper), " for YourWrapper {}\n```")]
-		pub trait $wrapper: ::std::fmt::Debug {
+		pub trait $wrapper: ::std::fmt::Debug + Send + Sync {
 			/// Called on a first instance if a second of the same type is added.
 			///
 			/// Only one of a wrapper type can exist within a Wrap at a time. The default behaviour

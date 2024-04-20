@@ -191,7 +191,7 @@ impl TokioChildWrapper for ProcessGroupChild {
 	}
 
 	#[instrument(level = "debug", skip(self))]
-	fn wait(&mut self) -> Box<dyn Future<Output = Result<ExitStatus>> + '_> {
+	fn wait(&mut self) -> Box<dyn Future<Output = Result<ExitStatus>> + Send + '_> {
 		Box::new(async {
 			if let ChildExitStatus::Exited(status) = &self.exit_status {
 				return Ok(*status);

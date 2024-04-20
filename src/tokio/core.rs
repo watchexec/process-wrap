@@ -109,7 +109,7 @@ pub trait TokioChildWrapper: std::fmt::Debug + Send + Sync {
 	/// By default this calls `start_kill()` and then `wait()`, which is the same way it is done on
 	/// the underlying `Child`, but that way implementing either or both of those methods will use
 	/// them when calling `kill()`, instead of requiring a stub implementation.
-	fn kill(&mut self) -> Box<dyn Future<Output = Result<()>> + '_> {
+	fn kill(&mut self) -> Box<dyn Future<Output = Result<()>> + Send + '_> {
 		Box::new(async {
 			self.start_kill()?;
 			Box::into_pin(self.wait()).await?;
@@ -142,7 +142,7 @@ pub trait TokioChildWrapper: std::fmt::Debug + Send + Sync {
 	/// has exited will always return the same result.
 	///
 	/// By default this is a passthrough to the underlying `Child`.
-	fn wait(&mut self) -> Box<dyn Future<Output = Result<ExitStatus>> + '_> {
+	fn wait(&mut self) -> Box<dyn Future<Output = Result<ExitStatus>> + Send + '_> {
 		Box::new(self.inner_mut().wait())
 	}
 
@@ -152,7 +152,7 @@ pub trait TokioChildWrapper: std::fmt::Debug + Send + Sync {
 	///
 	/// By default this is a reimplementation of the Tokio method, so that it can use the wrapper's
 	/// `wait()` method instead of the underlying `Child`'s `wait()`.
-	fn wait_with_output(mut self: Box<Self>) -> Box<dyn Future<Output = Result<Output>>>
+	fn wait_with_output(mut self: Box<Self>) -> Box<dyn Future<Output = Result<Output>> + Send>
 	where
 		Self: 'static,
 	{
