@@ -56,5 +56,8 @@ process-group = []
 ## Wrapper: Process Session
 process-session = ["process-group"]
 
+## Wrapper: Reset Sigmask
+reset-sigmask = []
+
 [package.metadata.docs.rs]
 all-features = true

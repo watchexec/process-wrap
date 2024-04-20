@@ -152,6 +152,21 @@ TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .spawn()?;
 ```
 
+### Reset signal mask
+
+- Platforms: POSIX (Linux, Mac, BSDs...)
+- Feature: `reset-sigmask`
+
+This resets the [signal mask] of the process instead of inheriting it from the parent.
+
+[signal mask]: https://www.man7.org/linux/man-pages/man2/sigprocmask.2.html
+
+```rust
+TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+  .wrap(ResetSigmask)
+  .spawn()?;
+```
+
 ### Creation flags
 
 - Platforms: Windows
@@ -245,3 +260,4 @@ Both can exist at the same time, but generally you should use one or the other.
 - `kill-on-drop`: **default**, enables the [kill on drop](#kill-on-drop) wrapper.
 - `process-group`: **default**, enables the [process group](#process-group) wrapper.
 - `process-session`: **default**, enables the [process session](#process-session) wrapper.
+- `reset-sigmask`: enables the [reset signal mask](#reset-signal-mask) wrapper.

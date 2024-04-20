@@ -22,6 +22,9 @@ pub use process_group::{ProcessGroup, ProcessGroupChild};
 #[cfg(all(unix, feature = "process-session"))]
 #[doc(inline)]
 pub use process_session::ProcessSession;
+#[cfg(all(unix, feature = "reset-sigmask"))]
+#[doc(inline)]
+pub use reset_sigmask::ResetSigmask;
 
 mod core;
 #[cfg(all(windows, feature = "creation-flags"))]
@@ -32,3 +35,5 @@ mod job_object;
 mod process_group;
 #[cfg(all(unix, feature = "process-session"))]
 mod process_session;
+#[cfg(all(unix, feature = "reset-sigmask"))]
+mod reset_sigmask;

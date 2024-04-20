@@ -163,11 +163,12 @@
 //!
 //! ## Wrappers
 //!
-//! - `creation-flags`: **default**, enables the creation flags wrapper.
-//! - `job-object`: **default**, enables the job object wrapper.
+//! - `creation-flags`: **default**, enables the creation flags wrapper (Windows-only).
+//! - `job-object`: **default**, enables the job object wrapper (Windows-only).
 //! - `kill-on-drop`: **default**, enables the kill on drop wrapper (Tokio-only).
-//! - `process-group`: **default**, enables the process group wrapper.
-//! - `process-session`: **default**, enables the process session wrapper.
+//! - `process-group`: **default**, enables the process group wrapper (Unix-only).
+//! - `process-session`: **default**, enables the process session wrapper (Unix-only).
+//! - `reset-sigmask`: enables the sigmask reset wrapper (Unix-only).
 //!
 #![doc(html_favicon_url = "https://watchexec.github.io/logo:command-group.svg")]
 #![doc(html_logo_url = "https://watchexec.github.io/logo:command-group.svg")]
