@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [7.1.0](https://github.com/watchexec/process-wrap/compare/v7.0.1..7.1.0) - 2024-04-20
+
+
+- **Feature:** Add Clone and Copy derives where possible - ([bfd45e0](https://github.com/watchexec/process-wrap/commit/bfd45e0e400551bcd749e76149961ccb56e532fc))
+- **Feature:** Add reset-sigmask wrapper - ([19d27d6](https://github.com/watchexec/process-wrap/commit/19d27d630cf136bb5d24f08974f736429677cdc8))
+
+---
 ## [7.0.1](https://github.com/watchexec/process-wrap/compare/v7.0.0..7.0.1) - 2024-04-16
 
 
