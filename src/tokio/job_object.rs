@@ -30,7 +30,7 @@ use super::{TokioChildWrapper, TokioCommandWrap, TokioCommandWrapper};
 /// See [Job Objects](https://docs.microsoft.com/en-us/windows/win32/procthread/job-objects).
 ///
 /// This wrapper provides a child wrapper: [`JobObjectChild`].
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct JobObject;
 
 impl TokioCommandWrapper for JobObject {

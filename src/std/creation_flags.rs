@@ -11,7 +11,7 @@ use super::{StdCommandWrap, StdCommandWrapper};
 /// It exists to be able to set creation flags on a `Command` and also store them in the wrapper, so
 /// that they're no overwritten by other wrappers. Notably this is the only way to use creation
 /// flags and the `JobObject` wrapper together.
-#[derive(Debug, Clone)]
+#[derive(Clone, Copy, Debug)]
 pub struct CreationFlags(pub PROCESS_CREATION_FLAGS);
 
 impl StdCommandWrapper for CreationFlags {

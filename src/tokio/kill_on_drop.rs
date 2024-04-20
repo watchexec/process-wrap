@@ -9,7 +9,7 @@ use super::{TokioCommandWrap, TokioCommandWrapper};
 /// This wrapper exists to be able to set the kill-on-drop flag on a `Command` and also store that
 /// fact in the wrapper, so that it can be used by other wrappers. Notably this is used by the
 /// `JobObject` wrapper.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct KillOnDrop;
 
 impl TokioCommandWrapper for KillOnDrop {

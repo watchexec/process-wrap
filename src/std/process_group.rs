@@ -31,7 +31,7 @@ use super::{StdChildWrapper, StdCommandWrap, StdCommandWrapper};
 /// placement in foreground or background, among other actions.
 ///
 /// This wrapper provides a child wrapper: [`ProcessGroupChild`].
-#[derive(Debug, Clone)]
+#[derive(Clone, Copy, Debug)]
 pub struct ProcessGroup {
 	leader: Pid,
 }

@@ -18,7 +18,7 @@ use super::{TokioCommandWrap, TokioCommandWrapper};
 ///
 /// This wrapper uses [the same child wrapper as `ProcessGroup`](super::ProcessGroupChild) and does
 /// the same setup (plus the session setup); using both together is unnecessary and may misbehave.
-#[derive(Debug, Clone)]
+#[derive(Clone, Copy, Debug)]
 pub struct ProcessSession;
 
 impl TokioCommandWrapper for ProcessSession {
