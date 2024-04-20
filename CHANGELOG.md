@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [8.0.0](https://github.com/watchexec/process-wrap/compare/v7.1.0..8.0.0) - 2024-04-20
+
+
+- **API change:** Add explicit Send + Sync bounds - ([6580a62](https://github.com/watchexec/process-wrap/commit/6580a62ce7e67a9c24a4ff7670573865de850737))
+
+---
 ## [7.1.0](https://github.com/watchexec/process-wrap/compare/v7.0.1..7.1.0) - 2024-04-20
 
 
