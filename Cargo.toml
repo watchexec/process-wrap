@@ -17,7 +17,7 @@ exclude = ["/bin", "/.github"]
 rust-version = "1.75.0"
 
 [dependencies]
-futures = "0.3.30"
+futures = { version = "0.3.30", optional = true }
 indexmap = "2.2.6"
 tokio = { version = "1.37.0", features = ["io-util", "macros", "process", "rt"], optional = true }
 tracing = "0.1.40"
@@ -39,7 +39,7 @@ default = ["creation-flags", "job-object", "kill-on-drop", "process-group", "pro
 std = ["dep:nix"]
 
 ## Frontend: TokioCommandWrap
-tokio1 = ["dep:nix", "dep:tokio"]
+tokio1 = ["dep:nix", "dep:futures", "dep:tokio"]
 
 ## Wrapper: Creation Flags
 creation-flags = ["dep:windows", "windows/Win32_System_Threading"]
