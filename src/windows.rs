@@ -6,6 +6,7 @@ use std::{
 	time::Duration,
 };
 
+#[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
 use windows::Win32::{
 	Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
@@ -47,12 +48,14 @@ unsafe impl Sync for JobPort {}
 ///
 /// If `kill_on_drop` is true, we opt into the `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` flag, which
 /// essentially implements the "reap children" feature of Unix systems directly in Win32.
-#[instrument(level = "debug")]
+#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 pub(crate) fn make_job_object(handle: HANDLE, kill_on_drop: bool) -> Result<JobPort> {
 	let job = unsafe { CreateJobObjectW(None, None) }.map_err(Error::other)?;
+	#[cfg(feature = "tracing")]
 	debug!(?job, "done CreateJobObjectW");
 
 	let completion_port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) }?;
+	#[cfg(feature = "tracing")]
 	debug!(?completion_port, "done CreateIoCompletionPort");
 
 	let associate_completion = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
@@ -70,6 +73,7 @@ pub(crate) fn make_job_object(handle: HANDLE, kill_on_drop: bool) -> Result<JobP
 				.expect("cannot safely cast to DWORD"),
 		)
 	}?;
+	#[cfg(feature = "tracing")]
 	debug!(
 		?associate_completion,
 		"done SetInformationJobObject(completion)"
@@ -91,9 +95,11 @@ pub(crate) fn make_job_object(handle: HANDLE, kill_on_drop: bool) -> Result<JobP
 				.expect("cannot safely cast to DWORD"),
 		)
 	}?;
+	#[cfg(feature = "tracing")]
 	debug!(?info, "done SetInformationJobObject(limit)");
 
 	unsafe { AssignProcessToJobObject(job, handle) }?;
+	#[cfg(feature = "tracing")]
 	debug!(?job, ?handle, "done AssignProcessToJobObject");
 
 	Ok(JobPort {
@@ -106,7 +112,7 @@ pub(crate) fn make_job_object(handle: HANDLE, kill_on_drop: bool) -> Result<JobP
 ///
 /// This is a pretty terrible hack, but it's either this or we
 /// re-implement all of Rust's std::process just to get access!
-#[instrument(level = "debug")]
+#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 	#[inline]
 	unsafe fn inner(pid: u32, tool_handle: HANDLE) -> Result<()> {
@@ -146,13 +152,13 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 }
 
 /// Terminate a job object without waiting for the processes to exit.
-#[instrument(level = "debug")]
+#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 pub(crate) fn terminate_job(job: HANDLE, exit_code: u32) -> Result<()> {
 	unsafe { TerminateJobObject(job, exit_code) }.map_err(Error::other)
 }
 
 /// Wait for a job to complete.
-#[instrument(level = "debug")]
+#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 pub(crate) fn wait_on_job(
 	completion_port: HANDLE,
 	timeout: Option<Duration>,

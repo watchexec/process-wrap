@@ -82,12 +82,14 @@ macro_rules! Wrap {
 				wrappers: &mut ::indexmap::IndexMap<::std::any::TypeId, Box<dyn $wrapper>>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
 				for (id, wrapper) in wrappers.iter_mut() {
+					#[cfg(feature = "tracing")]
 					::tracing::debug!(?id, "pre_spawn");
 					wrapper.pre_spawn(command, self)?;
 				}
 
 				let mut child = command.spawn()?;
 				for (id, wrapper) in wrappers.iter_mut() {
+					#[cfg(feature = "tracing")]
 					::tracing::debug!(?id, "post_spawn");
 					wrapper.post_spawn(&mut child, self)?;
 				}
@@ -98,6 +100,7 @@ macro_rules! Wrap {
 				) as Box<dyn $childer>;
 
 				for (id, wrapper) in wrappers.iter_mut() {
+					#[cfg(feature = "tracing")]
 					::tracing::debug!(?id, "wrap_child");
 					child = wrapper.wrap_child(child, self)?;
 				}

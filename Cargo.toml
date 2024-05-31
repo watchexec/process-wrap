@@ -20,7 +20,7 @@ rust-version = "1.75.0"
 futures = { version = "0.3.30", optional = true }
 indexmap = "2.2.6"
 tokio = { version = "1.37.0", features = ["io-util", "macros", "process", "rt"], optional = true }
-tracing = "0.1.40"
+tracing = { version = "0.1.40", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28.0", default-features = false, features = ["fs", "poll", "signal"], optional = true }
@@ -33,7 +33,10 @@ remoteprocess = "0.4.13"
 tokio = { version = "1.37.0", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
 
 [features]
-default = ["creation-flags", "job-object", "kill-on-drop", "process-group", "process-session"]
+default = ["creation-flags", "job-object", "kill-on-drop", "process-group", "process-session", "tracing"]
+
+## Enable internal tracing logs
+tracing = ["dep:tracing"]
 
 ## Frontend: StdCommandWrap
 std = ["dep:nix"]

@@ -5,6 +5,7 @@ use std::{
 	time::Duration,
 };
 
+#[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
 use windows::Win32::{
 	Foundation::{CloseHandle, HANDLE},
@@ -33,7 +34,7 @@ use super::{StdChildWrapper, StdCommandWrap, StdCommandWrapper};
 pub struct JobObject;
 
 impl StdCommandWrapper for JobObject {
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, core: &StdCommandWrap) -> Result<()> {
 		let mut flags = CREATE_SUSPENDED;
 		#[cfg(feature = "creation-flags")]
@@ -45,7 +46,7 @@ impl StdCommandWrapper for JobObject {
 		Ok(())
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
 		inner: Box<dyn StdChildWrapper>,
@@ -82,7 +83,7 @@ pub struct JobObjectChild {
 }
 
 impl JobObjectChild {
-	#[instrument(level = "debug", skip(job_port))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(job_port)))]
 	pub(crate) fn new(inner: Box<dyn StdChildWrapper>, job_port: JobPort) -> Self {
 		Self {
 			inner,
@@ -109,12 +110,12 @@ impl StdChildWrapper for JobObjectChild {
 		self.inner.into_inner()
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn start_kill(&mut self) -> Result<()> {
 		terminate_job(self.job_port.job, 1)
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wait(&mut self) -> Result<ExitStatus> {
 		if let ChildExitStatus::Exited(status) = &self.exit_status {
 			return Ok(*status);
@@ -133,7 +134,7 @@ impl StdChildWrapper for JobObjectChild {
 		Ok(status)
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
 		wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?;
 		self.inner.try_wait()

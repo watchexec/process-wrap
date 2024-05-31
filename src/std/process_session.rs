@@ -5,6 +5,7 @@ use std::{
 };
 
 use nix::unistd::{setsid, Pid};
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 use super::{StdCommandWrap, StdCommandWrapper};
@@ -25,7 +26,7 @@ use super::{StdCommandWrap, StdCommandWrapper};
 pub struct ProcessSession;
 
 impl StdCommandWrapper for ProcessSession {
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, _core: &StdCommandWrap) -> Result<()> {
 		unsafe {
 			command.pre_exec(move || setsid().map_err(Error::from).map(|_| ()));
@@ -34,7 +35,7 @@ impl StdCommandWrapper for ProcessSession {
 		Ok(())
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
 		inner: Box<dyn super::core::StdChildWrapper>,

@@ -2,6 +2,7 @@ use std::io::Result;
 
 use nix::sys::signal::{sigprocmask, SigSet, SigmaskHow};
 use tokio::process::Command;
+#[cfg(feature = "tracing")]
 use tracing::trace;
 
 use super::{TokioCommandWrap, TokioCommandWrapper};
@@ -19,8 +20,13 @@ impl TokioCommandWrapper for ResetSigmask {
 			command.pre_exec(|| {
 				let mut oldset = SigSet::empty();
 				let newset = SigSet::all();
+
+				#[cfg(feature = "tracing")]
 				trace!(unblocking=?newset, "resetting process sigmask");
+
 				sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&newset), Some(&mut oldset))?;
+
+				#[cfg(feature = "tracing")]
 				trace!(?oldset, "sigmask reset");
 				Ok(())
 			});

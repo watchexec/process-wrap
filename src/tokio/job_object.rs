@@ -4,6 +4,7 @@ use tokio::{
 	process::{Child, Command},
 	task::spawn_blocking,
 };
+#[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
 use windows::Win32::{
 	Foundation::{CloseHandle, HANDLE},
@@ -34,7 +35,7 @@ use super::{TokioChildWrapper, TokioCommandWrap, TokioCommandWrapper};
 pub struct JobObject;
 
 impl TokioCommandWrapper for JobObject {
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, core: &TokioCommandWrap) -> Result<()> {
 		let mut flags = CREATE_SUSPENDED;
 		#[cfg(feature = "creation-flags")]
@@ -46,7 +47,7 @@ impl TokioCommandWrapper for JobObject {
 		Ok(())
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
 		inner: Box<dyn TokioChildWrapper>,
@@ -64,6 +65,7 @@ impl TokioCommandWrapper for JobObject {
 		#[cfg(not(feature = "creation-flags"))]
 		let create_suspended = false;
 
+		#[cfg(feature = "tracing")]
 		debug!(
 			?kill_on_drop,
 			?create_suspended,
@@ -97,7 +99,7 @@ pub struct JobObjectChild {
 }
 
 impl JobObjectChild {
-	#[instrument(level = "debug", skip(job_port))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(job_port)))]
 	pub(crate) fn new(inner: Box<dyn TokioChildWrapper>, job_port: JobPort) -> Self {
 		Self {
 			inner,
@@ -124,12 +126,12 @@ impl TokioChildWrapper for JobObjectChild {
 		self.inner.into_inner()
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn start_kill(&mut self) -> Result<()> {
 		terminate_job(self.job_port.job, 1)
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wait(&mut self) -> Box<dyn Future<Output = Result<ExitStatus>> + Send + '_> {
 		Box::new(async {
 			if let ChildExitStatus::Exited(status) = &self.exit_status {
@@ -160,7 +162,7 @@ impl TokioChildWrapper for JobObjectChild {
 		})
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
 		wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?;
 		self.inner.try_wait()

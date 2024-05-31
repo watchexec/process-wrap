@@ -14,6 +14,7 @@ use nix::{
 	},
 	unistd::{setpgid, Pid},
 };
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 use crate::ChildExitStatus;
@@ -61,7 +62,7 @@ pub struct ProcessGroupChild {
 }
 
 impl ProcessGroupChild {
-	#[instrument(level = "debug")]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 	pub(crate) fn new(inner: Box<dyn StdChildWrapper>, pgid: Pid) -> Self {
 		Self {
 			inner,
@@ -79,7 +80,7 @@ impl ProcessGroupChild {
 }
 
 impl StdCommandWrapper for ProcessGroup {
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, _core: &StdCommandWrap) -> Result<()> {
 		#[cfg(Std_unstable)]
 		{
@@ -99,7 +100,7 @@ impl StdCommandWrapper for ProcessGroup {
 		Ok(())
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
 		inner: Box<dyn StdChildWrapper>,
@@ -112,12 +113,12 @@ impl StdCommandWrapper for ProcessGroup {
 }
 
 impl ProcessGroupChild {
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn signal_imp(&self, sig: Signal) -> Result<()> {
 		killpg(self.pgid, sig).map_err(Error::from)
 	}
 
-	#[instrument(level = "debug")]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 	fn wait_imp(pgid: Pid, flag: WaitPidFlag) -> Result<ControlFlow<Option<ExitStatus>>> {
 		// wait for processes in a loop until every process in this group has
 		// exited (this ensures that we reap any zombies that may have been
@@ -173,12 +174,12 @@ impl StdChildWrapper for ProcessGroupChild {
 		self.inner.into_inner()
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn start_kill(&mut self) -> Result<()> {
 		self.signal_imp(Signal::SIGKILL)
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wait(&mut self) -> Result<ExitStatus> {
 		if let ChildExitStatus::Exited(status) = &self.exit_status {
 			return Ok(*status);
@@ -194,7 +195,7 @@ impl StdChildWrapper for ProcessGroupChild {
 		Ok(status)
 	}
 
-	#[instrument(level = "debug", skip(self))]
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
 		if let ChildExitStatus::Exited(status) = &self.exit_status {
 			return Ok(Some(*status));
