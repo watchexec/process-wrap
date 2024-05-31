@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [8.0.1](https://github.com/watchexec/process-wrap/compare/v8.0.0..8.0.1) - 2024-05-31
+
+
+- **Deps:** Turn futures into an optional dependency (#7) - ([0c8b54b](https://github.com/watchexec/process-wrap/commit/0c8b54b0a1fcc56a63bc44ba0bebb5c1da3022f9))
+
+---
 ## [8.0.0](https://github.com/watchexec/process-wrap/compare/v7.1.0..8.0.0) - 2024-04-20
 
 
