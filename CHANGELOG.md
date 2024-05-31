@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [8.0.2](https://github.com/watchexec/process-wrap/compare/v8.0.1..8.0.2) - 2024-05-31
+
+
+- **Deps:** Add tracing feature to remove tracing dep if wanted - ([9f64922](https://github.com/watchexec/process-wrap/commit/9f649226dd409f951a0f985cf2717cbe489deba6))
+
+---
 ## [8.0.1](https://github.com/watchexec/process-wrap/compare/v8.0.0..8.0.1) - 2024-05-31
 
 
