@@ -93,8 +93,8 @@ impl TokioCommandWrapper for ProcessGroup {
 		}
 
 		#[cfg(not(tokio_unstable))]
-		let leader = self.leader;
 		unsafe {
+			let leader = self.leader;
 			command.pre_exec(move || {
 				setpgid(Pid::this(), leader)
 					.map_err(Error::from)
