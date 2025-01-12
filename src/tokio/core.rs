@@ -24,6 +24,7 @@ crate::generic_wrap::Wrap!(
 	|child| child
 );
 
+crate::generic_wrap::MaybeAnyTrait! {
 /// Wrapper for `tokio::process::Child`.
 ///
 /// This trait exposes most of the functionality of the underlying [`Child`]. It is implemented for
@@ -59,7 +60,7 @@ crate::generic_wrap::Wrap!(
 ///     }
 /// }
 /// ```
-pub trait TokioChildWrapper: std::fmt::Debug + Send + Sync {
+pub trait TokioChildWrapper {
 	/// Obtain a reference to the underlying `Child`.
 	fn inner(&self) -> &Child;
 
@@ -211,6 +212,7 @@ pub trait TokioChildWrapper: std::fmt::Debug + Send + Sync {
 			Ok(())
 		}
 	}
+}
 }
 
 impl TokioChildWrapper for Child {

@@ -41,6 +41,9 @@ tokio = { version = "1.38.0", features = ["io-util", "macros", "process", "rt", 
 [features]
 default = ["creation-flags", "job-object", "kill-on-drop", "process-group", "process-session", "tracing"]
 
+## Enable Any trait bound on the ChildWrapper traits
+downcasting = []
+
 ## Enable internal tracing logs
 tracing = ["dep:tracing"]
 

@@ -18,6 +18,7 @@ crate::generic_wrap::Wrap!(
 	StdChild // |child| StdChild(child)
 );
 
+crate::generic_wrap::MaybeAnyTrait! {
 /// Wrapper for `std::process::Child`.
 ///
 /// This trait exposes most of the functionality of the underlying [`Child`]. It is implemented for
@@ -54,7 +55,7 @@ crate::generic_wrap::Wrap!(
 ///     }
 /// }
 /// ```
-pub trait StdChildWrapper: std::fmt::Debug + Send + Sync {
+pub trait StdChildWrapper {
 	/// Obtain a reference to the underlying `Child`.
 	fn inner(&self) -> &Child;
 
@@ -210,6 +211,7 @@ pub trait StdChildWrapper: std::fmt::Debug + Send + Sync {
 		)
 		.map_err(std::io::Error::from)
 	}
+}
 }
 
 /// A thin wrapper around [`Child`].

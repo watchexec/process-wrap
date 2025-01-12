@@ -12,7 +12,7 @@ use nix::{
 		signal::{killpg, Signal},
 		wait::WaitPidFlag,
 	},
-	unistd::{setpgid, Pid},
+	unistd::Pid,
 };
 #[cfg(feature = "tracing")]
 use tracing::instrument;

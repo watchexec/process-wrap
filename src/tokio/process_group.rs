@@ -13,7 +13,7 @@ use nix::{
 		signal::{killpg, Signal},
 		wait::WaitPidFlag,
 	},
-	unistd::{setpgid, Pid},
+	unistd::Pid,
 };
 use tokio::{
 	process::{Child, Command},
