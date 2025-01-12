@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [8.1.0](https://github.com/watchexec/process-wrap/compare/v8.0.2..8.1.0) - 2025-01-12
+
+
+- **Bugfix:** Cfg attribute scope (#10) - ([04a41f3](https://github.com/watchexec/process-wrap/commit/04a41f3c3ce1c632e5854ddfbe2fe9e0c5c7101f))
+- **Deps:** Push tokio requirement to 1.38 to be able to use stable process_group() - ([ff834da](https://github.com/watchexec/process-wrap/commit/ff834da00187d294a6f779f0dc5d28363acb58df))
+- **Deps:** Update lockfile - ([d8c3e1f](https://github.com/watchexec/process-wrap/commit/d8c3e1fa8d52e9df1e7b715c52ff44fc37f80b56))
+- **Deps:** Upgrade nix to 0.29 - ([067ff80](https://github.com/watchexec/process-wrap/commit/067ff80779296b2aec047cab3c40d9570197901d))
+- **Deps:** Upgrade windows to 0.59 - ([067ff80](https://github.com/watchexec/process-wrap/commit/067ff80779296b2aec047cab3c40d9570197901d))
+- **Deps:** Bump MSRV to 1.77 - ([6ec3a36](https://github.com/watchexec/process-wrap/commit/6ec3a3631f93b98d2e95d7a4aba5ab492e3a82a2))
+- **Documentation:** Add notes to indicate which deps can be bumped safely - ([067ff80](https://github.com/watchexec/process-wrap/commit/067ff80779296b2aec047cab3c40d9570197901d))
+- **Feature:** Add try_clone to the child wrapper traits - ([3162a4a](https://github.com/watchexec/process-wrap/commit/3162a4abfbe3440037540bca858b8f912fb419c8))
+- **Feature:** Use process_group() from std (available since Rust 1.64) - ([76de1d5](https://github.com/watchexec/process-wrap/commit/76de1d5118b04dcd7a7046e3592880e38d6a9672))
+- **Tweak:** Wrap some windows handles that are safe to Send - ([657d4e3](https://github.com/watchexec/process-wrap/commit/657d4e302a399836b092452da588afb54486a1e7))
+
+---
 ## [8.0.2](https://github.com/watchexec/process-wrap/compare/v8.0.1..8.0.2) - 2024-05-31
 
 
