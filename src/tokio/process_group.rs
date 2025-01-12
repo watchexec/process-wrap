@@ -87,21 +87,7 @@ impl ProcessGroupChild {
 impl TokioCommandWrapper for ProcessGroup {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, _core: &TokioCommandWrap) -> Result<()> {
-		#[cfg(tokio_unstable)]
-		{
-			command.process_group(self.leader.as_raw());
-		}
-
-		#[cfg(not(tokio_unstable))]
-		unsafe {
-			let leader = self.leader;
-			command.pre_exec(move || {
-				setpgid(Pid::this(), leader)
-					.map_err(Error::from)
-					.map(|_| ())
-			});
-		}
-
+		command.process_group(self.leader.as_raw());
 		Ok(())
 	}
 
