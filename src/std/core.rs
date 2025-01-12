@@ -68,6 +68,14 @@ pub trait StdChildWrapper: std::fmt::Debug + Send + Sync {
 	/// this is always safe.
 	fn into_inner(self: Box<Self>) -> Child;
 
+	/// Obtain a clone if possible.
+	///
+	/// Some implementations may make it possible to clone the implementing structure, even though
+	/// std's `Child` isn't `Clone`. In those cases, this method should be overridden.
+	fn try_clone(&self) -> Option<Box<dyn StdChildWrapper>> {
+		None
+	}
+
 	/// Obtain the `Child`'s stdin.
 	///
 	/// By default this is a passthrough to the underlying `Child`.
