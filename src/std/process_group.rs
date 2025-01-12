@@ -82,21 +82,7 @@ impl ProcessGroupChild {
 impl StdCommandWrapper for ProcessGroup {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, _core: &StdCommandWrap) -> Result<()> {
-		#[cfg(Std_unstable)]
-		{
-			command.process_group(self.leader.as_raw());
-		}
-
-		#[cfg(not(Std_unstable))]
-		let leader = self.leader;
-		unsafe {
-			command.pre_exec(move || {
-				setpgid(Pid::this(), leader)
-					.map_err(Error::from)
-					.map(|_| ())
-			});
-		}
-
+		command.process_group(self.leader.as_raw());
 		Ok(())
 	}
 
