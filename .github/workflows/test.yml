@@ -16,7 +16,7 @@ jobs:
           - windows
         toolchain:
           - stable
-          - 1.75.0
+          - 1.77.0
         features:
           - tokio1
           - std

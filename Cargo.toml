@@ -14,12 +14,12 @@ readme = "README.md"
 
 edition = "2021"
 exclude = ["/bin", "/.github"]
-rust-version = "1.75.0"
+rust-version = "1.77.0"
 
 [dependencies]
 futures = { version = "0.3.30", optional = true }
 indexmap = "2.2.6"
-tokio = { version = "1.37.0", features = ["io-util", "macros", "process", "rt"], optional = true }
+tokio = { version = "1.38.0", features = ["io-util", "macros", "process", "rt"], optional = true }
 tracing = { version = "0.1.40", optional = true }
 # note: this library doesn't consider bumping the tokio minor to be
 # a breaking change, so long as it remains ~6 months below current
@@ -35,7 +35,7 @@ windows = { version = "0.59.0", optional = true }
 # as process-wrap is carefully designed to never expose windows's types
 
 [dev-dependencies]
-remoteprocess = "0.5"
+remoteprocess = "0.5.0"
 tokio = { version = "1.38.0", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
 
 [features]
