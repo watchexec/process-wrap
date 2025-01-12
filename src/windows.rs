@@ -25,47 +25,57 @@ use windows::Win32::{
 	},
 };
 
+#[derive(Clone, Copy, Debug)]
+pub struct JobHandle(pub HANDLE);
+
+unsafe impl Send for JobHandle {}
+unsafe impl Sync for JobHandle {}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PortHandle(pub HANDLE);
+
+unsafe impl Send for PortHandle {}
+unsafe impl Sync for PortHandle {}
+
 /// A JobObject and its associated completion port.
 ///
 /// This struct closes the handles when dropped.
 #[derive(Debug)]
 pub(crate) struct JobPort {
-	pub job: HANDLE,
-	pub completion_port: HANDLE,
+	pub job: JobHandle,
+	pub completion_port: PortHandle,
 }
 
 impl Drop for JobPort {
 	fn drop(&mut self) {
-		unsafe { CloseHandle(self.job) }.ok();
-		unsafe { CloseHandle(self.completion_port) }.ok();
+		unsafe { CloseHandle(self.job.0) }.ok();
+		unsafe { CloseHandle(self.completion_port.0) }.ok();
 	}
 }
-
-unsafe impl Send for JobPort {}
-unsafe impl Sync for JobPort {}
 
 /// Create a JobObject and an associated completion port.
 ///
 /// If `kill_on_drop` is true, we opt into the `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` flag, which
 /// essentially implements the "reap children" feature of Unix systems directly in Win32.
 #[cfg_attr(feature = "tracing", instrument(level = "debug"))]
-pub(crate) fn make_job_object(handle: HANDLE, kill_on_drop: bool) -> Result<JobPort> {
-	let job = unsafe { CreateJobObjectW(None, None) }.map_err(Error::other)?;
+pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Result<JobPort> {
+	let job = JobHandle(unsafe { CreateJobObjectW(None, None) }.map_err(Error::other)?);
 	#[cfg(feature = "tracing")]
 	debug!(?job, "done CreateJobObjectW");
 
-	let completion_port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) }?;
+	let completion_port =
+		PortHandle(unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) }?);
 	#[cfg(feature = "tracing")]
 	debug!(?completion_port, "done CreateIoCompletionPort");
 
 	let associate_completion = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
-		CompletionKey: job.0 as _,
-		CompletionPort: completion_port,
+		CompletionKey: job.0 .0 as _,
+		CompletionPort: completion_port.0,
 	};
 
 	unsafe {
 		SetInformationJobObject(
-			job,
+			job.0,
 			JobObjectAssociateCompletionPortInformation,
 			(&associate_completion) as *const _ as _,
 			std::mem::size_of_val(&associate_completion)
@@ -87,7 +97,7 @@ pub(crate) fn make_job_object(handle: HANDLE, kill_on_drop: bool) -> Result<JobP
 
 	unsafe {
 		SetInformationJobObject(
-			job,
+			job.0,
 			JobObjectExtendedLimitInformation,
 			&info as *const _ as _,
 			std::mem::size_of_val(&info)
@@ -98,9 +108,9 @@ pub(crate) fn make_job_object(handle: HANDLE, kill_on_drop: bool) -> Result<JobP
 	#[cfg(feature = "tracing")]
 	debug!(?info, "done SetInformationJobObject(limit)");
 
-	unsafe { AssignProcessToJobObject(job, handle) }?;
+	unsafe { AssignProcessToJobObject(job.0, process_handle) }?;
 	#[cfg(feature = "tracing")]
-	debug!(?job, ?handle, "done AssignProcessToJobObject");
+	debug!(?job, ?process_handle, "done AssignProcessToJobObject");
 
 	Ok(JobPort {
 		job,
@@ -153,14 +163,14 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 
 /// Terminate a job object without waiting for the processes to exit.
 #[cfg_attr(feature = "tracing", instrument(level = "debug"))]
-pub(crate) fn terminate_job(job: HANDLE, exit_code: u32) -> Result<()> {
-	unsafe { TerminateJobObject(job, exit_code) }.map_err(Error::other)
+pub(crate) fn terminate_job(job: JobHandle, exit_code: u32) -> Result<()> {
+	unsafe { TerminateJobObject(job.0, exit_code) }.map_err(Error::other)
 }
 
 /// Wait for a job to complete.
 #[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 pub(crate) fn wait_on_job(
-	completion_port: HANDLE,
+	completion_port: PortHandle,
 	timeout: Option<Duration>,
 ) -> Result<ControlFlow<()>> {
 	let mut code: u32 = 0;
@@ -170,7 +180,7 @@ pub(crate) fn wait_on_job(
 
 	let result = unsafe {
 		GetQueuedCompletionStatus(
-			completion_port,
+			completion_port.0,
 			&mut code,
 			&mut key,
 			&mut lp_overlapped as *mut _,

@@ -119,7 +119,7 @@ impl TokioChildWrapper for JobObjectChild {
 	fn into_inner(self: Box<Self>) -> Child {
 		// manually drop the completion port
 		let its = std::mem::ManuallyDrop::new(self.job_port);
-		unsafe { CloseHandle(its.completion_port) }.ok();
+		unsafe { CloseHandle(its.completion_port.0) }.ok();
 		// we leave the job handle unclosed, otherwise the Child is useless
 		// (as closing it will terminate the job)
 
