@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [8.2.0](https://github.com/watchexec/process-wrap/compare/v8.1.0..8.2.0) - 2025-01-12
+
+
+- **Feature:** Add downcasting feature which adds Any trait bound to ChildWrappers - ([3e48bf8](https://github.com/watchexec/process-wrap/commit/3e48bf86e1bff9c21f8f8cbd68ef77537e3ccf2e))
+
+---
 ## [8.1.0](https://github.com/watchexec/process-wrap/compare/v8.0.2..8.1.0) - 2025-01-12
 
 
