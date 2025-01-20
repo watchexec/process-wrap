@@ -18,7 +18,7 @@ rust-version = "1.77.0"
 
 [dependencies]
 futures = { version = "0.3.30", optional = true }
-indexmap = "2.2.6"
+indexmap = "2.7.1"
 tokio = { version = "1.38.0", features = ["io-util", "macros", "process", "rt"], optional = true }
 tracing = { version = "0.1.40", optional = true }
 # note: this library doesn't consider bumping the tokio minor to be
