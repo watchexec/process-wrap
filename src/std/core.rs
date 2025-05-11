@@ -248,17 +248,17 @@ fn read2(
 	};
 	use std::{
 		io::Error,
-		os::fd::{AsRawFd, BorrowedFd, RawFd},
+		os::fd::{AsRawFd, BorrowedFd},
 	};
 
 	let out_fd = out_r.as_raw_fd();
 	let err_fd = err_r.as_raw_fd();
-	set_nonblocking(out_fd, true)?;
-	set_nonblocking(err_fd, true)?;
-
 	// SAFETY: these are dropped at the same time as all other FDs here
 	let out_bfd = unsafe { BorrowedFd::borrow_raw(out_fd) };
 	let err_bfd = unsafe { BorrowedFd::borrow_raw(err_fd) };
+
+	set_nonblocking(out_bfd, true)?;
+	set_nonblocking(err_bfd, true)?;
 
 	let mut fds = [
 		PollFd::new(out_bfd, PollFlags::POLLIN),
@@ -269,11 +269,11 @@ fn read2(
 		poll(&mut fds, PollTimeout::NONE)?;
 
 		if fds[0].revents().is_some() && read(&mut out_r, out_v)? {
-			set_nonblocking(err_fd, false)?;
+			set_nonblocking(err_bfd, false)?;
 			return err_r.read_to_end(err_v).map(drop);
 		}
 		if fds[1].revents().is_some() && read(&mut err_r, err_v)? {
-			set_nonblocking(out_fd, false)?;
+			set_nonblocking(out_bfd, false)?;
 			return out_r.read_to_end(out_v).map(drop);
 		}
 	}
@@ -294,15 +294,15 @@ fn read2(
 	}
 
 	#[cfg(target_os = "linux")]
-	fn set_nonblocking(fd: RawFd, nonblocking: bool) -> Result<()> {
+	fn set_nonblocking(fd: BorrowedFd, nonblocking: bool) -> Result<()> {
 		let v = nonblocking as libc::c_int;
-		let res = unsafe { libc::ioctl(fd, libc::FIONBIO, &v) };
+		let res = unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONBIO, &v) };
 
 		Errno::result(res).map_err(Error::from).map(drop)
 	}
 
 	#[cfg(not(target_os = "linux"))]
-	fn set_nonblocking(fd: RawFd, nonblocking: bool) -> Result<()> {
+	fn set_nonblocking(fd: BorrowedFd, nonblocking: bool) -> Result<()> {
 		use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
 		let mut flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
