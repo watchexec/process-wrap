@@ -26,7 +26,7 @@ The full test suite from command-group was retained: process-wrap has parity on 
 
 ```toml
 [dependencies]
-process-wrap = { version = "8.2.0", features = ["tokio1"] }
+process-wrap = { version = "8.2.1", features = ["tokio1"] }
 ```
 
 By default, the crate does nothing, you need to enable either the std or Tokio "frontend". A default
@@ -87,7 +87,7 @@ dbg!(status);
 
 ```toml
 [dependencies]
-process-wrap = { version = "8.2.0", features = ["std"] }
+process-wrap = { version = "8.2.1", features = ["std"] }
 ```
 
 ```rust

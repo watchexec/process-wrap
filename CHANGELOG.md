@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [8.2.1](https://github.com/watchexec/process-wrap/compare/v8.2.0..8.2.1) - 2025-05-15
+
+
+- **Deps:** Update nix to 0.30 (#18) - ([fa80dc6](https://github.com/watchexec/process-wrap/commit/fa80dc61f8cdedaf537242100b0e48737ff872c7))
+- **Deps:** Update lockfile - ([854f074](https://github.com/watchexec/process-wrap/commit/854f0742e31653ead84ffa57623b283dcbff92f1))
+- **Documentation:** Mention ordering requirement - ([573f2ba](https://github.com/watchexec/process-wrap/commit/573f2ba98d48134793b24f522196f0d7abf4d87d))
+
+---
 ## [8.2.0](https://github.com/watchexec/process-wrap/compare/v8.1.0..8.2.0) - 2025-01-12
 
 
