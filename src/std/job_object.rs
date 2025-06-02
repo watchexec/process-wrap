@@ -40,7 +40,7 @@ impl StdCommandWrapper for JobObject {
 	fn pre_spawn(&mut self, command: &mut Command, core: &StdCommandWrap) -> Result<()> {
 		let mut flags = CREATE_SUSPENDED;
 		#[cfg(feature = "creation-flags")]
-		if let Some(CreationFlags(user_flags)) = core.get_wrap::<CreationFlags>() {
+		if let Some(CreationFlags(user_flags)) = core.get_wrap::<CreationFlags>().as_deref() {
 			flags |= *user_flags;
 		}
 

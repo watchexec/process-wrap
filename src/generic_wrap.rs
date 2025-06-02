@@ -12,7 +12,7 @@ macro_rules! Wrap {
 		#[derive(Debug)]
 		pub struct $name {
 			command: $command,
-			wrappers: ::indexmap::IndexMap<::std::any::TypeId, Box<dyn $wrapper>>,
+			wrappers: ::indexmap::IndexMap<::std::any::TypeId, ::std::cell::RefCell<::std::option::Option<Box<dyn $wrapper>>>>,
 		}
 
 		impl $name {
@@ -62,50 +62,18 @@ macro_rules! Wrap {
 			/// Returns `&mut self` for chaining.
 			pub fn wrap<W: $wrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
 				let typeid = ::std::any::TypeId::of::<W>();
-				let mut wrapper = Some(Box::new(wrapper));
+				let boxed: Box<(dyn $wrapper + 'static)> = Box::new(wrapper);
+				let mut wrapper = Some(::std::cell::RefCell::new(Some(boxed)));
 				let extant = self
 					.wrappers
 					.entry(typeid)
 					.or_insert_with(|| wrapper.take().unwrap());
 				if let Some(wrapper) = wrapper {
-					extant.extend(wrapper);
+					// UNWRAPs: we've just created those so we know they're Somes
+					extant.get_mut().as_mut().unwrap().extend(wrapper.into_inner().unwrap());
 				}
 
 				self
-			}
-
-			// poor man's try..finally block
-			#[inline]
-			fn spawn_inner(
-				&self,
-				command: &mut $command,
-				wrappers: &mut ::indexmap::IndexMap<::std::any::TypeId, Box<dyn $wrapper>>,
-			) -> ::std::io::Result<Box<dyn $childer>> {
-				for (id, wrapper) in wrappers.iter_mut() {
-					#[cfg(feature = "tracing")]
-					::tracing::debug!(?id, "pre_spawn");
-					wrapper.pre_spawn(command, self)?;
-				}
-
-				let mut child = command.spawn()?;
-				for (id, wrapper) in wrappers.iter_mut() {
-					#[cfg(feature = "tracing")]
-					::tracing::debug!(?id, "post_spawn");
-					wrapper.post_spawn(&mut child, self)?;
-				}
-
-				let mut child = Box::new(
-					#[allow(clippy::redundant_closure_call)]
-					$first_child_wrapper(child),
-				) as Box<dyn $childer>;
-
-				for (id, wrapper) in wrappers.iter_mut() {
-					#[cfg(feature = "tracing")]
-					::tracing::debug!(?id, "wrap_child");
-					child = wrapper.wrap_child(child, self)?;
-				}
-
-				Ok(child)
 			}
 
 			/// Spawn the command, returning a `Child` that can be interacted with.
@@ -115,15 +83,49 @@ macro_rules! Wrap {
 			/// trait object, only the methods from the trait are available directly; however you
 			/// may downcast to the concrete type of the last applied wrapper if you need to.
 			pub fn spawn(&mut self) -> ::std::io::Result<Box<dyn $childer>> {
-				let mut command = ::std::mem::replace(&mut self.command, <$command>::new(""));
-				let mut wrappers = ::std::mem::take(&mut self.wrappers);
+				// for each loop, we extract the active wrapper from its cell
+				// so we can use it mutably independently from the self borrow
+				// then we re-insert it; this happens regardless of the result
 
-				let res = self.spawn_inner(&mut command, &mut wrappers);
+				for (id, cell) in &self.wrappers {
+					#[cfg(feature = "tracing")]
+					::tracing::debug!(?id, "pre_spawn");
+					if let Some(mut wrapper) = cell.take() {
+						let mut command = ::std::mem::replace(&mut self.command, <$command>::new(""));
+						let ret = wrapper.pre_spawn(&mut command, self);
+						self.command = command;
+						cell.replace(Some(wrapper));
+						ret?;
+					}
+				}
 
-				self.command = command;
-				self.wrappers = wrappers;
+				let mut child = self.command.spawn()?;
+				for (id, cell) in &self.wrappers {
+					#[cfg(feature = "tracing")]
+					::tracing::debug!(?id, "post_spawn");
+					if let Some(mut wrapper) = cell.take() {
+						let ret = wrapper.post_spawn(&mut child, self);
+						cell.replace(Some(wrapper));
+						ret?;
+					}
+				}
 
-				res
+				let mut child = Box::new(
+					#[allow(clippy::redundant_closure_call)]
+					$first_child_wrapper(child),
+				) as Box<dyn $childer>;
+
+				for (id, cell) in &self.wrappers {
+					#[cfg(feature = "tracing")]
+					::tracing::debug!(?id, "wrap_child");
+					if let Some(mut wrapper) = cell.take() {
+						let ret = wrapper.wrap_child(child, self);
+						cell.replace(Some(wrapper));
+						child = ret?;
+					}
+				}
+
+				Ok(child)
 			}
 
 			/// Check if a wrapper of a given type is present.
@@ -139,14 +141,23 @@ macro_rules! Wrap {
 			///
 			/// Returns `None` if the wrapper is not present. To merely check if a wrapper is
 			/// present, use `has_wrap` instead.
-			pub fn get_wrap<W: $wrapper + 'static>(&self) -> Option<&W> {
+			///
+			/// Note that calling `.get_wrap()` to retrieve the current wrapper while within that
+			/// wrapper's hooks will return `None`. As this is useless (you should trivially have
+			/// access to the current wrapper), this is not considered a bug.
+			pub fn get_wrap<W: $wrapper + 'static>(&self) -> Option<::std::cell::Ref<W>> {
 				let typeid = ::std::any::TypeId::of::<W>();
-				self.wrappers.get(&typeid).map(|w| {
-					let w_any = w as &dyn ::std::any::Any;
-					w_any
-						.downcast_ref()
-						.expect("downcasting is guaranteed to succeed due to wrap()'s internals")
-				})
+				self.wrappers.get(&typeid)
+					.and_then(|cell| cell.try_borrow().ok()
+						.and_then(|borrow| ::std::cell::Ref::filter_map(
+							borrow, |opt| opt.as_ref().map(|w| {
+								let w_any = w as &dyn ::std::any::Any;
+								w_any
+									.downcast_ref()
+									.expect("downcasting is guaranteed to succeed due to wrap()'s internals")
+							})
+						).ok())
+					)
 			}
 		}
 
