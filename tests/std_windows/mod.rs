@@ -1,7 +1,7 @@
 mod prelude {
 	pub use std::{
 		io::{Read, Result, Write},
-		process::Stdio,
+		process::{Command, Stdio},
 		thread::sleep,
 		time::Duration,
 	};
@@ -9,6 +9,12 @@ mod prelude {
 	pub use process_wrap::std::*;
 
 	pub const DIE_TIME: Duration = Duration::from_millis(1000);
+}
+
+fn init() {
+	tracing_subscriber::fmt()
+		.with_max_level(tracing::Level::DEBUG)
+		.init();
 }
 
 mod id_same_as_inner;

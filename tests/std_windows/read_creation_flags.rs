@@ -1,9 +1,6 @@
-use std::{
-	process::Command,
-	sync::{
-		atomic::{AtomicU32, Ordering},
-		Arc,
-	},
+use std::sync::{
+	atomic::{AtomicU32, Ordering},
+	Arc,
 };
 
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
@@ -28,6 +25,8 @@ impl StdCommandWrapper for FlagSpy {
 
 #[test]
 fn retrieve_flags() -> Result<()> {
+	super::init();
+
 	let spy = FlagSpy::default();
 	let _ = StdCommandWrap::with_new("powershell.exe", |command| {
 		command.arg("/C").arg("echo hello").stdout(Stdio::piped());

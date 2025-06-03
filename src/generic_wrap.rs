@@ -67,8 +67,14 @@ macro_rules! Wrap {
 				let extant = self
 					.wrappers
 					.entry(typeid)
-					.or_insert_with(|| wrapper.take().unwrap());
+					.or_insert_with(|| {
+						#[cfg(feature = "tracing")]
+						::tracing::debug!(id=?typeid, "wrap");
+						wrapper.take().unwrap()
+					});
 				if let Some(wrapper) = wrapper {
+					#[cfg(feature = "tracing")]
+					::tracing::debug!(id=?typeid, "wrap extend");
 					// UNWRAPs: we've just created those so we know they're Somes
 					extant.get_mut().as_mut().unwrap().extend(wrapper.into_inner().unwrap());
 				}
@@ -147,17 +153,21 @@ macro_rules! Wrap {
 			/// access to the current wrapper), this is not considered a bug.
 			pub fn get_wrap<W: $wrapper + 'static>(&self) -> Option<::std::cell::Ref<W>> {
 				let typeid = ::std::any::TypeId::of::<W>();
+				#[cfg(feature = "tracing")]
+				::tracing::debug!(id=?typeid, "get wrap");
 				self.wrappers.get(&typeid)
-					.and_then(|cell| cell.try_borrow().ok()
-						.and_then(|borrow| ::std::cell::Ref::filter_map(
-							borrow, |opt| opt.as_ref().map(|w| {
-								let w_any = w as &dyn ::std::any::Any;
-								w_any
-									.downcast_ref()
-									.expect("downcasting is guaranteed to succeed due to wrap()'s internals")
-							})
-						).ok())
-					)
+					.and_then(|cell| cell.try_borrow().ok())
+					.and_then(|borrow| ::std::cell::Ref::filter_map(
+						borrow, |opt| opt.as_ref().map(|w: &Box<dyn $wrapper>| {
+							#[cfg(feature = "tracing")]
+							::tracing::debug!(id=?typeid, "got wrap");
+							let w_any = w as &dyn ::std::any::Any;
+							w_any
+								.downcast_ref()
+								.expect("downcasting is guaranteed to succeed due to wrap()'s internals")
+						})
+					).ok())
+
 			}
 		}
 
