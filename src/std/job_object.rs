@@ -63,6 +63,7 @@ impl StdCommandWrapper for JobObject {
 		#[cfg(not(feature = "creation-flags"))]
 		let create_suspended = false;
 
+		#[cfg(feature = "tracing")]
 		debug!(?create_suspended, "options from other wrappers");
 
 		let handle = HANDLE(inner.inner().as_raw_handle() as _);
