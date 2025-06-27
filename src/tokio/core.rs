@@ -181,8 +181,7 @@ pub trait TokioChildWrapper: Any + std::fmt::Debug + Send {
 			let stdout_fut = read_to_end(&mut stdout_pipe);
 			let stderr_fut = read_to_end(&mut stderr_pipe);
 
-			let (status, stdout, stderr) =
-				try_join3(self.wait(), stdout_fut, stderr_fut).await?;
+			let (status, stdout, stderr) = try_join3(self.wait(), stdout_fut, stderr_fut).await?;
 
 			// Drop happens after `try_join` due to <https://github.com/tokio-rs/tokio/issues/4309>
 			drop(stdout_pipe);
@@ -238,8 +237,8 @@ impl TokioChildWrapper for Child {
 
 impl dyn TokioChildWrapper {
 	fn downcast_ref<T: 'static>(&self) -> Option<&T> {
-        (self as &dyn Any).downcast_ref()
-    }
+		(self as &dyn Any).downcast_ref()
+	}
 
 	fn is_raw_child(&self) -> bool {
 		self.downcast_ref::<Child>().is_some()

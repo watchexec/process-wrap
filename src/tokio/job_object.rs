@@ -1,9 +1,6 @@
 use std::{future::Future, io::Result, pin::Pin, process::ExitStatus, time::Duration};
 
-use tokio::{
-	process::Command,
-	task::spawn_blocking,
-};
+use tokio::{process::Command, task::spawn_blocking};
 #[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
 use windows::Win32::{
