@@ -1,7 +1,7 @@
-use std::{future::Future, io::Result, process::ExitStatus, time::Duration};
+use std::{future::Future, io::Result, pin::Pin, process::ExitStatus, time::Duration};
 
 use tokio::{
-	process::{Child, Command},
+	process::Command,
 	task::spawn_blocking,
 };
 #[cfg(feature = "tracing")]
@@ -78,7 +78,7 @@ impl TokioCommandWrapper for JobObject {
 
 		let handle = HANDLE(
 			inner
-				.inner()
+				.inner_child()
 				.raw_handle()
 				.expect("child has exited but it has not even started") as _,
 		);
@@ -114,13 +114,13 @@ impl JobObjectChild {
 }
 
 impl TokioChildWrapper for JobObjectChild {
-	fn inner(&self) -> &Child {
+	fn inner(&self) -> &dyn TokioChildWrapper {
 		self.inner.inner()
 	}
-	fn inner_mut(&mut self) -> &mut Child {
+	fn inner_mut(&mut self) -> &mut dyn TokioChildWrapper {
 		self.inner.inner_mut()
 	}
-	fn into_inner(self: Box<Self>) -> Child {
+	fn into_inner(self: Box<Self>) -> Box<dyn TokioChildWrapper> {
 		// manually drop the completion port
 		let its = std::mem::ManuallyDrop::new(self.job_port);
 		unsafe { CloseHandle(its.completion_port.0) }.ok();
@@ -136,8 +136,8 @@ impl TokioChildWrapper for JobObjectChild {
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
-	fn wait(&mut self) -> Box<dyn Future<Output = Result<ExitStatus>> + Send + '_> {
-		Box::new(async {
+	fn wait(&mut self) -> Pin<Box<dyn Future<Output = Result<ExitStatus>> + Send + '_>> {
+		Box::pin(async {
 			if let ChildExitStatus::Exited(status) = &self.exit_status {
 				return Ok(*status);
 			}
@@ -146,7 +146,7 @@ impl TokioChildWrapper for JobObjectChild {
 
 			// always wait for parent to exit first, as by the time it does,
 			// it's likely that all its children have already exited.
-			let status = Box::into_pin(self.inner.wait()).await?;
+			let status = self.inner.wait().await?;
 			self.exit_status = ChildExitStatus::Exited(status);
 
 			// nevertheless, now try reaping all children a few times...
