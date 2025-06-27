@@ -1,7 +1,7 @@
 use std::{
 	io::Result,
 	os::windows::{io::AsRawHandle, process::CommandExt},
-	process::{Child, Command, ExitStatus},
+	process::{Command, ExitStatus},
 	time::Duration,
 };
 
@@ -66,7 +66,7 @@ impl StdCommandWrapper for JobObject {
 		#[cfg(feature = "tracing")]
 		debug!(?create_suspended, "options from other wrappers");
 
-		let handle = HANDLE(inner.inner().as_raw_handle() as _);
+		let handle = HANDLE(inner.inner_child().as_raw_handle() as _);
 
 		let job_port = make_job_object(handle, false)?;
 
@@ -99,13 +99,13 @@ impl JobObjectChild {
 }
 
 impl StdChildWrapper for JobObjectChild {
-	fn inner(&self) -> &Child {
+	fn inner(&self) -> &dyn StdChildWrapper {
 		self.inner.inner()
 	}
-	fn inner_mut(&mut self) -> &mut Child {
+	fn inner_mut(&mut self) -> &mut dyn StdChildWrapper {
 		self.inner.inner_mut()
 	}
-	fn into_inner(self: Box<Self>) -> Child {
+	fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper> {
 		// manually drop the completion port
 		let its = std::mem::ManuallyDrop::new(self.job_port);
 		unsafe { CloseHandle(its.completion_port.0) }.ok();
