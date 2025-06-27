@@ -32,7 +32,9 @@ use super::{TokioChildWrapper, TokioCommandWrap, TokioCommandWrapper};
 ///
 /// This wrapper provides a child wrapper: [`JobObjectChild`].
 ///
-/// When both [`CreationFlags`] and [`JobObject`] are used together, [`CreationFlags`] must come first.
+/// When both [`CreationFlags`] and [`JobObject`] are used together, either:
+/// - `CreationFlags` must come first, or
+/// - `CreationFlags` must include `CREATE_SUSPENDED`
 #[derive(Clone, Copy, Debug)]
 pub struct JobObject;
 

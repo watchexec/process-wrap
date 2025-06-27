@@ -115,7 +115,9 @@ TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .spawn()?;
 ```
 
-When both `CreationFlags` and `JobObject` are used together, `CreationFlags` must come first.
+When both `CreationFlags` and `JobObject` are used together, either:
+- `CreationFlags` must come first, or
+- `CreationFlags` must include `CREATE_SUSPENDED`
 
 ### Process group
 
@@ -185,7 +187,9 @@ TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .spawn()?;
 ```
 
-When both `CreationFlags` and `JobObject` are used together, `CreationFlags` must come first.
+When both `CreationFlags` and `JobObject` are used together, either:
+- `CreationFlags` must come first, or
+- `CreationFlags` must include `CREATE_SUSPENDED`
 
 ### Kill on drop
 
