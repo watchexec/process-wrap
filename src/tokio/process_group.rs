@@ -201,7 +201,7 @@ impl TokioChildWrapper for ProcessGroupChild {
 
 			// ...finally, if there are some that are still alive,
 			// block in the background to reap them fully.
-			spawn_blocking(move || Self::wait_imp(pgid, WaitPidFlag::empty())).await??;
+			let _ = spawn_blocking(move || Self::wait_imp(pgid, WaitPidFlag::empty())).await??;
 			Ok(status)
 		})
 	}
