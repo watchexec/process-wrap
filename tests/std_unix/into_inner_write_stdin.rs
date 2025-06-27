@@ -2,11 +2,13 @@ use super::prelude::*;
 
 #[test]
 fn nowrap() -> Result<()> {
-	let mut child = StdCommandWrap::with_new("cat", |command| {
-		command.stdin(Stdio::piped()).stdout(Stdio::piped());
-	})
-	.spawn()?
-	.into_inner();
+	let mut child = unsafe {
+		StdCommandWrap::with_new("cat", |command| {
+			command.stdin(Stdio::piped()).stdout(Stdio::piped());
+		})
+		.spawn()?
+		.into_inner_child()
+	};
 
 	if let Some(mut din) = child.stdin.take() {
 		din.write_all(b"hello")?;
@@ -23,12 +25,14 @@ fn nowrap() -> Result<()> {
 
 #[test]
 fn process_group() -> Result<()> {
-	let mut child = StdCommandWrap::with_new("cat", |command| {
-		command.stdin(Stdio::piped()).stdout(Stdio::piped());
-	})
-	.wrap(ProcessGroup::leader())
-	.spawn()?
-	.into_inner();
+	let mut child = unsafe {
+		StdCommandWrap::with_new("cat", |command| {
+			command.stdin(Stdio::piped()).stdout(Stdio::piped());
+		})
+		.wrap(ProcessGroup::leader())
+		.spawn()?
+		.into_inner_child()
+	};
 
 	if let Some(mut din) = child.stdin.take() {
 		din.write_all(b"hello")?;
@@ -45,12 +49,14 @@ fn process_group() -> Result<()> {
 
 #[test]
 fn process_session() -> Result<()> {
-	let mut child = StdCommandWrap::with_new("cat", |command| {
-		command.stdin(Stdio::piped()).stdout(Stdio::piped());
-	})
-	.wrap(ProcessSession)
-	.spawn()?
-	.into_inner();
+	let mut child = unsafe {
+		StdCommandWrap::with_new("cat", |command| {
+			command.stdin(Stdio::piped()).stdout(Stdio::piped());
+		})
+		.wrap(ProcessSession)
+		.spawn()?
+		.into_inner_child()
+	};
 
 	if let Some(mut din) = child.stdin.take() {
 		din.write_all(b"hello")?;
