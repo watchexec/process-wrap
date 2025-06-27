@@ -24,7 +24,6 @@ crate::generic_wrap::Wrap!(
 	|child| child
 );
 
-crate::generic_wrap::MaybeAnyTrait! {
 /// Wrapper for `tokio::process::Child`.
 ///
 /// This trait exposes most of the functionality of the underlying [`Child`]. It is implemented for
@@ -212,7 +211,6 @@ pub trait TokioChildWrapper {
 			Ok(())
 		}
 	}
-}
 }
 
 impl TokioChildWrapper for Child {
