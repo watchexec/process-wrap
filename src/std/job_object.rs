@@ -135,13 +135,13 @@ impl StdChildWrapper for JobObjectChild {
 		let JobPort {
 			completion_port, ..
 		} = self.job_port;
-		wait_on_job(completion_port, None)?;
+		let _ = wait_on_job(completion_port, None)?;
 		Ok(status)
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?;
+		let _ = wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?;
 		self.inner.try_wait()
 	}
 }
