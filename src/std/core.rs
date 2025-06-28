@@ -205,11 +205,7 @@ pub trait StdChildWrapper: Any + std::fmt::Debug + Send {
 	/// and unwrapped processes.
 	#[cfg(unix)]
 	fn signal(&self, sig: i32) -> Result<()> {
-		kill(
-			Pid::from_raw(i32::try_from(self.id()).map_err(std::io::Error::other)?),
-			Signal::try_from(sig)?,
-		)
-		.map_err(std::io::Error::from)
+		self.inner().signal(sig)
 	}
 }
 
@@ -239,6 +235,23 @@ impl StdChildWrapper for StdChild {
 	}
 	fn stderr(&mut self) -> &mut Option<ChildStderr> {
 		&mut self.0.stderr
+	}
+	fn id(&self) -> u32 {
+		self.0.id()
+	}
+	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+		self.0.try_wait()
+	}
+	fn wait(&mut self) -> Result<ExitStatus> {
+		self.0.wait()
+	}
+	#[cfg(unix)]
+	fn signal(&self, sig: i32) -> Result<()> {
+		kill(
+			Pid::from_raw(i32::try_from(self.id()).map_err(std::io::Error::other)?),
+			Signal::try_from(sig)?,
+		)
+		.map_err(std::io::Error::from)
 	}
 }
 
