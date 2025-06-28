@@ -7,10 +7,10 @@ async fn nowrap() -> Result<()> {
 	})
 	.spawn()?;
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert!(status.success());
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert!(status.success());
 
 	Ok(())
@@ -24,10 +24,10 @@ async fn process_group() -> Result<()> {
 	.wrap(ProcessGroup::leader())
 	.spawn()?;
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert!(status.success());
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert!(status.success());
 
 	Ok(())
@@ -41,10 +41,10 @@ async fn process_session() -> Result<()> {
 	.wrap(ProcessSession)
 	.spawn()?;
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert!(status.success());
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert!(status.success());
 
 	Ok(())

@@ -36,10 +36,9 @@ crate::generic_wrap::Wrap!(
 ///
 /// ```rust
 /// use process_wrap::std::*;
-/// use std::process::Child;
 ///
 /// #[derive(Debug)]
-/// pub struct YourChildWrapper(Child);
+/// pub struct YourChildWrapper(StdChild);
 ///
 /// impl StdChildWrapper for YourChildWrapper {
 ///     fn inner(&self) -> &dyn StdChildWrapper {

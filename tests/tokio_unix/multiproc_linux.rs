@@ -83,7 +83,7 @@ async fn process_group_kill_group() -> Result<()> {
 	nix::sys::signal::killpg(nix::unistd::Pid::from_raw(parent), Signal::SIGKILL).unwrap();
 	sleep(DIE_TIME).await;
 	assert!(!pid_alive(child), "child process should be dead");
-	Box::into_pin(leader.wait()).await.unwrap();
+	leader.wait().await.unwrap();
 	assert!(!pid_alive(parent), "parent process should be dead");
 
 	Ok(())
@@ -170,7 +170,7 @@ async fn process_session_kill_group() -> Result<()> {
 	nix::sys::signal::killpg(nix::unistd::Pid::from_raw(parent), Signal::SIGKILL).unwrap();
 	sleep(DIE_TIME).await;
 	assert!(!pid_alive(child), "child process should be dead");
-	Box::into_pin(leader.wait()).await.unwrap();
+	leader.wait().await.unwrap();
 	assert!(!pid_alive(parent), "parent process should be dead");
 
 	Ok(())
