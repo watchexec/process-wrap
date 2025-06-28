@@ -226,16 +226,16 @@ impl TokioChildWrapper for Child {
 		&mut self.stderr
 	}
 	fn id(&self) -> Option<u32> {
-		self.id()
+		Child::id(self)
 	}
 	fn start_kill(&mut self) -> Result<()> {
-		self.start_kill()
+		Child::start_kill(self)
 	}
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		self.try_wait()
+		Child::try_wait(self)
 	}
 	fn wait(&mut self) -> Pin<Box<dyn Future<Output = Result<ExitStatus>> + Send + '_>> {
-		Box::pin(self.wait())
+		Box::pin(Child::wait(self))
 	}
 	#[cfg(unix)]
 	fn signal(&self, sig: i32) -> Result<()> {

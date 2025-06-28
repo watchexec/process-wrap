@@ -229,13 +229,13 @@ impl StdChildWrapper for Child {
 		&mut self.stderr
 	}
 	fn id(&self) -> u32 {
-		self.id()
+		Child::id(self)
 	}
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		self.try_wait()
+		Child::try_wait(self)
 	}
 	fn wait(&mut self) -> Result<ExitStatus> {
-		self.wait()
+		Child::wait(self)
 	}
 	#[cfg(unix)]
 	fn signal(&self, sig: i32) -> Result<()> {
