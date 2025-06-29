@@ -37,6 +37,7 @@ windows = { version = "0.61.1", optional = true }
 [dev-dependencies]
 remoteprocess = "0.5.0"
 tokio = { version = "1.38.2", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
+tracing-subscriber = "0.3.19"
 
 [features]
 default = ["creation-flags", "job-object", "kill-on-drop", "process-group", "process-session", "tracing"]
