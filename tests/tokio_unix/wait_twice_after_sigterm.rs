@@ -10,10 +10,10 @@ async fn nowrap() -> Result<()> {
 
 	child.signal(Signal::SIGTERM as _)?;
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert_eq!(status.signal(), Some(Signal::SIGTERM as i32), "wait() one");
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert_eq!(status.signal(), Some(Signal::SIGTERM as i32), "wait() two");
 
 	Ok(())
@@ -30,10 +30,10 @@ async fn process_group() -> Result<()> {
 
 	child.signal(Signal::SIGTERM as _)?;
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert_eq!(status.signal(), Some(Signal::SIGTERM as i32), "wait() one");
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert_eq!(status.signal(), Some(Signal::SIGTERM as i32), "wait() two");
 
 	Ok(())
@@ -50,10 +50,10 @@ async fn process_session() -> Result<()> {
 
 	child.signal(Signal::SIGTERM as _)?;
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert_eq!(status.signal(), Some(Signal::SIGTERM as i32), "wait() one");
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert_eq!(status.signal(), Some(Signal::SIGTERM as i32), "wait() two");
 
 	Ok(())

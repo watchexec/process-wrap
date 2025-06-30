@@ -8,7 +8,7 @@ async fn nowrap() -> Result<()> {
 	.spawn()?;
 	sleep(DIE_TIME).await;
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert!(status.success());
 
 	Ok(())
@@ -23,7 +23,7 @@ async fn job_object() -> Result<()> {
 	.spawn()?;
 	sleep(DIE_TIME).await;
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert!(status.success());
 
 	Ok(())

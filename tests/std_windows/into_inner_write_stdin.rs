@@ -11,12 +11,12 @@ fn nowrap() -> Result<()> {
 	.spawn()?
 	.into_inner();
 
-	if let Some(mut din) = child.stdin.take() {
+	if let Some(mut din) = child.stdin().take() {
 		din.write_all(b"hello")?;
 	}
 
 	let mut output = String::new();
-	if let Some(mut out) = child.stdout.take() {
+	if let Some(mut out) = child.stdout().take() {
 		out.read_to_string(&mut output)?;
 	}
 
@@ -36,12 +36,12 @@ fn job_object() -> Result<()> {
 	.spawn()?
 	.into_inner();
 
-	if let Some(mut din) = child.stdin.take() {
+	if let Some(mut din) = child.stdin().take() {
 		din.write_all(b"hello")?;
 	}
 
 	let mut output = String::new();
-	if let Some(mut out) = child.stdout.take() {
+	if let Some(mut out) = child.stdout().take() {
 		out.read_to_string(&mut output)?;
 	}
 

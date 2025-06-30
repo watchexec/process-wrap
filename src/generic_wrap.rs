@@ -230,20 +230,4 @@ macro_rules! Wrap {
 	};
 }
 
-macro_rules! MaybeAnyTrait {
-	(
-		$(#[$($attrss:tt)*])*
-		$v:vis trait $name:ident $body:tt
-	) => {
-		#[cfg(feature = "downcasting")]
-		$(#[$($attrss)*])*
-		$v trait $name: std::fmt::Debug + Send + Sync + std::any::Any $body
-
-		#[cfg(not(feature = "downcasting"))]
-		$(#[$($attrss)*])*
-		$v trait $name: std::fmt::Debug + Send + Sync $body
-	}
-}
-
-pub(crate) use MaybeAnyTrait;
 pub(crate) use Wrap;

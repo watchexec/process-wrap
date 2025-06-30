@@ -1,6 +1,8 @@
 use std::{
+	any::Any,
 	future::Future,
 	io::Result,
+	pin::Pin,
 	process::{ExitStatus, Output},
 };
 
@@ -24,7 +26,6 @@ crate::generic_wrap::Wrap!(
 	|child| child
 );
 
-crate::generic_wrap::MaybeAnyTrait! {
 /// Wrapper for `tokio::process::Child`.
 ///
 /// This trait exposes most of the functionality of the underlying [`Child`]. It is implemented for
@@ -47,32 +48,32 @@ crate::generic_wrap::MaybeAnyTrait! {
 /// pub struct YourChildWrapper(Child);
 ///
 /// impl TokioChildWrapper for YourChildWrapper {
-///     fn inner(&self) -> &Child {
+///     fn inner(&self) -> &dyn TokioChildWrapper {
 ///         &self.0
 ///     }
 ///
-///     fn inner_mut(&mut self) -> &mut Child {
+///     fn inner_mut(&mut self) -> &mut dyn TokioChildWrapper {
 ///         &mut self.0
 ///     }
 ///
-///     fn into_inner(self: Box<Self>) -> Child {
-///         (*self).0
+///     fn into_inner(self: Box<Self>) -> Box<dyn TokioChildWrapper> {
+///         Box::new((*self).0)
 ///     }
 /// }
 /// ```
-pub trait TokioChildWrapper {
-	/// Obtain a reference to the underlying `Child`.
-	fn inner(&self) -> &Child;
+pub trait TokioChildWrapper: Any + std::fmt::Debug + Send {
+	/// Obtain a reference to the wrapped child.
+	fn inner(&self) -> &dyn TokioChildWrapper;
 
-	/// Obtain a mutable reference to the underlying `Child`.
-	fn inner_mut(&mut self) -> &mut Child;
+	/// Obtain a mutable reference to the wrapped child.
+	fn inner_mut(&mut self) -> &mut dyn TokioChildWrapper;
 
-	/// Consume the wrapper and return the underlying `Child`.
+	/// Consume the current wrapper and return the wrapped child.
 	///
-	/// Note that this may disrupt whatever the wrappers were doing. However, wrappers must ensure
-	/// that the `Child` is in a consistent state when this is called or they are dropped, so that
-	/// this is always safe.
-	fn into_inner(self: Box<Self>) -> Child;
+	/// Note that this may disrupt whatever the current wrapper was doing. However, wrappers must
+	/// ensure that the wrapped child is in a consistent state when this is called or they are
+	/// dropped, so that this is always safe.
+	fn into_inner(self: Box<Self>) -> Box<dyn TokioChildWrapper>;
 
 	/// Obtain a clone if possible.
 	///
@@ -84,23 +85,23 @@ pub trait TokioChildWrapper {
 
 	/// Obtain the `Child`'s stdin.
 	///
-	/// By default this is a passthrough to the underlying `Child`.
+	/// By default this is a passthrough to the wrapped child.
 	fn stdin(&mut self) -> &mut Option<ChildStdin> {
-		&mut self.inner_mut().stdin
+		self.inner_mut().stdin()
 	}
 
 	/// Obtain the `Child`'s stdout.
 	///
-	/// By default this is a passthrough to the underlying `Child`.
+	/// By default this is a passthrough to the wrapped child.
 	fn stdout(&mut self) -> &mut Option<ChildStdout> {
-		&mut self.inner_mut().stdout
+		self.inner_mut().stdout()
 	}
 
 	/// Obtain the `Child`'s stderr.
 	///
-	/// By default this is a passthrough to the underlying `Child`.
+	/// By default this is a passthrough to the wrapped child.
 	fn stderr(&mut self) -> &mut Option<ChildStderr> {
-		&mut self.inner_mut().stderr
+		self.inner_mut().stderr()
 	}
 
 	/// Obtain the `Child`'s process ID.
@@ -121,7 +122,7 @@ pub trait TokioChildWrapper {
 	fn kill(&mut self) -> Box<dyn Future<Output = Result<()>> + Send + '_> {
 		Box::new(async {
 			self.start_kill()?;
-			Box::into_pin(self.wait()).await?;
+			self.wait().await?;
 			Ok(())
 		})
 	}
@@ -151,8 +152,8 @@ pub trait TokioChildWrapper {
 	/// has exited will always return the same result.
 	///
 	/// By default this is a passthrough to the underlying `Child`.
-	fn wait(&mut self) -> Box<dyn Future<Output = Result<ExitStatus>> + Send + '_> {
-		Box::new(self.inner_mut().wait())
+	fn wait(&mut self) -> Pin<Box<dyn Future<Output = Result<ExitStatus>> + Send + '_>> {
+		Box::pin(self.inner_mut().wait())
 	}
 
 	/// Wait for the `Child` to exit and return its exit status and outputs.
@@ -180,8 +181,7 @@ pub trait TokioChildWrapper {
 			let stdout_fut = read_to_end(&mut stdout_pipe);
 			let stderr_fut = read_to_end(&mut stderr_pipe);
 
-			let (status, stdout, stderr) =
-				try_join3(Box::into_pin(self.wait()), stdout_fut, stderr_fut).await?;
+			let (status, stdout, stderr) = try_join3(self.wait(), stdout_fut, stderr_fut).await?;
 
 			// Drop happens after `try_join` due to <https://github.com/tokio-rs/tokio/issues/4309>
 			drop(stdout_pipe);
@@ -202,6 +202,43 @@ pub trait TokioChildWrapper {
 	/// and unwrapped processes.
 	#[cfg(unix)]
 	fn signal(&self, sig: i32) -> Result<()> {
+		self.inner().signal(sig)
+	}
+}
+
+impl TokioChildWrapper for Child {
+	fn inner(&self) -> &dyn TokioChildWrapper {
+		self
+	}
+	fn inner_mut(&mut self) -> &mut dyn TokioChildWrapper {
+		self
+	}
+	fn into_inner(self: Box<Self>) -> Box<dyn TokioChildWrapper> {
+		Box::new(*self)
+	}
+	fn stdin(&mut self) -> &mut Option<ChildStdin> {
+		&mut self.stdin
+	}
+	fn stdout(&mut self) -> &mut Option<ChildStdout> {
+		&mut self.stdout
+	}
+	fn stderr(&mut self) -> &mut Option<ChildStderr> {
+		&mut self.stderr
+	}
+	fn id(&self) -> Option<u32> {
+		Child::id(self)
+	}
+	fn start_kill(&mut self) -> Result<()> {
+		Child::start_kill(self)
+	}
+	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+		Child::try_wait(self)
+	}
+	fn wait(&mut self) -> Pin<Box<dyn Future<Output = Result<ExitStatus>> + Send + '_>> {
+		Box::pin(Child::wait(self))
+	}
+	#[cfg(unix)]
+	fn signal(&self, sig: i32) -> Result<()> {
 		if let Some(id) = self.id() {
 			kill(
 				Pid::from_raw(i32::try_from(id).map_err(std::io::Error::other)?),
@@ -213,16 +250,50 @@ pub trait TokioChildWrapper {
 		}
 	}
 }
-}
 
-impl TokioChildWrapper for Child {
-	fn inner(&self) -> &Child {
-		self
+impl dyn TokioChildWrapper {
+	fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+		(self as &dyn Any).downcast_ref()
 	}
-	fn inner_mut(&mut self) -> &mut Child {
-		self
+
+	fn is_raw_child(&self) -> bool {
+		self.downcast_ref::<Child>().is_some()
 	}
-	fn into_inner(self: Box<Self>) -> Child {
-		*self
+
+	/// Obtain a reference to the underlying [`Child`].
+	pub fn inner_child(&self) -> &Child {
+		let mut inner = self;
+		while !inner.is_raw_child() {
+			inner = inner.inner();
+		}
+
+		// UNWRAP: we've just checked that it's Some with is_raw_child()
+		inner.downcast_ref().unwrap()
+	}
+
+	/// Obtain a mutable reference to the underlying [`Child`].
+	///
+	/// Modifying the raw child may be unsound depending on the layering of wrappers.
+	pub unsafe fn inner_child_mut(&mut self) -> &mut Child {
+		let mut inner = self;
+		while !inner.is_raw_child() {
+			inner = inner.inner_mut();
+		}
+
+		// UNWRAP: we've just checked that with is_raw_child()
+		(inner as &mut dyn Any).downcast_mut().unwrap()
+	}
+
+	/// Obtain the underlying [`Child`].
+	///
+	/// Unwrapping everything may be unsound depending on the state of the wrappers.
+	pub unsafe fn into_inner_child(self: Box<Self>) -> Child {
+		let mut inner = self;
+		while !inner.is_raw_child() {
+			inner = inner.into_inner();
+		}
+
+		// UNWRAP: we've just checked that with is_raw_child()
+		*(inner as Box<dyn Any>).downcast().unwrap()
 	}
 }

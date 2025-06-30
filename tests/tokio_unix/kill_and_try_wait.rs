@@ -29,7 +29,7 @@ async fn process_group() -> Result<()> {
 
 	Box::into_pin(child.kill()).await?;
 
-	let status = Box::into_pin(child.wait()).await?;
+	let status = child.wait().await?;
 	assert!(!status.success());
 
 	sleep(DIE_TIME).await;
