@@ -127,15 +127,7 @@ pub trait StdChildWrapper: Any + std::fmt::Debug + Send {
 	/// library uses it to provide a consistent API across both std and Tokio (and because it's a
 	/// generally useful API).
 	fn start_kill(&mut self) -> Result<()> {
-		#[cfg(unix)]
-		{
-			self.signal(Signal::SIGKILL as _)
-		}
-
-		#[cfg(not(unix))]
-		{
-			self.inner_mut().kill()
-		}
+		self.inner_mut().start_kill()
 	}
 
 	/// Check if the `Child` has exited without blocking, and if so, return its exit status.
@@ -230,6 +222,17 @@ impl StdChildWrapper for Child {
 	}
 	fn id(&self) -> u32 {
 		Child::id(self)
+	}
+	fn start_kill(&mut self) -> Result<()> {
+		#[cfg(unix)]
+		{
+			self.signal(Signal::SIGKILL as _)
+		}
+
+		#[cfg(not(unix))]
+		{
+			Child::kill(self)
+		}
 	}
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
 		Child::try_wait(self)
