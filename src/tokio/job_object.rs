@@ -17,7 +17,7 @@ use crate::{
 use super::CreationFlags;
 #[cfg(feature = "kill-on-drop")]
 use super::KillOnDrop;
-use super::{TokioChildWrapper, TokioCommandWrap, TokioCommandWrapper};
+use super::{TokioChildWrapper, CommandWrap, CommandWrapper};
 
 /// Wrapper which creates a job object context for a `Command`.
 ///

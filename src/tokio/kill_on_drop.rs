@@ -2,7 +2,7 @@ use std::io::Result;
 
 use tokio::process::Command;
 
-use super::{TokioCommandWrap, TokioCommandWrapper};
+use super::{CommandWrap, CommandWrapper};
 
 /// Shim wrapper which sets kill-on-drop on a `Command`.
 ///
@@ -12,8 +12,8 @@ use super::{TokioCommandWrap, TokioCommandWrapper};
 #[derive(Clone, Copy, Debug)]
 pub struct KillOnDrop;
 
-impl TokioCommandWrapper for KillOnDrop {
-	fn pre_spawn(&mut self, command: &mut Command, _core: &TokioCommandWrap) -> Result<()> {
+impl CommandWrapper for KillOnDrop {
+	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
 		command.kill_on_drop(true);
 		Ok(())
 	}

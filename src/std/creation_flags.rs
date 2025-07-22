@@ -2,7 +2,7 @@ use std::{io::Result, os::windows::process::CommandExt, process::Command};
 
 use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
-use super::{StdCommandWrap, StdCommandWrapper};
+use super::{CommandWrap, CommandWrapper};
 
 /// Shim wrapper which sets Windows process creation flags.
 ///

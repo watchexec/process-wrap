@@ -3,7 +3,7 @@ use std::io::Result;
 use tokio::process::Command;
 use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
-use super::{TokioCommandWrap, TokioCommandWrapper};
+use super::{CommandWrap, CommandWrapper};
 
 /// Shim wrapper which sets Windows process creation flags.
 ///

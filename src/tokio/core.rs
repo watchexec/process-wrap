@@ -17,14 +17,7 @@ use tokio::{
 	process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
 };
 
-crate::generic_wrap::Wrap!(
-	TokioCommandWrap,
-	Command,
-	TokioCommandWrapper,
-	Child,
-	TokioChildWrapper,
-	|child| child
-);
+crate::generic_wrap::Wrap!(Command, Child, ChildWrapper, |child| child);
 
 /// Wrapper for `tokio::process::Child`.
 ///
@@ -47,39 +40,39 @@ crate::generic_wrap::Wrap!(
 /// #[derive(Debug)]
 /// pub struct YourChildWrapper(Child);
 ///
-/// impl TokioChildWrapper for YourChildWrapper {
-///     fn inner(&self) -> &dyn TokioChildWrapper {
+/// impl ChildWrapper for YourChildWrapper {
+///     fn inner(&self) -> &dyn ChildWrapper {
 ///         &self.0
 ///     }
 ///
-///     fn inner_mut(&mut self) -> &mut dyn TokioChildWrapper {
+///     fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
 ///         &mut self.0
 ///     }
 ///
-///     fn into_inner(self: Box<Self>) -> Box<dyn TokioChildWrapper> {
+///     fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
 ///         Box::new((*self).0)
 ///     }
 /// }
 /// ```
-pub trait TokioChildWrapper: Any + std::fmt::Debug + Send {
+pub trait ChildWrapper: Any + std::fmt::Debug + Send {
 	/// Obtain a reference to the wrapped child.
-	fn inner(&self) -> &dyn TokioChildWrapper;
+	fn inner(&self) -> &dyn ChildWrapper;
 
 	/// Obtain a mutable reference to the wrapped child.
-	fn inner_mut(&mut self) -> &mut dyn TokioChildWrapper;
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper;
 
 	/// Consume the current wrapper and return the wrapped child.
 	///
 	/// Note that this may disrupt whatever the current wrapper was doing. However, wrappers must
 	/// ensure that the wrapped child is in a consistent state when this is called or they are
 	/// dropped, so that this is always safe.
-	fn into_inner(self: Box<Self>) -> Box<dyn TokioChildWrapper>;
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper>;
 
 	/// Obtain a clone if possible.
 	///
 	/// Some implementations may make it possible to clone the implementing structure, even though
 	/// Tokio's `Child` isn't `Clone`. In those cases, this method should be overridden.
-	fn try_clone(&self) -> Option<Box<dyn TokioChildWrapper>> {
+	fn try_clone(&self) -> Option<Box<dyn ChildWrapper>> {
 		None
 	}
 
@@ -206,14 +199,14 @@ pub trait TokioChildWrapper: Any + std::fmt::Debug + Send {
 	}
 }
 
-impl TokioChildWrapper for Child {
-	fn inner(&self) -> &dyn TokioChildWrapper {
+impl ChildWrapper for Child {
+	fn inner(&self) -> &dyn ChildWrapper {
 		self
 	}
-	fn inner_mut(&mut self) -> &mut dyn TokioChildWrapper {
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
 		self
 	}
-	fn into_inner(self: Box<Self>) -> Box<dyn TokioChildWrapper> {
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
 		Box::new(*self)
 	}
 	fn stdin(&mut self) -> &mut Option<ChildStdin> {
@@ -251,7 +244,7 @@ impl TokioChildWrapper for Child {
 	}
 }
 
-impl dyn TokioChildWrapper {
+impl dyn ChildWrapper {
 	fn downcast_ref<T: 'static>(&self) -> Option<&T> {
 		(self as &dyn Any).downcast_ref()
 	}

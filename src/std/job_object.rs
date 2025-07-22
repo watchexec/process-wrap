@@ -19,7 +19,7 @@ use crate::{
 
 #[cfg(feature = "creation-flags")]
 use super::CreationFlags;
-use super::{StdChildWrapper, StdCommandWrap, StdCommandWrapper};
+use super::{StdChildWrapper, CommandWrap, CommandWrapper};
 
 /// Wrapper which creates a job object context for a `Command`.
 ///

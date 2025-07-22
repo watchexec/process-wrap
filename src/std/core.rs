@@ -10,14 +10,7 @@ use nix::{
 	unistd::Pid,
 };
 
-crate::generic_wrap::Wrap!(
-	StdCommandWrap,
-	Command,
-	StdCommandWrapper,
-	Child,
-	StdChildWrapper,
-	|child| child
-);
+crate::generic_wrap::Wrap!(Command, Child, ChildWrapper, |child| child);
 
 /// Wrapper for `std::process::Child`.
 ///
@@ -41,39 +34,39 @@ crate::generic_wrap::Wrap!(
 /// #[derive(Debug)]
 /// pub struct YourChildWrapper(Child);
 ///
-/// impl StdChildWrapper for YourChildWrapper {
-///     fn inner(&self) -> &dyn StdChildWrapper {
+/// impl ChildWrapper for YourChildWrapper {
+///     fn inner(&self) -> &dyn ChildWrapper {
 ///         &self.0
 ///     }
 ///
-///     fn inner_mut(&mut self) -> &mut dyn StdChildWrapper {
+///     fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
 ///         &mut self.0
 ///     }
 ///
-///     fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper> {
+///     fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
 ///         Box::new((*self).0)
 ///     }
 /// }
 /// ```
-pub trait StdChildWrapper: Any + std::fmt::Debug + Send {
+pub trait ChildWrapper: Any + std::fmt::Debug + Send {
 	/// Obtain a reference to the wrapped child.
-	fn inner(&self) -> &dyn StdChildWrapper;
+	fn inner(&self) -> &dyn ChildWrapper;
 
 	/// Obtain a mutable reference to the wrapped child.
-	fn inner_mut(&mut self) -> &mut dyn StdChildWrapper;
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper;
 
 	/// Consume the current wrapper and return the wrapped child.
 	///
 	/// Note that this may disrupt whatever the current wrapper was doing. However, wrappers must
 	/// ensure that the wrapped child is in a consistent state when this is called or they are
 	/// dropped, so that this is always safe.
-	fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper>;
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper>;
 
 	/// Obtain a clone if possible.
 	///
 	/// Some implementations may make it possible to clone the implementing structure, even though
 	/// std's `Child` isn't `Clone`. In those cases, this method should be overridden.
-	fn try_clone(&self) -> Option<Box<dyn StdChildWrapper>> {
+	fn try_clone(&self) -> Option<Box<dyn ChildWrapper>> {
 		None
 	}
 
@@ -201,14 +194,14 @@ pub trait StdChildWrapper: Any + std::fmt::Debug + Send {
 	}
 }
 
-impl StdChildWrapper for Child {
-	fn inner(&self) -> &dyn StdChildWrapper {
+impl ChildWrapper for Child {
+	fn inner(&self) -> &dyn ChildWrapper {
 		self
 	}
-	fn inner_mut(&mut self) -> &mut dyn StdChildWrapper {
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
 		self
 	}
-	fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper> {
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
 		self
 	}
 	fn stdin(&mut self) -> &mut Option<ChildStdin> {
@@ -250,7 +243,7 @@ impl StdChildWrapper for Child {
 	}
 }
 
-impl dyn StdChildWrapper {
+impl dyn ChildWrapper {
 	fn downcast_ref<T: 'static>(&self) -> Option<&T> {
 		(self as &dyn Any).downcast_ref()
 	}

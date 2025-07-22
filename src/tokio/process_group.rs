@@ -22,7 +22,7 @@ use tracing::instrument;
 
 use crate::ChildExitStatus;
 
-use super::{TokioChildWrapper, TokioCommandWrap, TokioCommandWrapper};
+use super::{ChildWrapper, CommandWrap, CommandWrapper};
 
 /// Wrapper which sets the process group of a `Command`.
 ///
@@ -59,14 +59,14 @@ impl ProcessGroup {
 /// Wrapper for `Child` which ensures that all processes in the group are reaped.
 #[derive(Debug)]
 pub struct ProcessGroupChild {
-	inner: Box<dyn TokioChildWrapper>,
+	inner: Box<dyn ChildWrapper>,
 	exit_status: ChildExitStatus,
 	pgid: Pid,
 }
 
 impl ProcessGroupChild {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
-	pub(crate) fn new(inner: Box<dyn TokioChildWrapper>, pgid: Pid) -> Self {
+	pub(crate) fn new(inner: Box<dyn ChildWrapper>, pgid: Pid) -> Self {
 		Self {
 			inner,
 			exit_status: ChildExitStatus::Running,
@@ -82,9 +82,9 @@ impl ProcessGroupChild {
 	}
 }
 
-impl TokioCommandWrapper for ProcessGroup {
+impl CommandWrapper for ProcessGroup {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
-	fn pre_spawn(&mut self, command: &mut Command, _core: &TokioCommandWrap) -> Result<()> {
+	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
 		command.process_group(self.leader.as_raw());
 		Ok(())
 	}
@@ -92,9 +92,9 @@ impl TokioCommandWrapper for ProcessGroup {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
-		inner: Box<dyn TokioChildWrapper>,
-		_core: &TokioCommandWrap,
-	) -> Result<Box<dyn TokioChildWrapper>> {
+		inner: Box<dyn ChildWrapper>,
+		_core: &CommandWrap,
+	) -> Result<Box<dyn ChildWrapper>> {
 		let pgid = Pid::from_raw(
 			i32::try_from(
 				inner
@@ -159,14 +159,14 @@ impl ProcessGroupChild {
 	}
 }
 
-impl TokioChildWrapper for ProcessGroupChild {
-	fn inner(&self) -> &dyn TokioChildWrapper {
+impl ChildWrapper for ProcessGroupChild {
+	fn inner(&self) -> &dyn ChildWrapper {
 		self.inner.inner()
 	}
-	fn inner_mut(&mut self) -> &mut dyn TokioChildWrapper {
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
 		self.inner.inner_mut()
 	}
-	fn into_inner(self: Box<Self>) -> Box<dyn TokioChildWrapper> {
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
 		self.inner.into_inner()
 	}
 

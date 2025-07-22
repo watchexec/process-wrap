@@ -4,7 +4,7 @@ use super::prelude::*;
 
 #[test]
 fn process_group_kill_leader() -> Result<()> {
-	let mut leader = StdCommandWrap::with_new("tests/multiproc_helper.rs", |command| {
+	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
 		command
 			.arg("1")
 			.arg("10")
@@ -46,7 +46,7 @@ fn process_group_kill_leader() -> Result<()> {
 
 #[test]
 fn process_group_kill_group() -> Result<()> {
-	let mut leader = StdCommandWrap::with_new("tests/multiproc_helper.rs", |command| {
+	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
 		command
 			.arg("1")
 			.arg("10")
@@ -89,7 +89,7 @@ fn process_group_kill_group() -> Result<()> {
 
 #[test]
 fn process_session_kill_leader() -> Result<()> {
-	let mut leader = StdCommandWrap::with_new("tests/multiproc_helper.rs", |command| {
+	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
 		command
 			.arg("1")
 			.arg("10")
@@ -131,7 +131,7 @@ fn process_session_kill_leader() -> Result<()> {
 
 #[test]
 fn process_session_kill_group() -> Result<()> {
-	let mut leader = StdCommandWrap::with_new("tests/multiproc_helper.rs", |command| {
+	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
 		command
 			.arg("1")
 			.arg("10")

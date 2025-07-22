@@ -5,7 +5,7 @@ use tokio::process::Command;
 #[cfg(feature = "tracing")]
 use tracing::trace;
 
-use super::{TokioCommandWrap, TokioCommandWrapper};
+use super::{CommandWrap, CommandWrapper};
 
 /// Wrapper which resets the process signal mask.
 ///
@@ -14,8 +14,8 @@ use super::{TokioCommandWrap, TokioCommandWrapper};
 #[derive(Clone, Copy, Debug)]
 pub struct ResetSigmask;
 
-impl TokioCommandWrapper for ResetSigmask {
-	fn pre_spawn(&mut self, command: &mut Command, _core: &TokioCommandWrap) -> Result<()> {
+impl CommandWrapper for ResetSigmask {
+	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
 		unsafe {
 			command.pre_exec(|| {
 				let mut oldset = SigSet::empty();

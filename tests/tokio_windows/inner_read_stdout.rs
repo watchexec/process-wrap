@@ -2,7 +2,7 @@ use super::prelude::*;
 
 #[tokio::test]
 async fn nowrap() -> Result<()> {
-	let mut child = TokioCommandWrap::with_new("powershell.exe", |command| {
+	let mut child = CommandWrap::with_new("powershell.exe", |command| {
 		command.arg("/C").arg("echo hello").stdout(Stdio::piped());
 	})
 	.spawn()?;
@@ -18,7 +18,7 @@ async fn nowrap() -> Result<()> {
 
 #[tokio::test]
 async fn job_object() -> Result<()> {
-	let mut child = TokioCommandWrap::with_new("powershell.exe", |command| {
+	let mut child = CommandWrap::with_new("powershell.exe", |command| {
 		command.arg("/C").arg("echo hello").stdout(Stdio::piped());
 	})
 	.wrap(JobObject)

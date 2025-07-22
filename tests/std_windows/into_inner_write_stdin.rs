@@ -2,7 +2,7 @@ use super::prelude::*;
 
 #[test]
 fn nowrap() -> Result<()> {
-	let mut child = StdCommandWrap::with_new("findstr", |command| {
+	let mut child = CommandWrap::with_new("findstr", |command| {
 		command
 			.arg("^")
 			.stdin(Stdio::piped())
@@ -26,7 +26,7 @@ fn nowrap() -> Result<()> {
 
 #[test]
 fn job_object() -> Result<()> {
-	let mut child = StdCommandWrap::with_new("findstr", |command| {
+	let mut child = CommandWrap::with_new("findstr", |command| {
 		command
 			.arg("^")
 			.stdin(Stdio::piped())
