@@ -9,7 +9,6 @@
 //!
 //! ```rust,no_run
 //! # fn main() -> std::io::Result<()> {
-//! use std::process::Command;
 //! use process_wrap::std::*;
 //!
 //! let mut command = StdCommandWrap::with_new("watch", |command| { command.arg("ls"); });
@@ -149,6 +148,289 @@
 //!   `Bar(Foo(Child))` depending on if `.wrap(Foo).wrap(Bar)` or `.wrap(Bar).wrap(Foo)` was called.
 //!   If your functionality is order-dependent, make sure to specify so in your documentation! By
 //!   default does nothing: no wrapping is performed and the input `child` is returned as-is.
+//!
+//! ## An Example Logging Wrapper
+//!
+//! Let's implement a logging wrapper that redirects a `Command`'s `stdout` and `stderr` into a
+//! text file. We can use `std::io::pipe` to merge `stdout` and `stderr` into one channel, then
+//! `std::io::copy` in a background thread to non-blockingly stream that data to disk as it comes
+//! in.
+//!
+//! ```rust
+//! # use process_wrap::std::{StdCommandWrap, StdCommandWrapper};
+//! # use std::{fs::File, io, path::PathBuf, process::Command, thread};
+//! #[derive(Debug)]
+//! struct LogFile {
+//! 	path: PathBuf,
+//! }
+//!
+//! impl LogFile {
+//! 	fn new(path: impl Into<PathBuf>) -> Self {
+//! 		Self { path: path.into() }
+//! 	}
+//! }
+//!
+//! impl StdCommandWrapper for LogFile {
+//! 	fn pre_spawn(&mut self, command: &mut Command, _core: &StdCommandWrap) -> io::Result<()> {
+//! 		let mut logfile = File::create(&self.path)?;
+//! 		let (mut rx, tx) = io::pipe()?;
+//!
+//! 		thread::spawn(move || {
+//! 			io::copy(&mut rx, &mut logfile).unwrap();
+//! 		});
+//!
+//! 		command.stdout(tx.try_clone()?).stderr(tx);
+//! 		Ok(())
+//! 	}
+//! }
+//! ```
+//!
+//! That's a great start, but it's actually introduced a resource leak: if the main thread of your
+//! program exits before that background one does, then the background thread won't get a chance to
+//! call `logfile`'s `Drop` implementation which closes the file. The file handle will be left open!
+//! To fix this, we'll need to keep track of the background thread's `ThreadHandle` and `.join()` it
+//! when calling `.wait()` on the `ChildWrapper`.
+//!
+//! ```rust
+//! # use process_wrap::std::{StdChildWrapper, StdCommandWrap, StdCommandWrapper};
+//! # use std::{
+//! # 	fs::File,
+//! # 	io, mem,
+//! # 	path::PathBuf,
+//! # 	process::{Command, ExitStatus},
+//! # 	thread::{self, JoinHandle},
+//! # };
+//! #[derive(Debug)]
+//! struct LogFile {
+//! 	path: PathBuf,
+//! 	thread: Option<JoinHandle<()>>,
+//! }
+//!
+//! impl LogFile {
+//! 	fn new(path: impl Into<PathBuf>) -> Self {
+//! 		Self {
+//! 			path: path.into(),
+//! 			thread: None,
+//! 		}
+//! 	}
+//! }
+//!
+//! impl StdCommandWrapper for LogFile {
+//! 	fn pre_spawn(&mut self, command: &mut Command, _core: &StdCommandWrap) -> io::Result<()> {
+//! 		let mut logfile = File::create(&self.path)?;
+//! 		let (mut rx, tx) = io::pipe()?;
+//!
+//! 		self.thread = Some(thread::spawn(move || {
+//! 			io::copy(&mut rx, &mut logfile).unwrap();
+//! 		}));
+//!
+//! 		command.stdout(tx.try_clone()?).stderr(tx);
+//! 		Ok(())
+//! 	}
+//!
+//! 	fn wrap_child(
+//! 		&mut self,
+//! 		child: Box<dyn StdChildWrapper>,
+//! 		_core: &StdCommandWrap,
+//! 	) -> io::Result<Box<dyn StdChildWrapper>> {
+//! 		let wrapped_child = LogFileChild {
+//! 			inner: child,
+//! 			thread: mem::take(&mut self.thread),
+//! 		};
+//! 		Ok(Box::new(wrapped_child))
+//! 	}
+//! }
+//!
+//! #[derive(Debug)]
+//! struct LogFileChild {
+//! 	inner: Box<dyn StdChildWrapper>,
+//! 	thread: Option<JoinHandle<()>>,
+//! }
+//!
+//! impl StdChildWrapper for LogFileChild {
+//! 	fn inner(&self) -> &dyn StdChildWrapper {
+//! 		&*self.inner
+//! 	}
+//!
+//! 	fn inner_mut(&mut self) -> &mut dyn StdChildWrapper {
+//! 		&mut *self.inner
+//! 	}
+//!
+//! 	fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper> {
+//! 		self.inner
+//! 	}
+//!
+//! 	fn wait(&mut self) -> io::Result<ExitStatus> {
+//! 		let exit_status = self.inner.wait();
+//!
+//! 		if let Some(thread) = mem::take(&mut self.thread) {
+//! 			thread.join().unwrap();
+//! 		}
+//!
+//! 		exit_status
+//! 	}
+//! }
+//! ```
+//!
+//! Now we're cleaning up after ourselves, but there is one last issue: if you actually call
+//! `.wait()`, then your program will deadlock! This is because `io::copy` copies data until `rx`
+//! returns an EOF, but that only happens after *all* copies of `tx` are dropped. Currently, our
+//! `Command` is holding onto `tx` even after calling `.spawn()`, so unless we manually drop the
+//! `Command` (freeing both copies of `tx`) before calling `.wait()`, our program will deadlock!
+//! We can fix this by telling `Command` to drop `tx` right after spawning the child — by this
+//! point, the `ChildWrapper` will have already inherited the copies of `tx` that it needs, so
+//! dropping `tx` from `Command` should be totally safe. We'll get `Command` to "drop" `tx` by
+//! setting its `stdin` and `stdout` to `Stdio::null()` in `CommandWrapper::post_spawn()`.
+//!
+//! ```rust
+//! # use process_wrap::std::{StdCommandWrap, StdCommandWrapper};
+//! # use std::{
+//! # 	io,
+//! # 	path::PathBuf,
+//! # 	process::{Child, Command, Stdio},
+//! # 	thread::JoinHandle,
+//! # };
+//! # #[derive(Debug)]
+//! # struct LogFile {
+//! # 	path: PathBuf,
+//! # 	thread: Option<JoinHandle<()>>,
+//! # }
+//! #
+//! impl StdCommandWrapper for LogFile {
+//! 	// ... snip ...
+//! 	fn post_spawn(
+//! 		&mut self,
+//! 		command: &mut Command,
+//! 		_child: &mut Child,
+//! 		_core: &StdCommandWrap,
+//! 	) -> io::Result<()> {
+//! 		command.stdout(Stdio::null()).stderr(Stdio::null());
+//!
+//! 		Ok(())
+//! 	}
+//! 	// ... snip ...
+//! }
+//! ```
+//!
+//! Finally, we can test that our new command-wrapper works:
+//!
+//! ```rust
+//! # use process_wrap::std::{StdChildWrapper, StdCommandWrap, StdCommandWrapper};
+//! # use std::{
+//! # 	error::Error,
+//! # 	fs::{self, File},
+//! # 	io, mem,
+//! # 	path::PathBuf,
+//! # 	process::{Child, Command, ExitStatus, Stdio},
+//! # 	thread::{self, JoinHandle},
+//! # };
+//! # use tempfile::NamedTempFile;
+//! # #[derive(Debug)]
+//! # struct LogFile {
+//! # 	path: PathBuf,
+//! # 	thread: Option<JoinHandle<()>>,
+//! # }
+//! #
+//! # impl LogFile {
+//! # 	fn new(path: impl Into<PathBuf>) -> Self {
+//! # 		Self {
+//! # 			path: path.into(),
+//! # 			thread: None,
+//! # 		}
+//! # 	}
+//! # }
+//! #
+//! # impl StdCommandWrapper for LogFile {
+//! # 	fn pre_spawn(&mut self, command: &mut Command, _core: &StdCommandWrap) -> io::Result<()> {
+//! # 		let mut logfile = File::create(&self.path)?;
+//! # 		let (mut rx, tx) = io::pipe()?;
+//! #
+//! # 		self.thread = Some(thread::spawn(move || {
+//! # 			io::copy(&mut rx, &mut logfile).unwrap();
+//! # 		}));
+//! #
+//! # 		command.stdout(tx.try_clone()?).stderr(tx);
+//! # 		Ok(())
+//! # 	}
+//! #
+//! # 	fn post_spawn(
+//! # 		&mut self,
+//! # 		command: &mut Command,
+//! # 		_child: &mut Child,
+//! # 		_core: &StdCommandWrap,
+//! # 	) -> io::Result<()> {
+//! # 		command.stdout(Stdio::null()).stderr(Stdio::null());
+//! #
+//! # 		Ok(())
+//! # 	}
+//! #
+//! # 	fn wrap_child(
+//! # 		&mut self,
+//! # 		child: Box<dyn StdChildWrapper>,
+//! # 		_core: &StdCommandWrap,
+//! # 	) -> io::Result<Box<dyn StdChildWrapper>> {
+//! # 		let wrapped_child = LogFileChild {
+//! # 			inner: child,
+//! # 			thread: mem::take(&mut self.thread),
+//! # 		};
+//! # 		Ok(Box::new(wrapped_child))
+//! # 	}
+//! # }
+//! #
+//! # #[derive(Debug)]
+//! # struct LogFileChild {
+//! # 	inner: Box<dyn StdChildWrapper>,
+//! # 	thread: Option<JoinHandle<()>>,
+//! # }
+//! #
+//! # impl StdChildWrapper for LogFileChild {
+//! # 	fn inner(&self) -> &dyn StdChildWrapper {
+//! # 		&*self.inner
+//! # 	}
+//! #
+//! # 	fn inner_mut(&mut self) -> &mut dyn StdChildWrapper {
+//! # 		&mut *self.inner
+//! # 	}
+//! #
+//! # 	fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper> {
+//! # 		self.inner
+//! # 	}
+//! #
+//! # 	fn wait(&mut self) -> io::Result<ExitStatus> {
+//! # 		let exit_status = self.inner.wait();
+//! #
+//! # 		if let Some(thread) = mem::take(&mut self.thread) {
+//! # 			thread.join().unwrap();
+//! # 		}
+//! #
+//! # 		exit_status
+//! # 	}
+//! # }
+//! #
+//! fn main() -> Result<(), Box<dyn Error>> {
+//! 	#[cfg(windows)]
+//! 	let mut command = StdCommandWrap::with_new("cmd", |command| {
+//! 		command.args(["/c", "echo Hello && echo World 1>&2"]);
+//! 	});
+//! 	#[cfg(unix)]
+//! 	let mut command = StdCommandWrap::with_new("sh", |command| {
+//! 		command.args(["-c", "echo Hello && echo World 1>&2"]);
+//! 	});
+//!
+//! 	let logfile = NamedTempFile::new()?;
+//! 	let logfile_path = logfile.path();
+//!
+//! 	command.wrap(LogFile::new(logfile_path)).spawn()?.wait()?;
+//!
+//! 	let logfile_lines: Vec<String> = fs::read_to_string(logfile_path)?
+//! 		.lines()
+//! 		.map(|l| l.trim().into())
+//! 		.collect();
+//! 	assert_eq!(logfile_lines, vec!["Hello", "World"]);
+//!
+//! 	Ok(())
+//! }
+//! ```
 //!
 //! # Features
 //!
