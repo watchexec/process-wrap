@@ -19,7 +19,7 @@ use crate::{
 
 #[cfg(feature = "creation-flags")]
 use super::CreationFlags;
-use super::{StdChildWrapper, CommandWrap, CommandWrapper};
+use super::{ChildWrapper, CommandWrap, CommandWrapper};
 
 /// Wrapper which creates a job object context for a `Command`.
 ///
@@ -37,9 +37,9 @@ use super::{StdChildWrapper, CommandWrap, CommandWrapper};
 #[derive(Clone, Copy, Debug)]
 pub struct JobObject;
 
-impl StdCommandWrapper for JobObject {
+impl CommandWrapper for JobObject {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
-	fn pre_spawn(&mut self, command: &mut Command, core: &StdCommandWrap) -> Result<()> {
+	fn pre_spawn(&mut self, command: &mut Command, core: &CommandWrap) -> Result<()> {
 		let mut flags = CREATE_SUSPENDED;
 		#[cfg(feature = "creation-flags")]
 		if let Some(CreationFlags(user_flags)) = core.get_wrap::<CreationFlags>() {
@@ -53,9 +53,9 @@ impl StdCommandWrapper for JobObject {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
-		inner: Box<dyn StdChildWrapper>,
-		core: &StdCommandWrap,
-	) -> Result<Box<dyn StdChildWrapper>> {
+		inner: Box<dyn ChildWrapper>,
+		core: &CommandWrap,
+	) -> Result<Box<dyn ChildWrapper>> {
 		#[cfg(feature = "creation-flags")]
 		let create_suspended = core
 			.get_wrap::<CreationFlags>()
@@ -82,14 +82,14 @@ impl StdCommandWrapper for JobObject {
 /// Wrapper for `Child` which waits on all processes within the job.
 #[derive(Debug)]
 pub struct JobObjectChild {
-	inner: Box<dyn StdChildWrapper>,
+	inner: Box<dyn ChildWrapper>,
 	exit_status: ChildExitStatus,
 	job_port: JobPort,
 }
 
 impl JobObjectChild {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(job_port)))]
-	pub(crate) fn new(inner: Box<dyn StdChildWrapper>, job_port: JobPort) -> Self {
+	pub(crate) fn new(inner: Box<dyn ChildWrapper>, job_port: JobPort) -> Self {
 		Self {
 			inner,
 			exit_status: ChildExitStatus::Running,
@@ -98,14 +98,14 @@ impl JobObjectChild {
 	}
 }
 
-impl StdChildWrapper for JobObjectChild {
-	fn inner(&self) -> &dyn StdChildWrapper {
+impl ChildWrapper for JobObjectChild {
+	fn inner(&self) -> &dyn ChildWrapper {
 		self.inner.inner()
 	}
-	fn inner_mut(&mut self) -> &mut dyn StdChildWrapper {
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
 		self.inner.inner_mut()
 	}
-	fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper> {
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
 		// manually drop the completion port
 		let its = std::mem::ManuallyDrop::new(self.job_port);
 		unsafe { CloseHandle(its.completion_port.0) }.ok();

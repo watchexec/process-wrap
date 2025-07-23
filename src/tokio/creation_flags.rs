@@ -19,8 +19,8 @@ use super::{CommandWrap, CommandWrapper};
 #[derive(Clone, Copy, Debug)]
 pub struct CreationFlags(pub PROCESS_CREATION_FLAGS);
 
-impl TokioCommandWrapper for CreationFlags {
-	fn pre_spawn(&mut self, command: &mut Command, _core: &TokioCommandWrap) -> Result<()> {
+impl CommandWrapper for CreationFlags {
+	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
 		command.creation_flags((self.0).0);
 		Ok(())
 	}
