@@ -2,7 +2,7 @@ use super::prelude::*;
 
 #[test]
 fn nowrap() -> Result<()> {
-	let child = StdCommandWrap::with_new("powershell.exe", |command| {
+	let child = CommandWrap::with_new("powershell.exe", |command| {
 		command.arg("/C").arg("echo hello").stdout(Stdio::piped());
 	})
 	.spawn()?;
@@ -16,7 +16,7 @@ fn nowrap() -> Result<()> {
 
 #[test]
 fn job_object() -> Result<()> {
-	let child = StdCommandWrap::with_new("powershell.exe", |command| {
+	let child = CommandWrap::with_new("powershell.exe", |command| {
 		command.arg("/C").arg("echo hello").stdout(Stdio::piped());
 	})
 	.wrap(JobObject)

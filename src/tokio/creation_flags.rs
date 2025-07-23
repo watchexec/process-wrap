@@ -3,7 +3,7 @@ use std::io::Result;
 use tokio::process::Command;
 use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
-use super::{TokioCommandWrap, TokioCommandWrapper};
+use super::{CommandWrap, CommandWrapper};
 
 /// Shim wrapper which sets Windows process creation flags.
 ///
@@ -19,8 +19,8 @@ use super::{TokioCommandWrap, TokioCommandWrapper};
 #[derive(Clone, Copy, Debug)]
 pub struct CreationFlags(pub PROCESS_CREATION_FLAGS);
 
-impl TokioCommandWrapper for CreationFlags {
-	fn pre_spawn(&mut self, command: &mut Command, _core: &TokioCommandWrap) -> Result<()> {
+impl CommandWrapper for CreationFlags {
+	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
 		command.creation_flags((self.0).0);
 		Ok(())
 	}

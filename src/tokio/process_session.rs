@@ -5,7 +5,7 @@ use tokio::process::Command;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
-use super::{TokioCommandWrap, TokioCommandWrapper};
+use super::{CommandWrap, CommandWrapper};
 
 /// Wrapper which creates a new session and group for the `Command`.
 ///
@@ -22,9 +22,9 @@ use super::{TokioCommandWrap, TokioCommandWrapper};
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessSession;
 
-impl TokioCommandWrapper for ProcessSession {
+impl CommandWrapper for ProcessSession {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
-	fn pre_spawn(&mut self, command: &mut Command, _core: &TokioCommandWrap) -> Result<()> {
+	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
 		unsafe {
 			command.pre_exec(move || setsid().map_err(Error::from).map(|_| ()));
 		}
@@ -35,9 +35,9 @@ impl TokioCommandWrapper for ProcessSession {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
-		inner: Box<dyn super::core::TokioChildWrapper>,
-		_core: &TokioCommandWrap,
-	) -> Result<Box<dyn super::core::TokioChildWrapper>> {
+		inner: Box<dyn super::core::ChildWrapper>,
+		_core: &CommandWrap,
+	) -> Result<Box<dyn super::core::ChildWrapper>> {
 		let pgid = Pid::from_raw(
 			i32::try_from(
 				inner

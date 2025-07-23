@@ -3,7 +3,7 @@ use super::prelude::*;
 #[test]
 fn nowrap() -> Result<()> {
 	let mut child = unsafe {
-		StdCommandWrap::with_new("cat", |command| {
+		CommandWrap::with_new("cat", |command| {
 			command.stdin(Stdio::piped()).stdout(Stdio::piped());
 		})
 		.spawn()?
@@ -26,7 +26,7 @@ fn nowrap() -> Result<()> {
 #[test]
 fn process_group() -> Result<()> {
 	let mut child = unsafe {
-		StdCommandWrap::with_new("cat", |command| {
+		CommandWrap::with_new("cat", |command| {
 			command.stdin(Stdio::piped()).stdout(Stdio::piped());
 		})
 		.wrap(ProcessGroup::leader())
@@ -50,7 +50,7 @@ fn process_group() -> Result<()> {
 #[test]
 fn process_session() -> Result<()> {
 	let mut child = unsafe {
-		StdCommandWrap::with_new("cat", |command| {
+		CommandWrap::with_new("cat", |command| {
 			command.stdin(Stdio::piped()).stdout(Stdio::piped());
 		})
 		.wrap(ProcessSession)

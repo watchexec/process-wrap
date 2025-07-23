@@ -4,7 +4,7 @@ use super::prelude::*;
 
 #[tokio::test]
 async fn process_group_kill_leader() -> Result<()> {
-	let mut leader = TokioCommandWrap::with_new("tests/multiproc_helper.rs", |command| {
+	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
 		command
 			.arg("1")
 			.arg("10")
@@ -47,7 +47,7 @@ async fn process_group_kill_leader() -> Result<()> {
 
 #[tokio::test]
 async fn process_group_kill_group() -> Result<()> {
-	let mut leader = TokioCommandWrap::with_new("tests/multiproc_helper.rs", |command| {
+	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
 		command
 			.arg("1")
 			.arg("10")
@@ -91,7 +91,7 @@ async fn process_group_kill_group() -> Result<()> {
 
 #[tokio::test]
 async fn process_session_kill_leader() -> Result<()> {
-	let mut leader = TokioCommandWrap::with_new("tests/multiproc_helper.rs", |command| {
+	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
 		command
 			.arg("1")
 			.arg("10")
@@ -134,7 +134,7 @@ async fn process_session_kill_leader() -> Result<()> {
 
 #[tokio::test]
 async fn process_session_kill_group() -> Result<()> {
-	let mut leader = TokioCommandWrap::with_new("tests/multiproc_helper.rs", |command| {
+	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
 		command
 			.arg("1")
 			.arg("10")

@@ -4,24 +4,24 @@
 )]
 
 macro_rules! Wrap {
-	($name:ident, $command:ty, $wrapper:ident, $child:ty, $childer:ident, $first_child_wrapper:expr) => {
+	($command:ty, $child:ty, $childer:ident, $first_child_wrapper:expr) => {
 		/// A wrapper around a `Command` that allows for additional functionality to be added.
 		///
 		/// This is the core type of the `process-wrap` crate. It is a wrapper around a
 		#[doc = concat!("[`", stringify!($command), "`].")]
 		#[derive(Debug)]
-		pub struct $name {
+		pub struct CommandWrap {
 			command: $command,
-			wrappers: ::indexmap::IndexMap<::std::any::TypeId, Box<dyn $wrapper>>,
+			wrappers: ::indexmap::IndexMap<::std::any::TypeId, Box<dyn CommandWrapper>>,
 		}
 
-		impl $name {
+		impl CommandWrap {
 			/// Create from a program name and a closure to configure the command.
 			///
 			/// This is a convenience method that creates a new `Command` and then calls the closure
 			/// to configure it. The `Command` is then wrapped and returned.
 			///
-			#[doc = concat!("Alternatively, use `From`/`Into` to convert a [`", stringify!($command),"`] to a [`", stringify!($name), "`].")]
+			#[doc = concat!("Alternatively, use `From`/`Into` to convert a [`", stringify!($command),"`] to a [`", stringify!(CommandWrap), "`].")]
 			pub fn with_new(
 				program: impl AsRef<::std::ffi::OsStr>,
 				init: impl FnOnce(&mut $command),
@@ -60,7 +60,7 @@ macro_rules! Wrap {
 			/// will be silently discarded.
 			///
 			/// Returns `&mut self` for chaining.
-			pub fn wrap<W: $wrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
+			pub fn wrap<W: CommandWrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
 				let typeid = ::std::any::TypeId::of::<W>();
 				let mut wrapper = Some(Box::new(wrapper));
 				let extant = self
@@ -79,7 +79,7 @@ macro_rules! Wrap {
 			fn spawn_inner(
 				&self,
 				command: &mut $command,
-				wrappers: &mut ::indexmap::IndexMap<::std::any::TypeId, Box<dyn $wrapper>>,
+				wrappers: &mut ::indexmap::IndexMap<::std::any::TypeId, Box<dyn CommandWrapper>>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
 				for (id, wrapper) in wrappers.iter_mut() {
 					#[cfg(feature = "tracing")]
@@ -127,7 +127,7 @@ macro_rules! Wrap {
 			}
 
 			/// Check if a wrapper of a given type is present.
-			pub fn has_wrap<W: $wrapper + 'static>(&self) -> bool {
+			pub fn has_wrap<W: CommandWrapper + 'static>(&self) -> bool {
 				let typeid = ::std::any::TypeId::of::<W>();
 				self.wrappers.contains_key(&typeid)
 			}
@@ -139,7 +139,7 @@ macro_rules! Wrap {
 			///
 			/// Returns `None` if the wrapper is not present. To merely check if a wrapper is
 			/// present, use `has_wrap` instead.
-			pub fn get_wrap<W: $wrapper + 'static>(&self) -> Option<&W> {
+			pub fn get_wrap<W: CommandWrapper + 'static>(&self) -> Option<&W> {
 				let typeid = ::std::any::TypeId::of::<W>();
 				self.wrappers.get(&typeid).map(|w| {
 					let w_any = w as &dyn ::std::any::Any;
@@ -150,7 +150,7 @@ macro_rules! Wrap {
 			}
 		}
 
-		impl From<Command> for $name {
+		impl From<Command> for CommandWrap {
 			fn from(command: $command) -> Self {
 				Self {
 					command,
@@ -169,8 +169,8 @@ macro_rules! Wrap {
 		/// ```rust,ignore
 		/// #[derive(Debug)]
 		/// pub struct YourWrapper;
-		#[doc = concat!("impl ", stringify!($wrapper), " for YourWrapper {}\n```")]
-		pub trait $wrapper: ::std::fmt::Debug + Send + Sync {
+		#[doc = concat!("impl ", stringify!(CommandWrapper), " for YourWrapper {}\n```")]
+		pub trait CommandWrapper: ::std::fmt::Debug + Send + Sync {
 			/// Called on a first instance if a second of the same type is added.
 			///
 			/// Only one of a wrapper type can exist within a Wrap at a time. The default behaviour
@@ -184,7 +184,7 @@ macro_rules! Wrap {
 			/// downcasting fails, instead of using unchecked downcasting and unleashing UB.
 			///
 			/// Default impl: no-op.
-			fn extend(&mut self, _other: Box<dyn $wrapper>) {}
+			fn extend(&mut self, _other: Box<dyn CommandWrapper>) {}
 
 			/// Called before the command is spawned, to mutate it as needed.
 			///
@@ -194,7 +194,7 @@ macro_rules! Wrap {
 			/// `CreationFlags` on Windows works along with `JobObject`.
 			///
 			/// Defaut impl: no-op.
-			fn pre_spawn(&mut self, _command: &mut $command, _core: &$name) -> Result<()> {
+			fn pre_spawn(&mut self, _command: &mut $command, _core: &CommandWrap) -> Result<()> {
 				Ok(())
 			}
 
@@ -204,7 +204,7 @@ macro_rules! Wrap {
 			/// how `CreationFlags` on Windows works along with `JobObject`.
 			///
 			/// Default: no-op.
-			fn post_spawn(&mut self, _command: &mut $command, _child: &mut $child, _core: &$name) -> Result<()> {
+			fn post_spawn(&mut self, _command: &mut $command, _child: &mut $child, _core: &CommandWrap) -> Result<()> {
 				Ok(())
 			}
 
@@ -222,7 +222,7 @@ macro_rules! Wrap {
 			fn wrap_child(
 				&mut self,
 				child: Box<dyn $childer>,
-				_core: &$name,
+				_core: &CommandWrap,
 			) -> Result<Box<dyn $childer>> {
 				Ok(child)
 			}

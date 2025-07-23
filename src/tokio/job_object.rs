@@ -17,7 +17,7 @@ use crate::{
 use super::CreationFlags;
 #[cfg(feature = "kill-on-drop")]
 use super::KillOnDrop;
-use super::{TokioChildWrapper, TokioCommandWrap, TokioCommandWrapper};
+use super::{ChildWrapper, CommandWrap, CommandWrapper};
 
 /// Wrapper which creates a job object context for a `Command`.
 ///
@@ -35,9 +35,9 @@ use super::{TokioChildWrapper, TokioCommandWrap, TokioCommandWrapper};
 #[derive(Clone, Copy, Debug)]
 pub struct JobObject;
 
-impl TokioCommandWrapper for JobObject {
+impl CommandWrapper for JobObject {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
-	fn pre_spawn(&mut self, command: &mut Command, core: &TokioCommandWrap) -> Result<()> {
+	fn pre_spawn(&mut self, command: &mut Command, core: &CommandWrap) -> Result<()> {
 		let mut flags = CREATE_SUSPENDED;
 		#[cfg(feature = "creation-flags")]
 		if let Some(CreationFlags(user_flags)) = core.get_wrap::<CreationFlags>() {
@@ -51,9 +51,9 @@ impl TokioCommandWrapper for JobObject {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
-		inner: Box<dyn TokioChildWrapper>,
-		core: &TokioCommandWrap,
-	) -> Result<Box<dyn TokioChildWrapper>> {
+		inner: Box<dyn ChildWrapper>,
+		core: &CommandWrap,
+	) -> Result<Box<dyn ChildWrapper>> {
 		#[cfg(feature = "kill-on-drop")]
 		let kill_on_drop = core.has_wrap::<KillOnDrop>();
 		#[cfg(not(feature = "kill-on-drop"))]
@@ -94,14 +94,14 @@ impl TokioCommandWrapper for JobObject {
 /// Wrapper for `Child` which waits on all processes within the job.
 #[derive(Debug)]
 pub struct JobObjectChild {
-	inner: Box<dyn TokioChildWrapper>,
+	inner: Box<dyn ChildWrapper>,
 	exit_status: ChildExitStatus,
 	job_port: JobPort,
 }
 
 impl JobObjectChild {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(job_port)))]
-	pub(crate) fn new(inner: Box<dyn TokioChildWrapper>, job_port: JobPort) -> Self {
+	pub(crate) fn new(inner: Box<dyn ChildWrapper>, job_port: JobPort) -> Self {
 		Self {
 			inner,
 			exit_status: ChildExitStatus::Running,
@@ -110,14 +110,14 @@ impl JobObjectChild {
 	}
 }
 
-impl TokioChildWrapper for JobObjectChild {
-	fn inner(&self) -> &dyn TokioChildWrapper {
+impl ChildWrapper for JobObjectChild {
+	fn inner(&self) -> &dyn ChildWrapper {
 		self.inner.inner()
 	}
-	fn inner_mut(&mut self) -> &mut dyn TokioChildWrapper {
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
 		self.inner.inner_mut()
 	}
-	fn into_inner(self: Box<Self>) -> Box<dyn TokioChildWrapper> {
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
 		// manually drop the completion port
 		let its = std::mem::ManuallyDrop::new(self.job_port);
 		unsafe { CloseHandle(its.completion_port.0) }.ok();

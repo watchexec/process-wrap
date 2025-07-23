@@ -2,7 +2,7 @@ use super::prelude::*;
 
 #[tokio::test]
 async fn nowrap() -> Result<()> {
-	let mut child = TokioCommandWrap::with_new("findstr", |command| {
+	let mut child = CommandWrap::with_new("findstr", |command| {
 		command
 			.arg("^")
 			.stdin(Stdio::piped())
@@ -26,7 +26,7 @@ async fn nowrap() -> Result<()> {
 
 #[tokio::test]
 async fn job_object() -> Result<()> {
-	let mut child = TokioCommandWrap::with_new("findstr", |command| {
+	let mut child = CommandWrap::with_new("findstr", |command| {
 		command
 			.arg("^")
 			.stdin(Stdio::piped())

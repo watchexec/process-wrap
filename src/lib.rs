@@ -11,7 +11,7 @@
 //! # fn main() -> std::io::Result<()> {
 //! use process_wrap::std::*;
 //!
-//! let mut command = StdCommandWrap::with_new("watch", |command| { command.arg("ls"); });
+//! let mut command = CommandWrap::with_new("watch", |command| { command.arg("ls"); });
 //! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
 //! #[cfg(windows)] { command.wrap(JobObject); }
 //! let mut child = command.spawn()?;
@@ -36,7 +36,7 @@
 //!
 //! # Usage
 //!
-//! The core API is [`StdCommandWrap`](std::StdCommandWrap) and [`TokioCommandWrap`](tokio::TokioCommandWrap),
+//! The core API is [`CommandWrap`](std::CommandWrap) and [`CommandWrap`](tokio::CommandWrap),
 //! which can be constructed either directly from an existing `process::Command`:
 //!
 //! ```rust
@@ -44,7 +44,7 @@
 //! use std::process::Command;
 //! let mut command = Command::new("ls");
 //! command.arg("-l");
-//! let mut command = StdCommandWrap::from(command);
+//! let mut command = CommandWrap::from(command);
 //! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
 //! #[cfg(windows)] { command.wrap(JobObject); }
 //! ```
@@ -53,7 +53,7 @@
 //!
 //! ```rust
 //! use process_wrap::std::*;
-//! let mut command = StdCommandWrap::with_new("ls", |command| { command.arg("-l"); });
+//! let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
 //! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
 //! #[cfg(windows)] { command.wrap(JobObject); }
 //! ```
@@ -62,7 +62,7 @@
 //!
 //! ```rust
 //! use process_wrap::std::*;
-//! StdCommandWrap::with_new("ls", |command| { command.arg("-l"); })
+//! CommandWrap::with_new("ls", |command| { command.arg("-l"); })
 //!    .wrap(ProcessGroup::leader());
 //! ```
 //!
@@ -89,7 +89,7 @@
 //!
 //! ```rust
 //! use process_wrap::tokio::*;
-//! let mut command = TokioCommandWrap::with_new("ls", |command| { command.arg("-l"); });
+//! let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
 //! command.wrap(KillOnDrop);
 //! ```
 //!
@@ -97,7 +97,7 @@
 //!
 //! ```rust,ignore
 //! use process_wrap::std::*;
-//! let mut command = StdCommandWrap::with_new("ls", |command| { command.arg("-l"); });
+//! let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
 //! command.wrap(CreationFlags(CREATE_NO_WINDOW));
 //! ```
 //!
@@ -112,8 +112,8 @@
 //! underlying APIs. Of course you can (and should) re-use/share code wherever possible if
 //! implementing both.
 //!
-//! At minimum, you must implement [`StdCommandWrapper`](crate::std::StdCommandWrapper) and/or
-//! [`TokioCommandWrapper`](crate::tokio::TokioCommandWrapper). These provide the same functionality
+//! At minimum, you must implement [`CommandWrapper`](crate::std::CommandWrapper) and/or
+//! [`CommandWrapper`](crate::tokio::CommandWrapper). These provide the same functionality
 //! (and indeed internally are generated using a common macro), but differ in the exact types used.
 //! Here's the most basic impl (shown for Tokio):
 //!
@@ -121,27 +121,27 @@
 //! use process_wrap::tokio::*;
 //! #[derive(Debug)]
 //! pub struct YourWrapper;
-//! impl TokioCommandWrapper for YourWrapper {}
+//! impl CommandWrapper for YourWrapper {}
 //! ```
 //!
 //! The trait provides extension or hook points into the lifecycle of a `Command`:
 //!
-//! - **`fn extend(&mut self, other: Box<dyn TokioCommandWrapper>)`** is called if
+//! - **`fn extend(&mut self, other: Box<dyn CommandWrapper>)`** is called if
 //!   `.wrap(YourWrapper)` is done twice. Only one of a wrapper type can exist, so this gives the
 //!   opportunity to incorporate all or part of the second wrapper instance into the first. By
 //!   default, this does nothing (ie only the first registered wrapper instance of a type applies).
 //!
-//! - **`fn pre_spawn(&mut self, command: &mut Command, core: &TokioCommandWrap)`** is called before
+//! - **`fn pre_spawn(&mut self, command: &mut Command, core: &CommandWrap)`** is called before
 //!   the command is spawned, and gives mutable access to it. It also gives mutable access to the
 //!   wrapper instance, so state can be stored if needed. The `core` reference gives access to data
 //!   from other wrappers; for example, that's how `CreationFlags` on Windows works along with
 //!   `JobObject`. By default does nothing.
 //!
-//! - **`fn post_spawn(&mut self, child: &mut tokio::process::Child, core: &TokioCommandWrap)`** is
+//! - **`fn post_spawn(&mut self, child: &mut tokio::process::Child, core: &CommandWrap)`** is
 //!   called after spawn, and should be used for any necessary cleanups. It is offered for
 //!   completeness but is expected to be less used than `wrap_child()`. By default does nothing.
 //!
-//! - **`fn wrap_child(&mut self, child: Box<dyn TokioChildWrapper>, core: &TokioCommandWrap)`** is
+//! - **`fn wrap_child(&mut self, child: Box<dyn TokioChildWrapper>, core: &CommandWrap)`** is
 //!   called after all `post_spawn()`s have run. If your wrapper needs to override the methods on
 //!   Child, then it should create an instance of its own type implementing `TokioChildWrapper` and
 //!   return it here. Child wraps are _in order_: you may end up with a `Foo(Bar(Child))` or a
@@ -157,31 +157,31 @@
 //! in.
 //!
 //! ```rust
-//! # use process_wrap::std::{StdCommandWrap, StdCommandWrapper};
+//! # use process_wrap::std::{CommandWrap, CommandWrapper};
 //! # use std::{fs::File, io, path::PathBuf, process::Command, thread};
 //! #[derive(Debug)]
 //! struct LogFile {
-//! 	path: PathBuf,
+//!     path: PathBuf,
 //! }
 //!
 //! impl LogFile {
-//! 	fn new(path: impl Into<PathBuf>) -> Self {
-//! 		Self { path: path.into() }
-//! 	}
+//!     fn new(path: impl Into<PathBuf>) -> Self {
+//!         Self { path: path.into() }
+//!     }
 //! }
 //!
-//! impl StdCommandWrapper for LogFile {
-//! 	fn pre_spawn(&mut self, command: &mut Command, _core: &StdCommandWrap) -> io::Result<()> {
-//! 		let mut logfile = File::create(&self.path)?;
-//! 		let (mut rx, tx) = io::pipe()?;
+//! impl CommandWrapper for LogFile {
+//!     fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> io::Result<()> {
+//!         let mut logfile = File::create(&self.path)?;
+//!         let (mut rx, tx) = io::pipe()?;
 //!
-//! 		thread::spawn(move || {
-//! 			io::copy(&mut rx, &mut logfile).unwrap();
-//! 		});
+//!         thread::spawn(move || {
+//!          io::copy(&mut rx, &mut logfile).unwrap();
+//!         });
 //!
-//! 		command.stdout(tx.try_clone()?).stderr(tx);
-//! 		Ok(())
-//! 	}
+//!         command.stdout(tx.try_clone()?).stderr(tx);
+//!         Ok(())
+//!     }
 //! }
 //! ```
 //!
@@ -192,83 +192,83 @@
 //! when calling `.wait()` on the `ChildWrapper`.
 //!
 //! ```rust
-//! # use process_wrap::std::{StdChildWrapper, StdCommandWrap, StdCommandWrapper};
+//! # use process_wrap::std::{ChildWrapper, CommandWrap, CommandWrapper};
 //! # use std::{
-//! # 	fs::File,
-//! # 	io, mem,
-//! # 	path::PathBuf,
-//! # 	process::{Command, ExitStatus},
-//! # 	thread::{self, JoinHandle},
+//! #     fs::File,
+//! #     io, mem,
+//! #     path::PathBuf,
+//! #     process::{Command, ExitStatus},
+//! #     thread::{self, JoinHandle},
 //! # };
 //! #[derive(Debug)]
 //! struct LogFile {
-//! 	path: PathBuf,
-//! 	thread: Option<JoinHandle<()>>,
+//!     path: PathBuf,
+//!     thread: Option<JoinHandle<()>>,
 //! }
 //!
 //! impl LogFile {
-//! 	fn new(path: impl Into<PathBuf>) -> Self {
-//! 		Self {
-//! 			path: path.into(),
-//! 			thread: None,
-//! 		}
-//! 	}
+//!     fn new(path: impl Into<PathBuf>) -> Self {
+//!         Self {
+//!          path: path.into(),
+//!          thread: None,
+//!         }
+//!     }
 //! }
 //!
-//! impl StdCommandWrapper for LogFile {
-//! 	fn pre_spawn(&mut self, command: &mut Command, _core: &StdCommandWrap) -> io::Result<()> {
-//! 		let mut logfile = File::create(&self.path)?;
-//! 		let (mut rx, tx) = io::pipe()?;
+//! impl CommandWrapper for LogFile {
+//!     fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> io::Result<()> {
+//!         let mut logfile = File::create(&self.path)?;
+//!         let (mut rx, tx) = io::pipe()?;
 //!
-//! 		self.thread = Some(thread::spawn(move || {
-//! 			io::copy(&mut rx, &mut logfile).unwrap();
-//! 		}));
+//!         self.thread = Some(thread::spawn(move || {
+//!          io::copy(&mut rx, &mut logfile).unwrap();
+//!         }));
 //!
-//! 		command.stdout(tx.try_clone()?).stderr(tx);
-//! 		Ok(())
-//! 	}
+//!         command.stdout(tx.try_clone()?).stderr(tx);
+//!         Ok(())
+//!     }
 //!
-//! 	fn wrap_child(
-//! 		&mut self,
-//! 		child: Box<dyn StdChildWrapper>,
-//! 		_core: &StdCommandWrap,
-//! 	) -> io::Result<Box<dyn StdChildWrapper>> {
-//! 		let wrapped_child = LogFileChild {
-//! 			inner: child,
-//! 			thread: mem::take(&mut self.thread),
-//! 		};
-//! 		Ok(Box::new(wrapped_child))
-//! 	}
+//!     fn wrap_child(
+//!         &mut self,
+//!         child: Box<dyn ChildWrapper>,
+//!         _core: &CommandWrap,
+//!     ) -> io::Result<Box<dyn ChildWrapper>> {
+//!         let wrapped_child = LogFileChild {
+//!          inner: child,
+//!          thread: mem::take(&mut self.thread),
+//!         };
+//!         Ok(Box::new(wrapped_child))
+//!     }
 //! }
 //!
 //! #[derive(Debug)]
 //! struct LogFileChild {
-//! 	inner: Box<dyn StdChildWrapper>,
-//! 	thread: Option<JoinHandle<()>>,
+//!     inner: Box<dyn ChildWrapper>,
+//!     thread: Option<JoinHandle<()>>,
 //! }
 //!
-//! impl StdChildWrapper for LogFileChild {
-//! 	fn inner(&self) -> &dyn StdChildWrapper {
-//! 		&*self.inner
-//! 	}
+//! impl ChildWrapper for LogFileChild {
+//!     fn inner(&self) -> &dyn ChildWrapper {
+//!         &*self.inner
+//!     }
 //!
-//! 	fn inner_mut(&mut self) -> &mut dyn StdChildWrapper {
-//! 		&mut *self.inner
-//! 	}
+//!     fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+//!         &mut *self.inner
+//!     }
 //!
-//! 	fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper> {
-//! 		self.inner
-//! 	}
+//!     fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+//!         self.inner
+//!     }
 //!
-//! 	fn wait(&mut self) -> io::Result<ExitStatus> {
-//! 		let exit_status = self.inner.wait();
+//!     fn wait(&mut self) -> io::Result<ExitStatus> {
+//!         let exit_status = self.inner.wait();
 //!
-//! 		if let Some(thread) = mem::take(&mut self.thread) {
-//! 			thread.join().unwrap();
-//! 		}
+//!         if let Some(thread) = mem::take(&mut self.thread) {
+//!          thread.join().unwrap();
+//!         }
 //!
-//! 		exit_status
-//! 	}
+//!         exit_status
+//!     }
 //! }
 //! ```
 //!
@@ -283,152 +283,152 @@
 //! setting its `stdin` and `stdout` to `Stdio::null()` in `CommandWrapper::post_spawn()`.
 //!
 //! ```rust
-//! # use process_wrap::std::{StdCommandWrap, StdCommandWrapper};
+//! # use process_wrap::std::{CommandWrap, CommandWrapper};
 //! # use std::{
-//! # 	io,
-//! # 	path::PathBuf,
-//! # 	process::{Child, Command, Stdio},
-//! # 	thread::JoinHandle,
+//! #     io,
+//! #     path::PathBuf,
+//! #     process::{Child, Command, Stdio},
+//! #     thread::JoinHandle,
 //! # };
 //! # #[derive(Debug)]
 //! # struct LogFile {
-//! # 	path: PathBuf,
-//! # 	thread: Option<JoinHandle<()>>,
+//! #     path: PathBuf,
+//! #     thread: Option<JoinHandle<()>>,
 //! # }
 //! #
-//! impl StdCommandWrapper for LogFile {
-//! 	// ... snip ...
-//! 	fn post_spawn(
-//! 		&mut self,
-//! 		command: &mut Command,
-//! 		_child: &mut Child,
-//! 		_core: &StdCommandWrap,
-//! 	) -> io::Result<()> {
-//! 		command.stdout(Stdio::null()).stderr(Stdio::null());
+//! impl CommandWrapper for LogFile {
+//!     // ... snip ...
+//!     fn post_spawn(
+//!         &mut self,
+//!         command: &mut Command,
+//!         _child: &mut Child,
+//!         _core: &CommandWrap,
+//!     ) -> io::Result<()> {
+//!         command.stdout(Stdio::null()).stderr(Stdio::null());
 //!
-//! 		Ok(())
-//! 	}
-//! 	// ... snip ...
+//!         Ok(())
+//!     }
+//!     // ... snip ...
 //! }
 //! ```
 //!
 //! Finally, we can test that our new command-wrapper works:
 //!
 //! ```rust
-//! # use process_wrap::std::{StdChildWrapper, StdCommandWrap, StdCommandWrapper};
+//! # use process_wrap::std::{ChildWrapper, CommandWrap, CommandWrapper};
 //! # use std::{
-//! # 	error::Error,
-//! # 	fs::{self, File},
-//! # 	io, mem,
-//! # 	path::PathBuf,
-//! # 	process::{Child, Command, ExitStatus, Stdio},
-//! # 	thread::{self, JoinHandle},
+//! #     error::Error,
+//! #     fs::{self, File},
+//! #     io, mem,
+//! #     path::PathBuf,
+//! #     process::{Child, Command, ExitStatus, Stdio},
+//! #     thread::{self, JoinHandle},
 //! # };
 //! # use tempfile::NamedTempFile;
 //! # #[derive(Debug)]
 //! # struct LogFile {
-//! # 	path: PathBuf,
-//! # 	thread: Option<JoinHandle<()>>,
+//! #     path: PathBuf,
+//! #     thread: Option<JoinHandle<()>>,
 //! # }
 //! #
 //! # impl LogFile {
-//! # 	fn new(path: impl Into<PathBuf>) -> Self {
-//! # 		Self {
-//! # 			path: path.into(),
-//! # 			thread: None,
-//! # 		}
-//! # 	}
+//! #     fn new(path: impl Into<PathBuf>) -> Self {
+//! #         Self {
+//! #          path: path.into(),
+//! #          thread: None,
+//! #         }
+//! #     }
 //! # }
 //! #
-//! # impl StdCommandWrapper for LogFile {
-//! # 	fn pre_spawn(&mut self, command: &mut Command, _core: &StdCommandWrap) -> io::Result<()> {
-//! # 		let mut logfile = File::create(&self.path)?;
-//! # 		let (mut rx, tx) = io::pipe()?;
+//! # impl CommandWrapper for LogFile {
+//! #     fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> io::Result<()> {
+//! #         let mut logfile = File::create(&self.path)?;
+//! #         let (mut rx, tx) = io::pipe()?;
 //! #
-//! # 		self.thread = Some(thread::spawn(move || {
-//! # 			io::copy(&mut rx, &mut logfile).unwrap();
-//! # 		}));
+//! #         self.thread = Some(thread::spawn(move || {
+//! #          io::copy(&mut rx, &mut logfile).unwrap();
+//! #         }));
 //! #
-//! # 		command.stdout(tx.try_clone()?).stderr(tx);
-//! # 		Ok(())
-//! # 	}
+//! #         command.stdout(tx.try_clone()?).stderr(tx);
+//! #         Ok(())
+//! #     }
 //! #
-//! # 	fn post_spawn(
-//! # 		&mut self,
-//! # 		command: &mut Command,
-//! # 		_child: &mut Child,
-//! # 		_core: &StdCommandWrap,
-//! # 	) -> io::Result<()> {
-//! # 		command.stdout(Stdio::null()).stderr(Stdio::null());
+//! #     fn post_spawn(
+//! #         &mut self,
+//! #         command: &mut Command,
+//! #         _child: &mut Child,
+//! #         _core: &CommandWrap,
+//! #     ) -> io::Result<()> {
+//! #         command.stdout(Stdio::null()).stderr(Stdio::null());
 //! #
-//! # 		Ok(())
-//! # 	}
+//! #         Ok(())
+//! #     }
 //! #
-//! # 	fn wrap_child(
-//! # 		&mut self,
-//! # 		child: Box<dyn StdChildWrapper>,
-//! # 		_core: &StdCommandWrap,
-//! # 	) -> io::Result<Box<dyn StdChildWrapper>> {
-//! # 		let wrapped_child = LogFileChild {
-//! # 			inner: child,
-//! # 			thread: mem::take(&mut self.thread),
-//! # 		};
-//! # 		Ok(Box::new(wrapped_child))
-//! # 	}
+//! #     fn wrap_child(
+//! #         &mut self,
+//! #         child: Box<dyn ChildWrapper>,
+//! #         _core: &CommandWrap,
+//! #     ) -> io::Result<Box<dyn ChildWrapper>> {
+//! #         let wrapped_child = LogFileChild {
+//! #          inner: child,
+//! #          thread: mem::take(&mut self.thread),
+//! #         };
+//! #         Ok(Box::new(wrapped_child))
+//! #     }
 //! # }
 //! #
 //! # #[derive(Debug)]
 //! # struct LogFileChild {
-//! # 	inner: Box<dyn StdChildWrapper>,
-//! # 	thread: Option<JoinHandle<()>>,
+//! #     inner: Box<dyn ChildWrapper>,
+//! #     thread: Option<JoinHandle<()>>,
 //! # }
 //! #
-//! # impl StdChildWrapper for LogFileChild {
-//! # 	fn inner(&self) -> &dyn StdChildWrapper {
-//! # 		&*self.inner
-//! # 	}
+//! # impl ChildWrapper for LogFileChild {
+//! #     fn inner(&self) -> &dyn ChildWrapper {
+//! #         &*self.inner
+//! #     }
 //! #
-//! # 	fn inner_mut(&mut self) -> &mut dyn StdChildWrapper {
-//! # 		&mut *self.inner
-//! # 	}
+//! #     fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+//! #         &mut *self.inner
+//! #     }
 //! #
-//! # 	fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper> {
-//! # 		self.inner
-//! # 	}
+//! #     fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+//! #         self.inner
+//! #     }
 //! #
-//! # 	fn wait(&mut self) -> io::Result<ExitStatus> {
-//! # 		let exit_status = self.inner.wait();
+//! #     fn wait(&mut self) -> io::Result<ExitStatus> {
+//! #         let exit_status = self.inner.wait();
 //! #
-//! # 		if let Some(thread) = mem::take(&mut self.thread) {
-//! # 			thread.join().unwrap();
-//! # 		}
+//! #         if let Some(thread) = mem::take(&mut self.thread) {
+//! #          thread.join().unwrap();
+//! #         }
 //! #
-//! # 		exit_status
-//! # 	}
+//! #         exit_status
+//! #     }
 //! # }
 //! #
 //! fn main() -> Result<(), Box<dyn Error>> {
-//! 	#[cfg(windows)]
-//! 	let mut command = StdCommandWrap::with_new("cmd", |command| {
-//! 		command.args(["/c", "echo Hello && echo World 1>&2"]);
-//! 	});
-//! 	#[cfg(unix)]
-//! 	let mut command = StdCommandWrap::with_new("sh", |command| {
-//! 		command.args(["-c", "echo Hello && echo World 1>&2"]);
-//! 	});
+//!     #[cfg(windows)]
+//!     let mut command = CommandWrap::with_new("cmd", |command| {
+//!         command.args(["/c", "echo Hello && echo World 1>&2"]);
+//!     });
+//!     #[cfg(unix)]
+//!     let mut command = CommandWrap::with_new("sh", |command| {
+//!         command.args(["-c", "echo Hello && echo World 1>&2"]);
+//!     });
 //!
-//! 	let logfile = NamedTempFile::new()?;
-//! 	let logfile_path = logfile.path();
+//!     let logfile = NamedTempFile::new()?;
+//!     let logfile_path = logfile.path();
 //!
-//! 	command.wrap(LogFile::new(logfile_path)).spawn()?.wait()?;
+//!     command.wrap(LogFile::new(logfile_path)).spawn()?.wait()?;
 //!
-//! 	let logfile_lines: Vec<String> = fs::read_to_string(logfile_path)?
-//! 		.lines()
-//! 		.map(|l| l.trim().into())
-//! 		.collect();
-//! 	assert_eq!(logfile_lines, vec!["Hello", "World"]);
+//!     let logfile_lines: Vec<String> = fs::read_to_string(logfile_path)?
+//!         .lines()
+//!         .map(|l| l.trim().into())
+//!         .collect();
+//!     assert_eq!(logfile_lines, vec!["Hello", "World"]);
 //!
-//! 	Ok(())
+//!     Ok(())
 //! }
 //! ```
 //!

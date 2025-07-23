@@ -2,7 +2,7 @@ use super::prelude::*;
 
 #[test]
 fn nowrap() -> Result<()> {
-	let mut child = StdCommandWrap::with_new("yes", |command| {
+	let mut child = CommandWrap::with_new("yes", |command| {
 		command.stdout(Stdio::null());
 	})
 	.spawn()?;
@@ -20,7 +20,7 @@ fn nowrap() -> Result<()> {
 
 #[test]
 fn process_group() -> Result<()> {
-	let mut child = StdCommandWrap::with_new("yes", |command| {
+	let mut child = CommandWrap::with_new("yes", |command| {
 		command.stdout(Stdio::null());
 	})
 	.wrap(ProcessGroup::leader())
@@ -43,7 +43,7 @@ fn process_group() -> Result<()> {
 
 #[test]
 fn process_session() -> Result<()> {
-	let mut child = StdCommandWrap::with_new("yes", |command| {
+	let mut child = CommandWrap::with_new("yes", |command| {
 		command.stdout(Stdio::null());
 	})
 	.wrap(ProcessSession)

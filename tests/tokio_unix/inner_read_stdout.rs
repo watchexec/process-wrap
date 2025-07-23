@@ -2,7 +2,7 @@ use super::prelude::*;
 
 #[tokio::test]
 async fn nowrap() -> Result<()> {
-	let mut child = TokioCommandWrap::with_new("echo", |command| {
+	let mut child = CommandWrap::with_new("echo", |command| {
 		command.arg("hello").stdout(Stdio::piped());
 	})
 	.spawn()?;
@@ -18,7 +18,7 @@ async fn nowrap() -> Result<()> {
 
 #[tokio::test]
 async fn process_group() -> Result<()> {
-	let mut child = TokioCommandWrap::with_new("echo", |command| {
+	let mut child = CommandWrap::with_new("echo", |command| {
 		command.arg("hello").stdout(Stdio::piped());
 	})
 	.wrap(ProcessGroup::leader())
@@ -35,7 +35,7 @@ async fn process_group() -> Result<()> {
 
 #[tokio::test]
 async fn process_session() -> Result<()> {
-	let mut child = TokioCommandWrap::with_new("echo", |command| {
+	let mut child = CommandWrap::with_new("echo", |command| {
 		command.arg("hello").stdout(Stdio::piped());
 	})
 	.wrap(ProcessSession)
