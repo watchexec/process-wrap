@@ -1,4 +1,5 @@
 use std::{
+	any::Any,
 	io::{Read, Result},
 	process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output},
 };
@@ -15,22 +16,21 @@ crate::generic_wrap::Wrap!(
 	StdCommandWrapper,
 	Child,
 	StdChildWrapper,
-	StdChild // |child| StdChild(child)
+	|child| child
 );
 
-crate::generic_wrap::MaybeAnyTrait! {
 /// Wrapper for `std::process::Child`.
 ///
 /// This trait exposes most of the functionality of the underlying [`Child`]. It is implemented for
-/// [`StdChild`] (a thin wrapper around [`Child`]) (because implementing directly on [`Child`] would
-/// loop) and by wrappers.
+/// [`Child`] and by wrappers.
 ///
 /// The required methods are `inner`, `inner_mut`, and `into_inner`. That provides access to the
-/// underlying `Child` and allows the wrapper to be dropped and the `Child` to be used directly if
-/// necessary.
+/// lower layer and ultimately allows the wrappers to be unwrap and the `Child` to be used directly
+/// if necessary. There are convenience `inner_child`, `inner_child_mut` and `into_inner_child`
+/// methods on the trait object.
 ///
 /// It also makes it possible for all the other methods to have default implementations. Some are
-/// direct passthroughs to the underlying `Child`, while others are more complex.
+/// direct passthroughs to the lower layers, while others are more complex.
 ///
 /// Here's a simple example of a wrapper:
 ///
@@ -42,32 +42,32 @@ crate::generic_wrap::MaybeAnyTrait! {
 /// pub struct YourChildWrapper(Child);
 ///
 /// impl StdChildWrapper for YourChildWrapper {
-///     fn inner(&self) -> &Child {
+///     fn inner(&self) -> &dyn StdChildWrapper {
 ///         &self.0
 ///     }
 ///
-///     fn inner_mut(&mut self) -> &mut Child {
+///     fn inner_mut(&mut self) -> &mut dyn StdChildWrapper {
 ///         &mut self.0
 ///     }
 ///
-///     fn into_inner(self: Box<Self>) -> Child {
-///         (*self).0
+///     fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper> {
+///         Box::new((*self).0)
 ///     }
 /// }
 /// ```
-pub trait StdChildWrapper {
-	/// Obtain a reference to the underlying `Child`.
-	fn inner(&self) -> &Child;
+pub trait StdChildWrapper: Any + std::fmt::Debug + Send {
+	/// Obtain a reference to the wrapped child.
+	fn inner(&self) -> &dyn StdChildWrapper;
 
-	/// Obtain a mutable reference to the underlying `Child`.
-	fn inner_mut(&mut self) -> &mut Child;
+	/// Obtain a mutable reference to the wrapped child.
+	fn inner_mut(&mut self) -> &mut dyn StdChildWrapper;
 
-	/// Consume the wrapper and return the underlying `Child`.
+	/// Consume the current wrapper and return the wrapped child.
 	///
-	/// Note that this may disrupt whatever the wrappers were doing. However, wrappers must ensure
-	/// that the `Child` is in a consistent state when this is called or they are dropped, so that
-	/// this is always safe.
-	fn into_inner(self: Box<Self>) -> Child;
+	/// Note that this may disrupt whatever the current wrapper was doing. However, wrappers must
+	/// ensure that the wrapped child is in a consistent state when this is called or they are
+	/// dropped, so that this is always safe.
+	fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper>;
 
 	/// Obtain a clone if possible.
 	///
@@ -79,23 +79,23 @@ pub trait StdChildWrapper {
 
 	/// Obtain the `Child`'s stdin.
 	///
-	/// By default this is a passthrough to the underlying `Child`.
+	/// By default this is a passthrough to the wrapped child.
 	fn stdin(&mut self) -> &mut Option<ChildStdin> {
-		&mut self.inner_mut().stdin
+		self.inner_mut().stdin()
 	}
 
 	/// Obtain the `Child`'s stdout.
 	///
-	/// By default this is a passthrough to the underlying `Child`.
+	/// By default this is a passthrough to the wrapped child.
 	fn stdout(&mut self) -> &mut Option<ChildStdout> {
-		&mut self.inner_mut().stdout
+		self.inner_mut().stdout()
 	}
 
 	/// Obtain the `Child`'s stderr.
 	///
-	/// By default this is a passthrough to the underlying `Child`.
+	/// By default this is a passthrough to the wrapped child.
 	fn stderr(&mut self) -> &mut Option<ChildStderr> {
-		&mut self.inner_mut().stderr
+		self.inner_mut().stderr()
 	}
 
 	/// Obtain the `Child`'s process ID.
@@ -127,15 +127,7 @@ pub trait StdChildWrapper {
 	/// library uses it to provide a consistent API across both std and Tokio (and because it's a
 	/// generally useful API).
 	fn start_kill(&mut self) -> Result<()> {
-		#[cfg(unix)]
-		{
-			self.signal(Signal::SIGKILL as _)
-		}
-
-		#[cfg(not(unix))]
-		{
-			self.inner_mut().kill()
-		}
+		self.inner_mut().start_kill()
 	}
 
 	/// Check if the `Child` has exited without blocking, and if so, return its exit status.
@@ -205,6 +197,51 @@ pub trait StdChildWrapper {
 	/// and unwrapped processes.
 	#[cfg(unix)]
 	fn signal(&self, sig: i32) -> Result<()> {
+		self.inner().signal(sig)
+	}
+}
+
+impl StdChildWrapper for Child {
+	fn inner(&self) -> &dyn StdChildWrapper {
+		self
+	}
+	fn inner_mut(&mut self) -> &mut dyn StdChildWrapper {
+		self
+	}
+	fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper> {
+		self
+	}
+	fn stdin(&mut self) -> &mut Option<ChildStdin> {
+		&mut self.stdin
+	}
+	fn stdout(&mut self) -> &mut Option<ChildStdout> {
+		&mut self.stdout
+	}
+	fn stderr(&mut self) -> &mut Option<ChildStderr> {
+		&mut self.stderr
+	}
+	fn id(&self) -> u32 {
+		Child::id(self)
+	}
+	fn start_kill(&mut self) -> Result<()> {
+		#[cfg(unix)]
+		{
+			self.signal(Signal::SIGKILL as _)
+		}
+
+		#[cfg(not(unix))]
+		{
+			Child::kill(self)
+		}
+	}
+	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+		Child::try_wait(self)
+	}
+	fn wait(&mut self) -> Result<ExitStatus> {
+		Child::wait(self)
+	}
+	#[cfg(unix)]
+	fn signal(&self, sig: i32) -> Result<()> {
 		kill(
 			Pid::from_raw(i32::try_from(self.id()).map_err(std::io::Error::other)?),
 			Signal::try_from(sig)?,
@@ -212,25 +249,51 @@ pub trait StdChildWrapper {
 		.map_err(std::io::Error::from)
 	}
 }
-}
 
-/// A thin wrapper around [`Child`].
-///
-/// This is used only because implementing [`StdChildWrapper`] directly on std's [`Child`] creates
-/// loops in the type system. It is not intended to be used directly, but only to be used internally
-/// by the library.
-#[derive(Debug)]
-pub struct StdChild(pub Child);
+impl dyn StdChildWrapper {
+	fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+		(self as &dyn Any).downcast_ref()
+	}
 
-impl StdChildWrapper for StdChild {
-	fn inner(&self) -> &Child {
-		&self.0
+	fn is_raw_child(&self) -> bool {
+		self.downcast_ref::<Child>().is_some()
 	}
-	fn inner_mut(&mut self) -> &mut Child {
-		&mut self.0
+
+	/// Obtain a reference to the underlying [`Child`].
+	pub fn inner_child(&self) -> &Child {
+		let mut inner = self;
+		while !inner.is_raw_child() {
+			inner = inner.inner();
+		}
+
+		// UNWRAP: we've just checked that it's Some with is_raw_child()
+		inner.downcast_ref().unwrap()
 	}
-	fn into_inner(self: Box<Self>) -> Child {
-		(*self).0
+
+	/// Obtain a mutable reference to the underlying [`Child`].
+	///
+	/// Modifying the raw child may be unsound depending on the layering of wrappers.
+	pub unsafe fn inner_child_mut(&mut self) -> &mut Child {
+		let mut inner = self;
+		while !inner.is_raw_child() {
+			inner = inner.inner_mut();
+		}
+
+		// UNWRAP: we've just checked that with is_raw_child()
+		(inner as &mut dyn Any).downcast_mut().unwrap()
+	}
+
+	/// Obtain the underlying [`Child`].
+	///
+	/// Unwrapping everything may be unsound depending on the state of the wrappers.
+	pub unsafe fn into_inner_child(self: Box<Self>) -> Child {
+		let mut inner = self;
+		while !inner.is_raw_child() {
+			inner = inner.into_inner();
+		}
+
+		// UNWRAP: we've just checked that with is_raw_child()
+		*(inner as Box<dyn Any>).downcast().unwrap()
 	}
 }
 

@@ -2,7 +2,7 @@ use std::{
 	io::{Error, Result},
 	ops::ControlFlow,
 	os::unix::process::{CommandExt, ExitStatusExt},
-	process::{Child, Command, ExitStatus},
+	process::{Command, ExitStatus},
 };
 
 use nix::{
@@ -150,13 +150,13 @@ impl ProcessGroupChild {
 }
 
 impl StdChildWrapper for ProcessGroupChild {
-	fn inner(&self) -> &Child {
+	fn inner(&self) -> &dyn StdChildWrapper {
 		self.inner.inner()
 	}
-	fn inner_mut(&mut self) -> &mut Child {
+	fn inner_mut(&mut self) -> &mut dyn StdChildWrapper {
 		self.inner.inner_mut()
 	}
-	fn into_inner(self: Box<Self>) -> Child {
+	fn into_inner(self: Box<Self>) -> Box<dyn StdChildWrapper> {
 		self.inner.into_inner()
 	}
 
@@ -177,7 +177,7 @@ impl StdChildWrapper for ProcessGroupChild {
 		self.exit_status = ChildExitStatus::Exited(status);
 
 		// nevertheless, now wait and make sure we reap all children.
-		Self::wait_imp(self.pgid, WaitPidFlag::empty())?;
+		let _ = Self::wait_imp(self.pgid, WaitPidFlag::empty())?;
 		Ok(status)
 	}
 

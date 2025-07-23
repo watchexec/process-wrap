@@ -8,7 +8,7 @@ fn nowrap() -> Result<()> {
 	.spawn()?;
 	assert!(child.try_wait()?.is_none(), "pre kill");
 
-	(child.kill())?;
+	child.kill()?;
 	sleep(DIE_TIME);
 	assert!(child.try_wait()?.is_some(), "try_wait() one");
 
@@ -27,7 +27,7 @@ fn job_object() -> Result<()> {
 	.spawn()?;
 	assert!(child.try_wait()?.is_none(), "pre kill");
 
-	(child.kill())?;
+	child.kill()?;
 	sleep(DIE_TIME);
 	assert!(child.try_wait()?.is_some(), "try_wait() one");
 

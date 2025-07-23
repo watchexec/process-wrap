@@ -14,7 +14,7 @@ readme = "README.md"
 
 edition = "2021"
 exclude = ["/bin", "/.github"]
-rust-version = "1.77.0"
+rust-version = "1.86.0"
 
 [dependencies]
 futures = { version = "0.3.30", optional = true }
@@ -40,9 +40,6 @@ tokio = { version = "1.38.2", features = ["io-util", "macros", "process", "rt", 
 
 [features]
 default = ["creation-flags", "job-object", "kill-on-drop", "process-group", "process-session", "tracing"]
-
-## Enable Any trait bound on the ChildWrapper traits
-downcasting = []
 
 ## Enable internal tracing logs
 tracing = ["dep:tracing"]

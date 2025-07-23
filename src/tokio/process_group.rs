@@ -3,6 +3,7 @@ use std::{
 	io::{Error, Result},
 	ops::ControlFlow,
 	os::unix::process::ExitStatusExt,
+	pin::Pin,
 	process::ExitStatus,
 };
 
@@ -15,10 +16,7 @@ use nix::{
 	},
 	unistd::Pid,
 };
-use tokio::{
-	process::{Child, Command},
-	task::spawn_blocking,
-};
+use tokio::{process::Command, task::spawn_blocking};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -162,13 +160,13 @@ impl ProcessGroupChild {
 }
 
 impl TokioChildWrapper for ProcessGroupChild {
-	fn inner(&self) -> &Child {
+	fn inner(&self) -> &dyn TokioChildWrapper {
 		self.inner.inner()
 	}
-	fn inner_mut(&mut self) -> &mut Child {
+	fn inner_mut(&mut self) -> &mut dyn TokioChildWrapper {
 		self.inner.inner_mut()
 	}
-	fn into_inner(self: Box<Self>) -> Child {
+	fn into_inner(self: Box<Self>) -> Box<dyn TokioChildWrapper> {
 		self.inner.into_inner()
 	}
 
@@ -178,8 +176,8 @@ impl TokioChildWrapper for ProcessGroupChild {
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
-	fn wait(&mut self) -> Box<dyn Future<Output = Result<ExitStatus>> + Send + '_> {
-		Box::new(async {
+	fn wait(&mut self) -> Pin<Box<dyn Future<Output = Result<ExitStatus>> + Send + '_>> {
+		Box::pin(async {
 			if let ChildExitStatus::Exited(status) = &self.exit_status {
 				return Ok(*status);
 			}
@@ -189,7 +187,7 @@ impl TokioChildWrapper for ProcessGroupChild {
 
 			// always wait for parent to exit first, as by the time it does,
 			// it's likely that all its children have already been reaped.
-			let status = Box::into_pin(self.inner.wait()).await?;
+			let status = self.inner.wait().await?;
 			self.exit_status = ChildExitStatus::Exited(status);
 
 			// nevertheless, now try reaping all children a few times...
@@ -201,7 +199,7 @@ impl TokioChildWrapper for ProcessGroupChild {
 
 			// ...finally, if there are some that are still alive,
 			// block in the background to reap them fully.
-			spawn_blocking(move || Self::wait_imp(pgid, WaitPidFlag::empty())).await??;
+			let _ = spawn_blocking(move || Self::wait_imp(pgid, WaitPidFlag::empty())).await??;
 			Ok(status)
 		})
 	}
