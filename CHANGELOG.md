@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [9.0.0](https://github.com/watchexec/process-wrap/compare/v8.2.1..9.0.0) - 2025-08-09
+
+
+- **Bugfix:** Restore ability to compile without tracing - ([e760d2d](https://github.com/watchexec/process-wrap/commit/e760d2d6e859c795fbe892cc87c85daeb4d4c74a))
+- **Documentation:** Add workaround for jobobject ordering - ([6afbf8d](https://github.com/watchexec/process-wrap/commit/6afbf8dfa247f66ea5ade513e6b8822e9695da2c))
+- **Feature:** Change child wrapper inner()s to return one layer down (#23) - ([bcfd7fd](https://github.com/watchexec/process-wrap/commit/bcfd7fd889fe957d5921299380ea323a794205a3))
+- **Feature:** Add `&mut Command` to `post_spawn()` (#24) - ([93b5dd2](https://github.com/watchexec/process-wrap/commit/93b5dd214c344469deede02db7710746b36f178c))
+- **Refactor:** Rename types to remove std/tokio name differentiation (#26) - ([f1cf62e](https://github.com/watchexec/process-wrap/commit/f1cf62e56c8870bdf7c9af620d4261ffafe015aa))
+
+---
 ## [8.2.1](https://github.com/watchexec/process-wrap/compare/v8.2.0..8.2.1) - 2025-05-15
 
 

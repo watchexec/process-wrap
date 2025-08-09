@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "process-wrap"
-version = "8.2.1"
+version = "9.0.0"
 dependencies = [
  "futures",
  "indexmap",
