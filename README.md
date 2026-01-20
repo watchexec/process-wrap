@@ -7,9 +7,10 @@
 - **[API documentation][docs]**.
 - [Dual-licensed][copyright] with Apache 2.0 and MIT.
 - Successor to [command-group](https://github.com/watchexec/command-group).
-- Minimum Supported Rust Version: 1.86.0.
+- Minimum Supported Rust Version: 1.87.0.
   - Only the latest stable rustc version is supported.
-  - MSRV increases will not incur major version bumps.
+  - We try to conservatively bump the MSRV,
+  - but MSRV increases will not incur major version bumps.
 
 [copyright]: ./COPYRIGHT
 [docs]: https://docs.rs/process-wrap
