@@ -13,8 +13,8 @@ use windows::Win32::{
 };
 
 use crate::{
-	windows::{make_job_object, resume_threads, terminate_job, wait_on_job, JobPort},
 	ChildExitStatus,
+	windows::{JobPort, make_job_object, resume_threads, terminate_job, wait_on_job},
 };
 
 #[cfg(feature = "creation-flags")]

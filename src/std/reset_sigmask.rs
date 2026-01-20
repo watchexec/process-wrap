@@ -1,6 +1,6 @@
 use std::{io::Result, os::unix::process::CommandExt, process::Command};
 
-use nix::sys::signal::{sigprocmask, SigSet, SigmaskHow};
+use nix::sys::signal::{SigSet, SigmaskHow, sigprocmask};
 #[cfg(feature = "tracing")]
 use tracing::trace;
 

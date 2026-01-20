@@ -11,7 +11,7 @@ use nix::{
 	errno::Errno,
 	libc,
 	sys::{
-		signal::{killpg, Signal},
+		signal::{Signal, killpg},
 		wait::WaitPidFlag,
 	},
 	unistd::Pid,

@@ -4,7 +4,7 @@ use std::{
 	process::Command,
 };
 
-use nix::unistd::{setsid, Pid};
+use nix::unistd::{Pid, setsid};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 

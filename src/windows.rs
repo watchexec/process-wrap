@@ -12,16 +12,16 @@ use windows::Win32::{
 	Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
 	System::{
 		Diagnostics::ToolHelp::{
-			CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+			CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 		},
-		JobObjects::{
-			AssignProcessToJobObject, CreateJobObjectW,
-			JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
-			SetInformationJobObject, TerminateJobObject, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
-			JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-		},
-		Threading::{GetProcessId, OpenThread, ResumeThread, INFINITE, THREAD_SUSPEND_RESUME},
 		IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED},
+		JobObjects::{
+			AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+			JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+			JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
+			SetInformationJobObject, TerminateJobObject,
+		},
+		Threading::{GetProcessId, INFINITE, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
 	},
 };
 
@@ -69,7 +69,7 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 	debug!(?completion_port, "done CreateIoCompletionPort");
 
 	let associate_completion = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
-		CompletionKey: job.0 .0 as _,
+		CompletionKey: job.0.0 as _,
 		CompletionPort: completion_port.0,
 	};
 

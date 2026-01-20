@@ -1,6 +1,6 @@
 use std::io::{Error, Result};
 
-use nix::unistd::{setsid, Pid};
+use nix::unistd::{Pid, setsid};
 use tokio::process::Command;
 #[cfg(feature = "tracing")]
 use tracing::instrument;

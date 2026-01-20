@@ -1,6 +1,6 @@
 use std::io::Result;
 
-use nix::sys::signal::{sigprocmask, SigSet, SigmaskHow};
+use nix::sys::signal::{SigSet, SigmaskHow, sigprocmask};
 use tokio::process::Command;
 #[cfg(feature = "tracing")]
 use tracing::trace;

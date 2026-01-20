@@ -9,7 +9,7 @@ use std::{
 use futures::future::try_join3;
 #[cfg(unix)]
 use nix::{
-	sys::signal::{kill, Signal},
+	sys::signal::{Signal, kill},
 	unistd::Pid,
 };
 use tokio::{
