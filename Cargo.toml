@@ -12,9 +12,10 @@ homepage = "https://github.com/watchexec/process-wrap"
 repository = "https://github.com/watchexec/process-wrap"
 readme = "README.md"
 
-edition = "2021"
+edition = "2024"
+resolver = "3"
 exclude = ["/bin", "/.github"]
-rust-version = "1.86.0"
+rust-version = "1.87.0"
 
 [dependencies]
 futures = { version = "0.3.30", optional = true }
