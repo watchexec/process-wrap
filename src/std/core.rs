@@ -48,7 +48,7 @@ crate::generic_wrap::Wrap!(Command, Child, ChildWrapper, |child| child);
 ///     }
 /// }
 /// ```
-pub trait ChildWrapper: Any + std::fmt::Debug + Send {
+pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	/// Obtain a reference to the wrapped child.
 	fn inner(&self) -> &dyn ChildWrapper;
 
@@ -383,3 +383,8 @@ fn read2(
 	err_r.read_to_end(err_v)?;
 	Ok(())
 }
+
+const _: () = {
+	const fn assert_sync<T: ?Sized + Sync>() {}
+	assert_sync::<dyn ChildWrapper>();
+};

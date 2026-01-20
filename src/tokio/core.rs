@@ -54,7 +54,7 @@ crate::generic_wrap::Wrap!(Command, Child, ChildWrapper, |child| child);
 ///     }
 /// }
 /// ```
-pub trait ChildWrapper: Any + std::fmt::Debug + Send {
+pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	/// Obtain a reference to the wrapped child.
 	fn inner(&self) -> &dyn ChildWrapper;
 
@@ -290,3 +290,8 @@ impl dyn ChildWrapper {
 		*(inner as Box<dyn Any>).downcast().unwrap()
 	}
 }
+
+const _: () = {
+	const fn assert_sync<T: ?Sized + Sync>() {}
+	assert_sync::<dyn ChildWrapper>();
+};
