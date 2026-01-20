@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [9.0.1](https://github.com/watchexec/process-wrap/compare/v9.0.0..9.0.1) - 2026-01-20
+
+
+- **Bugfix:** Restore Sync support - ([9a8bbb9](https://github.com/watchexec/process-wrap/commit/9a8bbb92b334539c29cea480342354a9857c90db))
+- **Deps:** Upgrade windows and transitives - ([bbaaef0](https://github.com/watchexec/process-wrap/commit/bbaaef011177f048e79d4fb6fae48c1f72865a23))
+- **Documentation:** Better document msrv policy - ([446028b](https://github.com/watchexec/process-wrap/commit/446028b646dc0747aad68754b341a7a8871f3c4f))
+
+---
 ## [9.0.0](https://github.com/watchexec/process-wrap/compare/v8.2.1..9.0.0) - 2025-08-09
 
 

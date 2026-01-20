@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: If you use this software, please cite it using these metadata.
 title: "process-wrap: extensible wrappers for Rust Command APIs"
 
-version: "9.0.0"
-date-released: 2025-08-09
+version: "9.0.1"
+date-released: 2026-01-20
 
 repository-code: https://github.com/watchexec/process-wrap
 license: Apache-2.0 OR MIT
