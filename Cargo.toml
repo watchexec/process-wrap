@@ -30,7 +30,7 @@ nix = { version = "0.30.1", default-features = false, features = ["fs", "poll", 
 # as process-wrap is carefully designed to never expose nix's types
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61.1", optional = true }
+windows = { version = "0.62.2", optional = true }
 # note: bumping the windows version doesn't require a breaking change,
 # as process-wrap is carefully designed to never expose windows's types
 
