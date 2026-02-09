@@ -51,7 +51,7 @@ use tokio::process::Command;
 use process_wrap::tokio::*;
 
 let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
-  .wrap(JobObject::new())
+  .wrap(JobObject)
   .spawn()?;
 let status = Box::into_pin(child.wait()).await?;
 dbg!(status);
@@ -140,7 +140,7 @@ TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .spawn()?;
 ```
 
-For Windows process groups, use `CreationFlags::NEW_PROCESS_GROUP` and/or `JobObject::new()`.
+For Windows process groups, use `CreationFlags::NEW_PROCESS_GROUP` and/or `JobObject`.
 
 ### Process session
 
