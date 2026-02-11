@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [9.0.2](https://github.com/watchexec/process-wrap/compare/v9.0.1..9.0.2) - 2026-02-11
+
+
+- **Documentation:** Fix incorrect `JobObject::new()` usage in README (#29) - ([f7dd863](https://github.com/watchexec/process-wrap/commit/f7dd863ec6d7ba2822d1d8a92b257707860c719e))
+
+---
 ## [9.0.1](https://github.com/watchexec/process-wrap/compare/v9.0.0..9.0.1) - 2026-01-20
 
 
