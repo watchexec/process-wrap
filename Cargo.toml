@@ -26,7 +26,7 @@ tracing = { version = "0.1.40", optional = true }
 # a breaking change, so long as it remains ~6 months below current
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30.1", default-features = false, features = ["fs", "poll", "signal"], optional = true }
+nix = { version = "0.31.1", default-features = false, features = ["fs", "poll", "signal"], optional = true }
 # note: bumping the nix version doesn't require a breaking change,
 # as process-wrap is carefully designed to never expose nix's types
 
