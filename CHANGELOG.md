@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [9.0.3](https://github.com/watchexec/process-wrap/compare/v9.0.2..9.0.3) - 2026-02-12
+
+
+- **Bugfix:** Docs.rs build - ([5d19d8a](https://github.com/watchexec/process-wrap/commit/5d19d8a6f965c41f86abcdd9710025111142262b))
+- **Deps:** Update nix 0.31 - ([2e613c6](https://github.com/watchexec/process-wrap/commit/2e613c6697cf64415de1389e81879f6578589608))
+- **Documentation:** Update readme - ([b1422d7](https://github.com/watchexec/process-wrap/commit/b1422d75b148ec5b211a8ce78faf45a83c42a9c0))
+
+---
 ## [9.0.2](https://github.com/watchexec/process-wrap/compare/v9.0.1..9.0.2) - 2026-02-11
 
 
