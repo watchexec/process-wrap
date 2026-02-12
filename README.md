@@ -34,53 +34,49 @@ By default, the crate does nothing, you need to enable either the std or Tokio "
 set of wrappers are enabled; you may choose to only compile those you need, see [the features list].
 
 ```rust
-use tokio::process::Command;
 use process_wrap::tokio::*;
 
-let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+let mut child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessGroup::leader())
   .spawn()?;
-let status = Box::into_pin(child.wait()).await?;
+let status = child.wait().await?;
 dbg!(status);
 ```
 
 ### or on Windows
 
 ```rust
-use tokio::process::Command;
 use process_wrap::tokio::*;
 
-let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+let mut child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(JobObject)
   .spawn()?;
-let status = Box::into_pin(child.wait()).await?;
+let status = child.wait().await?;
 dbg!(status);
 ```
 
 ### or with sessions
 
 ```rust
-use tokio::process::Command;
 use process_wrap::tokio::*;
 
-let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+let mut child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessSession)
   .spawn()?;
-let status = Box::into_pin(child.wait()).await?;
+let status = child.wait().await?;
 dbg!(status);
 ```
 
 ### or with multiple wrappers
 
 ```rust
-use tokio::process::Command;
 use process_wrap::tokio::*;
 
-let mut child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+let mut child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessSession)
   .wrap(KillOnDrop)
   .spawn()?;
-let status = Box::into_pin(child.wait()).await?;
+let status = child.wait().await?;
 dbg!(status);
 ```
 
@@ -92,10 +88,9 @@ process-wrap = { version = "9.0.2", features = ["std"] }
 ```
 
 ```rust
-use std::process::Command;
 use process_wrap::std::*;
 
-let mut child = StdCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+let mut child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessGroup::leader())
   .spawn()?;
 let status = child.wait()?;
@@ -111,7 +106,7 @@ dbg!(status);
 - Feature: `job-object` (default)
 
 ```rust
-TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(JobObject)
   .spawn()?;
 ```
@@ -127,7 +122,7 @@ When both `CreationFlags` and `JobObject` are used together, either:
 - Feature: `process-group` (default)
 
 ```rust
-TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessGroup::leader())
   .spawn()?;
 ```
@@ -135,7 +130,7 @@ TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
 Or join a different group instead:
 
 ```rust
-TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessGroup::attach_to(pgid))
   .spawn()?;
 ```
@@ -152,7 +147,7 @@ This combines creating a new session and a new group, and setting this process a
 To join the session from another process, use `ProcessGroup::attach_to()` instead.
 
 ```rust
-TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessSession)
   .spawn()?;
 ```
@@ -167,7 +162,7 @@ This resets the [signal mask] of the process instead of inheriting it from the p
 [signal mask]: https://www.man7.org/linux/man-pages/man2/sigprocmask.2.html
 
 ```rust
-TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ResetSigmask)
   .spawn()?;
 ```
@@ -182,7 +177,7 @@ This is a shim to allow setting Windows process creation flags with this API, as
 
 ```rust
 use windows::Win32::System::Threading::*;
-TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(CreationFlags(CREATE_NO_WINDOW | CREATE_DETACHED))
   .wrap(JobObject)
   .spawn()?;
@@ -201,7 +196,7 @@ When both `CreationFlags` and `JobObject` are used together, either:
 This is a shim to allow wrappers to handle the kill-on-drop flag, as it can't be read from Command.
 
 ```rust
-let child = TokioCommandWrap::with_new("watch", |command| { command.arg("ls"); })
+let child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(KillOnDrop)
   .wrap(ProcessGroup::leader())
   .spawn()?;
@@ -214,37 +209,37 @@ Implementing a wrapper is done via a set of traits.
 The std and Tokio sides are completely separate, due to the different underlying APIs.
 Of course you can (and should) re-use/share code wherever possible if implementing both.
 
-At minimum, you must implement `StdCommandWrapper` and/or `TokioCommandWrapper`.
+At minimum, you must implement `CommandWrapper` (from `process_wrap::std` and/or `process_wrap::tokio`).
 These provide the same functionality, but differ in the exact types specified.
 Here's the most basic impl (shown for Tokio):
 
 ```rust
 #[derive(Debug)]
 pub struct YourWrapper;
-impl TokioCommandWrapper for YourWrapper {}
+impl CommandWrapper for YourWrapper {}
 ```
 
 That's right, all member methods are optional.
 The trait provides extension or hook points into the lifecycle of a `Command`:
 
-- **`fn extend(&mut self, other: Box<dyn TokioCommandWrapper>)`** is called if `.wrap(YourWrapper)`
+- **`fn extend(&mut self, other: Box<dyn CommandWrapper>)`** is called if `.wrap(YourWrapper)`
   is done twice. Only one of a wrapper type can exist, so this gives the opportunity to incorporate
   all or part of the second wrapper instance into the first. By default, this does nothing (ie only
   the first registered wrapper instance of a type does anything).
 
-- **`fn pre_spawn(&mut self, command: &mut Command, core: &TokioCommandWrap)`** is called before the
+- **`fn pre_spawn(&mut self, command: &mut Command, core: &CommandWrap)`** is called before the
   command is spawned, and gives mutable access to it. It also gives mutable access to the wrapper
   instance, so state can be stored if needed. The `core` reference gives access to data from other
   wrappers; for example, that's how `CreationFlags` on Windows works along with `JobObject`. Noop by
   default.
 
-- **`fn post_spawn(&mut self, child: &mut tokio::process::Child, core: &TokioCommandWrap)`** is
-  called after spawn, and should be used for any necessary cleanups. It is offered for completedness
+- **`fn post_spawn(&mut self, command: &mut Command, child: &mut tokio::process::Child, core: &CommandWrap)`**
+  is called after spawn, and should be used for any necessary cleanups. It is offered for completeness
   but is expected to be less used than `wrap_child()`. Noop by default.
 
-- **`fn wrap_child(&mut self, child: Box<dyn TokioChildWrapper>, core: &TokioCommandWrap)`** is
+- **`fn wrap_child(&mut self, child: Box<dyn ChildWrapper>, core: &CommandWrap)`** is
   called after all `post_spawn()`s have run. If your wrapper needs to override the methods on Child,
-  then it should create an instance of its own type implementing `TokioChildWrapper` and return it
+  then it should create an instance of its own type implementing `ChildWrapper` and return it
   here. Child wraps are _in order_: you may end up with a `Foo(Bar(Child))` or a `Bar(Foo(Child))`
   depending on if `.wrap(Foo).wrap(Bar)` or `.wrap(Bar).wrap(Foo)` was called. If your functionality
   is order-dependent, make sure to specify so in your documentation! Default is noop: no wrapping is
