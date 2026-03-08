@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [9.1.0](https://github.com/watchexec/process-wrap/compare/v9.0.3..9.1.0) - 2026-03-08
+
+
+- **Feature:** Add `CommandWrap::spawn_with` for custom spawner functions - ([9632e9d](https://github.com/watchexec/process-wrap/commit/9632e9de383f8fe0497612a9f0f2c92a8e01b3ea))
+
+---
 ## [9.0.3](https://github.com/watchexec/process-wrap/compare/v9.0.2..9.0.3) - 2026-02-12
 
 
