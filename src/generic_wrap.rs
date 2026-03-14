@@ -80,7 +80,7 @@ macro_rules! Wrap {
 				&self,
 				command: &mut $command,
 				wrappers: &mut ::indexmap::IndexMap<::std::any::TypeId, Box<dyn CommandWrapper>>,
-				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<$child>,
+				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<Box<dyn $childer>>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
 				for (id, wrapper) in wrappers.iter_mut() {
 					#[cfg(feature = "tracing")]
@@ -89,16 +89,6 @@ macro_rules! Wrap {
 				}
 
 				let mut child = spawner(command)?;
-				for (id, wrapper) in wrappers.iter_mut() {
-					#[cfg(feature = "tracing")]
-					::tracing::debug!(?id, "post_spawn");
-					wrapper.post_spawn(command, &mut child, self)?;
-				}
-
-				let mut child = Box::new(
-					#[allow(clippy::redundant_closure_call)]
-					$first_child_wrapper(child),
-				) as Box<dyn $childer>;
 
 				for (id, wrapper) in wrappers.iter_mut() {
 					#[cfg(feature = "tracing")]
@@ -111,25 +101,35 @@ macro_rules! Wrap {
 
 			/// Spawn the command, returning a `Child` that can be interacted with.
 			///
-			/// In order, this runs all the `pre_spawn` hooks, then spawns the command, then runs
-			/// all the `post_spawn` hooks, then stacks all the `wrap_child`s. As it returns a boxed
-			/// trait object, only the methods from the trait are available directly; however you
-			/// may downcast to the concrete type of the last applied wrapper if you need to.
+			/// In order, this runs all the `pre_spawn` hooks, then spawns the command, then
+			/// stacks all the `wrap_child`s. As it returns a boxed trait object, only the
+			/// methods from the trait are available directly; however you may downcast to the
+			/// concrete type of the last applied wrapper if you need to.
 			pub fn spawn(&mut self) -> ::std::io::Result<Box<dyn $childer>> {
-				self.spawn_with(|command| command.spawn())
+				self.spawn_with(|command| {
+					let child = command.spawn()?;
+					Ok(Box::new(
+						#[allow(clippy::redundant_closure_call)]
+						$first_child_wrapper(child),
+					) as Box<dyn $childer>)
+				})
 			}
 
 			/// Spawn the command using a custom spawner function.
 			///
 			/// This is like [`spawn`](Self::spawn), but instead of calling `command.spawn()`
-			/// directly, it calls the provided closure to create the child process. This is
-			/// useful when you need to use a platform-specific or custom spawning mechanism.
+			/// directly, it calls the provided closure to create the child process. The
+			/// closure receives a `&mut Command` and must return a boxed `ChildWrapper`.
 			///
-			/// The lifecycle is the same as `spawn`: all `pre_spawn` hooks run first, then
-			/// the provided closure is called, then `post_spawn` hooks, then `wrap_child`.
+			/// This is useful when you need to use a platform-specific or custom spawning
+			/// mechanism, or when the process is spawned by an external mechanism (e.g. a
+			/// privileged helper) that provides its own child lifecycle management.
+			///
+			/// The lifecycle is: all `pre_spawn` hooks run first, then the provided closure
+			/// is called, then `wrap_child` hooks are applied.
 			pub fn spawn_with(
 				&mut self,
-				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<$child>,
+				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<Box<dyn $childer>>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
 				let mut command = ::std::mem::replace(&mut self.command, <$command>::new(""));
 				let mut wrappers = ::std::mem::take(&mut self.wrappers);
