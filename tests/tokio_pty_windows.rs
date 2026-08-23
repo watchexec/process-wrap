@@ -199,6 +199,19 @@ fn print_size(output: HANDLE) -> io::Result<()> {
 }
 
 #[tokio::test]
+async fn attaches_standard_handles_before_releasing_console_ownership() -> io::Result<()> {
+	let mut command = helper("terminal")?;
+	let (mut child, controller) = command.spawn(PtyOptions::default())?;
+	let (input, mut output, _resize) = controller.into_parts();
+	drop(input);
+
+	let mut bytes = read_through(&mut output, b"PW-TERMINALS:111").await?;
+	assert!(timeout(TIMEOUT, child.wait()).await??.success());
+	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	Ok(())
+}
+
+#[tokio::test]
 async fn exposes_terminal_handles_and_preserves_environment_cwd_and_merged_output() -> io::Result<()>
 {
 	let directory = tempfile::tempdir()?;
