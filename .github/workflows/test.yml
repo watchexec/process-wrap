@@ -182,6 +182,9 @@ jobs:
           grep -Fx 'src/tokio/pty.rs' "$RUNNER_TEMP/package-files.txt"
           grep -Fx 'src/tokio/pty/unix.rs' "$RUNNER_TEMP/package-files.txt"
           grep -Fx 'src/tokio/pty/unsupported.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/mod.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/command.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/environment.rs' "$RUNNER_TEMP/package-files.txt"
 
   semver:
     name: Semver against PR base
