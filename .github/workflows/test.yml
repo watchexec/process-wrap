@@ -209,7 +209,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'llvm-readobj failed to inspect the process-wrap test executable'
           }
-          $forbidden = $imports | Select-String 'Symbol: (CreatePseudoConsole|ResizePseudoConsole|ClosePseudoConsole)'
+          $forbidden = $imports | Select-String 'Symbol: (CreatePseudoConsole|ResizePseudoConsole|ReleasePseudoConsole|ClosePseudoConsole)'
           if ($forbidden) {
             $forbidden | Write-Error
             throw 'ConPTY functions must be resolved dynamically'
@@ -257,9 +257,18 @@ jobs:
           grep -Fx 'src/tokio/pty.rs' "$RUNNER_TEMP/package-files.txt"
           grep -Fx 'src/tokio/pty/unix.rs' "$RUNNER_TEMP/package-files.txt"
           grep -Fx 'src/tokio/pty/unsupported.rs' "$RUNNER_TEMP/package-files.txt"
-          grep -Fx 'src/tokio/pty/windows/mod.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/api.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/attributes.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/backend.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/child.rs' "$RUNNER_TEMP/package-files.txt"
           grep -Fx 'src/tokio/pty/windows/command.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/console.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/controller.rs' "$RUNNER_TEMP/package-files.txt"
           grep -Fx 'src/tokio/pty/windows/environment.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/mod.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/pipe.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/program.rs' "$RUNNER_TEMP/package-files.txt"
+          grep -Fx 'src/tokio/pty/windows/spawn.rs' "$RUNNER_TEMP/package-files.txt"
 
   semver:
     name: Semver against PR base
