@@ -334,16 +334,16 @@ fn closed() -> io::Error {
 
 #[cfg(test)]
 mod tests {
-	use std::{fs::File, os::fd::RawFd, sync::Mutex};
+	use std::os::fd::RawFd;
 
-	use nix::errno::Errno;
+	use nix::unistd::pipe;
 
 	use super::*;
 
-	static DESCRIPTOR_TEST: Mutex<()> = Mutex::new(());
-
-	fn null_fd() -> OwnedFd {
-		File::open("/dev/null").unwrap().into()
+	fn pipe_pair() -> (OwnedFd, OwnedFd) {
+		let (reader, writer) = pipe().unwrap();
+		set_nonblocking(&reader).unwrap();
+		(reader, writer)
 	}
 
 	fn assert_open(fd: RawFd) {
@@ -351,18 +351,31 @@ mod tests {
 		assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
 	}
 
-	fn assert_closed(fd: RawFd) {
-		// SAFETY: fcntl reports EBADF without dereferencing or taking ownership of a closed descriptor.
-		assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-		assert_eq!(Errno::last(), Errno::EBADF);
+	fn assert_closed(reader: &OwnedFd) {
+		let mut byte = 0_u8;
+		// SAFETY: reader is a live nonblocking pipe descriptor and byte is writable for one byte.
+		let read =
+			unsafe { libc::read(reader.as_raw_fd(), std::ptr::from_mut(&mut byte).cast(), 1) };
+		if read != 0 {
+			panic!(
+				"pipe reader did not observe writer closure: {}",
+				io::Error::last_os_error()
+			);
+		}
 	}
 
-	fn descriptors() -> (OwnedFd, OwnedFd, OwnedFd, [RawFd; 3]) {
-		let stdin = null_fd();
-		let stdout = null_fd();
-		let stderr = null_fd();
+	fn descriptors() -> (OwnedFd, OwnedFd, OwnedFd, [OwnedFd; 3], [RawFd; 3]) {
+		let (stdin_reader, stdin) = pipe_pair();
+		let (stdout_reader, stdout) = pipe_pair();
+		let (stderr_reader, stderr) = pipe_pair();
 		let raw = [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()];
-		(stdin, stdout, stderr, raw)
+		(
+			stdin,
+			stdout,
+			stderr,
+			[stdin_reader, stdout_reader, stderr_reader],
+			raw,
+		)
 	}
 
 	#[test]
@@ -394,9 +407,8 @@ mod tests {
 
 	#[test]
 	fn slave_stdio_is_dropped_when_the_spawn_operation_returns() {
-		let _lock = DESCRIPTOR_TEST.lock().unwrap();
 		let mut command = tokio::process::Command::new("ignored");
-		let (stdin, stdout, stderr, raw) = descriptors();
+		let (stdin, stdout, stderr, readers, raw) = descriptors();
 
 		let result = with_slave_stdio(&mut command, stdin, stdout, stderr, |_| {
 			raw.into_iter().for_each(assert_open);
@@ -404,14 +416,13 @@ mod tests {
 		});
 
 		assert_eq!(result, 42);
-		raw.into_iter().for_each(assert_closed);
+		readers.iter().for_each(assert_closed);
 	}
 
 	#[test]
 	fn slave_stdio_is_dropped_when_the_spawn_operation_panics() {
-		let _lock = DESCRIPTOR_TEST.lock().unwrap();
 		let mut command = tokio::process::Command::new("ignored");
-		let (stdin, stdout, stderr, raw) = descriptors();
+		let (stdin, stdout, stderr, readers, raw) = descriptors();
 
 		let panic = catch_unwind(AssertUnwindSafe(|| {
 			with_slave_stdio(&mut command, stdin, stdout, stderr, |_| {
@@ -421,6 +432,6 @@ mod tests {
 		}));
 
 		assert!(panic.is_err());
-		raw.into_iter().for_each(assert_closed);
+		readers.iter().for_each(assert_closed);
 	}
 }
