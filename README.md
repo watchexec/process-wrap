@@ -83,7 +83,10 @@ dbg!(status);
 ### or in a pseudo-terminal
 
 The non-default `pty` feature enables Tokio PTY transport on Linux, Android, macOS, FreeBSD,
-NetBSD, OpenBSD, DragonFly BSD, illumos, and Solaris. It implies `tokio1`. Other targets return
+NetBSD, OpenBSD, DragonFly BSD, illumos, and Solaris, plus ConPTY on Windows 11 24H2 (build
+26100), Windows Server 2025, and newer releases. It implies `tokio1`. The Windows backend
+dynamically resolves `CreatePseudoConsole`, `ResizePseudoConsole`, `ReleasePseudoConsole`, and
+`ClosePseudoConsole`; Windows versions without that complete capability set and other targets return
 `std::io::ErrorKind::Unsupported` rather than falling back to ordinary pipes. Linux and macOS run
 transport tests in CI; the other Unix backends are cross-compiled there pending native runners.
 
@@ -96,8 +99,7 @@ process-wrap = { version = "9.1.0", features = ["pty"] }
 use process_wrap::tokio::*;
 use tokio::io::AsyncReadExt;
 
-let mut command = PtyCommand::new("ls");
-command.wrap(ProcessSession);
+let mut command = PtyCommand::new("your-program");
 let (mut child, controller) = command.spawn(PtyOptions::default())?;
 let (input, mut output, _resize) = controller.into_parts();
 drop(input);
@@ -113,22 +115,33 @@ dbg!(status, terminal_bytes);
 ```
 
 A PTY intentionally merges stdout and stderr. `PtyInput` and `PtyOutput` are strong owners of one
-bidirectional master descriptor, so dropping either one alone does not half-close the terminal. The
-terminal hangs up after both are gone; `PtyResize` is weak and cannot keep it alive. Send the
-terminal's VEOF character when that is the desired terminal policy rather than expecting a separate
-input half-close or clonable force-close handle.
+terminal lifetime: on Unix they share a bidirectional master file description, while Windows uses
+independent host pipes and a shared pseudoconsole. Shutting down or dropping either owner alone does
+not hang up the terminal; `PtyResize` is weak and cannot keep it alive. There is no portable
+independent input half-close or clonable force-close promise. Send the terminal's VEOF character when
+that is the desired portable terminal policy.
 
-Child waiting and PTY draining are independent. On most supported Unix systems, descendants can retain
-the slave after the direct child exits. On macOS, drain output concurrently with waiting: the kernel
-drains queued output as the session leader exits, then revokes the controlling terminal from its
-descendants. The transport passes terminal bytes through without owning parent-terminal raw mode,
-relays, key handling, VT parsing, scrollback, or pager policy.
+Child waiting and PTY draining are independent. On most supported Unix systems, descendants can
+retain the slave after the direct child exits. On macOS, drain output concurrently with waiting: the
+kernel drains queued output as the session leader exits, then revokes the controlling terminal from
+its descendants. Windows descendants can remain attached to the pseudoconsole after the direct child
+exits; process-wrap releases application ownership after attachment, so output reaches EOF naturally
+once every client disconnects. Final pseudoconsole cleanup runs away from the Tokio reactor. The
+transport passes terminal bytes through without owning parent-terminal raw mode, relays, key handling,
+VT parsing, scrollback, or pager policy.
 
-A bare PTY creates the required session. `ProcessGroup::leader()` and `ProcessSession` each preserve
-their group-aware child supervision when used individually; `ProcessGroup::attach_to(...)` and
-explicitly registering both wrappers return `InvalidInput`. `ResetSigmask` composes normally.
-`KillOnDrop` remains Tokio's direct-child behavior—it does not promise to kill an entire group or
+A bare Unix PTY creates the required session. `ProcessGroup::leader()` and `ProcessSession` each
+preserve their group-aware child supervision when used individually; `ProcessGroup::attach_to(...)`
+and explicitly registering both wrappers return `InvalidInput`. `ResetSigmask` composes normally.
+`KillOnDrop` remains Tokio's direct-child behavior—it does not promise to kill an entire Unix group or
 session.
+
+The Windows backend accepts only the built-in `CreationFlags`, `JobObject`, and `KillOnDrop` wrappers
+whose features are enabled; another wrapper returns `InvalidInput` before spawn hooks run.
+`CreationFlags` and `JobObject` compose in either order, with temporary suspension used for job
+assignment and explicit `CREATE_SUSPENDED` preserved. `KillOnDrop` terminates the direct process when
+used alone and configures kill-on-job-close when combined with `JobObject`. Direct `.bat` and `.cmd`
+execution is rejected rather than choosing a command interpreter implicitly.
 
 ### or with std
 

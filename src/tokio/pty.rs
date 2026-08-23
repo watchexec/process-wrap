@@ -69,9 +69,9 @@ use windows as imp;
 
 /// The character and pixel dimensions of a pseudo-terminal.
 ///
-/// Character dimensions must both be nonzero. Pixel dimensions may be zero when they are unknown or
-/// not meaningful to the caller. Sizes are validated by [`PtyCommand::spawn`] and
-/// [`PtyResize::resize`].
+/// Character dimensions must both be nonzero. Windows additionally limits both to 32767. Pixel
+/// dimensions may be zero when they are unknown or not meaningful to the caller, and ConPTY ignores
+/// them. Sizes are validated by [`PtyCommand::spawn`] and [`PtyResize::resize`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PtySize {
 	/// Character rows.
@@ -226,10 +226,11 @@ pub(crate) fn try_resume_primary_thread(child: &mut dyn ChildWrapper) -> Option<
 /// A tracked command builder for pseudo-terminal spawning.
 ///
 /// This API is available with the non-default `pty` crate feature. Linux, Android, macOS, the BSDs,
-/// illumos, and Solaris provide a native Unix backend; other targets compile the same API but
-/// [`spawn`](Self::spawn) returns [`io::ErrorKind::Unsupported`] without falling back to pipes.
-/// Linux and macOS run transport tests in CI; the other Unix backends are cross-compiled there
-/// pending native runners.
+/// illumos, and Solaris provide a native Unix backend. Windows uses ConPTY on Windows 11 24H2
+/// (build 26100), Windows Server 2025, and newer releases. Older Windows versions and other targets
+/// compile the same API but [`spawn`](Self::spawn) returns [`io::ErrorKind::Unsupported`] without
+/// falling back to pipes. Linux and macOS run transport tests in CI; the other Unix backends are
+/// cross-compiled there pending native runners.
 ///
 /// The builder owns the complete portable command intent instead of exposing unrestricted mutable
 /// access to the underlying Tokio command. This lets platform backends preserve arguments,
@@ -354,8 +355,12 @@ impl PtyCommand {
 	///
 	/// When Windows PTY spawning is supported, its backend accepts only the exact built-in
 	/// `CreationFlags`, `JobObject`, and `KillOnDrop` wrapper types whose crate features are enabled.
-	/// Any other command wrapper causes spawning to return [`io::ErrorKind::InvalidInput`] before
-	/// spawn-time hooks (`pre_spawn`, `post_spawn`, and `wrap_child`) run.
+	/// `CreationFlags` and `JobObject` compose in either registration order; job assignment uses
+	/// temporary suspension while preserving an explicitly requested `CREATE_SUSPENDED`.
+	/// `KillOnDrop` applies to the direct process alone or configures kill-on-job-close when combined
+	/// with `JobObject`. Any other command wrapper causes spawning to return
+	/// [`io::ErrorKind::InvalidInput`] before spawn-time hooks (`pre_spawn`, `post_spawn`, and
+	/// `wrap_child`) run.
 	pub fn wrap<W: CommandWrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
 		#[cfg(windows)]
 		{
@@ -374,8 +379,14 @@ impl PtyCommand {
 	/// Spawn the command attached to a pseudo-terminal.
 	///
 	/// A bare Unix PTY creates the session, controlling terminal, and foreground process group needed
-	/// by the child. Standard output and standard error share the terminal and are returned as one
-	/// ordered byte stream through [`PtyOutput`].
+	/// by the child. Windows uses separate input and output pipes with ConPTY; child standard output
+	/// and standard error are merged on every supported backend and returned as one ordered byte stream
+	/// through [`PtyOutput`]. Direct Windows `.bat` and `.cmd` execution is rejected rather than
+	/// selecting a command interpreter implicitly.
+	///
+	/// The Windows backend dynamically resolves `CreatePseudoConsole`, `ResizePseudoConsole`,
+	/// `ReleasePseudoConsole`, and `ClosePseudoConsole`. Missing any capability returns
+	/// [`io::ErrorKind::Unsupported`] without preventing the crate itself from loading.
 	///
 	/// This API never falls back to ordinary pipes. On a target without a backend it returns
 	/// [`io::ErrorKind::Unsupported`], even when the supplied options would be invalid on a supported
@@ -395,10 +406,12 @@ impl PtyCommand {
 
 /// The asynchronous input side of a pseudo-terminal.
 ///
-/// Input and output are strong owners of the same bidirectional PTY master. Shutting down or
-/// dropping only this input object releases its owner but cannot close the master or produce child
-/// EOF while [`PtyOutput`] still exists. There is no independent transport half-close; send the
-/// terminal's VEOF control character when that is the desired terminal policy.
+/// Input and output are strong owners of the same terminal lifetime. On Unix they share one
+/// bidirectional PTY master file description; on Windows they use independent host pipes while
+/// sharing the pseudoconsole owner. Shutting down or dropping only this input object releases its
+/// owner but cannot by itself hang up the terminal while [`PtyOutput`] still exists. There is no
+/// portable independent transport half-close; send the terminal's VEOF control character when that
+/// is the desired portable terminal policy.
 #[derive(Debug)]
 pub struct PtyInput {
 	inner: imp::Input,
@@ -424,10 +437,12 @@ impl AsyncWrite for PtyInput {
 
 /// The asynchronous merged output side of a pseudo-terminal.
 ///
-/// This is a strong owner of the shared bidirectional PTY master. On most supported Unix systems,
-/// output EOF means that every slave descriptor has closed and a descendant may retain the slave
-/// after the direct child exits. On macOS, drain output concurrently with waiting: session-leader
-/// exit drains queued output and then revokes the controlling terminal from its descendants.
+/// This is a strong owner of the shared terminal. On most supported Unix systems, output EOF means
+/// that every slave descriptor has closed and a descendant may retain the slave after the direct
+/// child exits. On macOS, drain output concurrently with waiting: session-leader exit drains queued
+/// output and then revokes the controlling terminal from its descendants. On Windows, the
+/// pseudoconsole is released after process attachment and its output pipe closes once every attached
+/// client disconnects.
 #[derive(Debug)]
 pub struct PtyOutput {
 	inner: imp::Output,
@@ -445,7 +460,7 @@ impl AsyncRead for PtyOutput {
 
 /// A cloneable weak handle for resizing a pseudo-terminal.
 ///
-/// Resize handles do not keep the PTY master alive.
+/// Resize handles do not keep the terminal alive.
 #[derive(Clone, Debug)]
 pub struct PtyResize {
 	inner: imp::Resize,
@@ -463,16 +478,18 @@ impl PtyResize {
 
 /// The I/O and resize controls for a spawned pseudo-terminal.
 ///
-/// [`PtyInput`] and [`PtyOutput`] each strongly own one shared bidirectional master. The terminal
-/// hangs up only after both owners are gone; dropping either one alone is not a half-close. A
+/// [`PtyInput`] and [`PtyOutput`] each strongly own one shared terminal lifetime. On Unix this is a
+/// bidirectional master file description; on Windows it combines independent host pipes with the
+/// pseudoconsole. Parent-side ownership is fully released only after both owners are gone; dropping
+/// either one alone does not itself hang up the terminal and is not a portable half-close. A
 /// [`PtyResize`] is weak and never keeps the terminal alive. There is deliberately no clonable
-/// force-close handle, parent-terminal raw mode, byte relay, key handling, VT parsing, scrollback,
-/// or pager policy in this transport.
+/// force-close handle, parent-terminal raw mode, byte relay, key handling, VT parsing, scrollback, or
+/// pager policy in this transport.
 ///
 /// Process supervision and PTY draining are separate lifecycles. Waiting for the direct child does
-/// not imply output EOF on most supported Unix systems, because descendants can retain slave
-/// descriptors. On macOS, drive waiting and draining concurrently because session-leader exit waits
-/// for queued output before revoking the controlling terminal.
+/// not imply output EOF on most supported Unix systems or Windows, because descendants can retain
+/// their terminal connection. On macOS, drive waiting and draining concurrently because
+/// session-leader exit waits for queued output before revoking the controlling terminal.
 #[derive(Debug)]
 pub struct PtyController {
 	input: PtyInput,

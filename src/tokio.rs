@@ -27,7 +27,9 @@ pub use process_group::{ProcessGroup, ProcessGroupChild};
 pub use process_session::ProcessSession;
 #[cfg(feature = "pty")]
 #[doc(inline)]
-/// Pseudo-terminal support, available with the non-default `pty` crate feature.
+/// Native pseudo-terminal support on Linux and macOS and ConPTY support on Windows 11 24H2
+/// (build 26100), Windows Server 2025, and newer releases, available with the non-default `pty`
+/// crate feature.
 pub use pty::{PtyCommand, PtyController, PtyInput, PtyOptions, PtyOutput, PtyResize, PtySize};
 #[cfg(all(unix, feature = "reset-sigmask"))]
 #[doc(inline)]
