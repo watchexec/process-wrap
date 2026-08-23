@@ -107,3 +107,168 @@ fn append_backslashes(command_line: &mut Vec<u16>, count: usize) {
 		command_line.push(BACKSLASH);
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		ffi::OsString,
+		os::windows::ffi::{OsStrExt, OsStringExt},
+	};
+
+	use super::super::super::EnvironmentIntent;
+	use super::*;
+
+	fn os(units: &[u16]) -> OsString {
+		OsString::from_wide(units)
+	}
+
+	fn regular(value: &str) -> ArgIntent {
+		ArgIntent::Regular(OsString::from(value))
+	}
+
+	fn raw(value: &str) -> ArgIntent {
+		ArgIntent::Raw(OsString::from(value))
+	}
+
+	fn intent(program: OsString, args: Vec<ArgIntent>) -> CommandIntent {
+		CommandIntent {
+			program,
+			args,
+			environment: EnvironmentIntent {
+				clear: false,
+				changes: Vec::new(),
+			},
+			current_dir: None,
+		}
+	}
+
+	fn terminated(value: &str) -> Vec<u16> {
+		OsStr::new(value).encode_wide().chain([0]).collect()
+	}
+
+	#[test]
+	fn quotes_regular_arguments_with_windows_crt_rules() {
+		let cases = [
+			("none", Vec::new(), "\"tool\""),
+			("empty", vec![regular("")], "\"tool\" \"\""),
+			("simple", vec![regular("plain")], "\"tool\" plain"),
+			(
+				"space",
+				vec![regular("two words")],
+				"\"tool\" \"two words\"",
+			),
+			(
+				"tab",
+				vec![regular("two\twords")],
+				"\"tool\" \"two\twords\"",
+			),
+			("quote", vec![regular("a\"b")], "\"tool\" a\\\"b"),
+			(
+				"backslash quote",
+				vec![regular("a\\\"b")],
+				"\"tool\" a\\\\\\\"b",
+			),
+			("unquoted slash", vec![regular("a\\")], "\"tool\" a\\"),
+			(
+				"quoted trailing slash",
+				vec![regular("a b\\")],
+				"\"tool\" \"a b\\\\\"",
+			),
+		];
+
+		for (name, args, expected) in cases {
+			let prepared = prepare_command_line(&intent(OsString::from("tool"), args)).unwrap();
+			assert_eq!(
+				prepared.command_line.as_units(),
+				terminated(expected),
+				"{name}"
+			);
+			assert_eq!(
+				prepared.application_name.as_units(),
+				terminated("tool"),
+				"{name}"
+			);
+		}
+	}
+
+	#[test]
+	fn preserves_interleaved_raw_fragments_exactly() {
+		let prepared = prepare_command_line(&intent(
+			OsString::from("tool"),
+			vec![
+				regular("two words"),
+				raw(r#"/D "literal""#),
+				regular("plain"),
+				raw(""),
+			],
+		))
+		.unwrap();
+		assert_eq!(
+			prepared.command_line.as_units(),
+			terminated(r#""tool" "two words" /D "literal" plain "#)
+		);
+	}
+
+	#[test]
+	fn preserves_lone_surrogates_in_program_and_arguments() {
+		let program = [b't' as u16, 0xd800, b'o' as u16];
+		let prepared = prepare_command_line(&intent(
+			os(&program),
+			vec![
+				ArgIntent::Regular(os(&[0xdc00])),
+				ArgIntent::Raw(os(&[0xd801])),
+			],
+		))
+		.unwrap();
+
+		assert_eq!(
+			prepared.application_name.as_units(),
+			[program.as_slice(), &[0]].concat()
+		);
+		assert_eq!(
+			prepared.command_line.as_units(),
+			[
+				DOUBLE_QUOTE,
+				program[0],
+				program[1],
+				program[2],
+				DOUBLE_QUOTE,
+				SPACE,
+				0xdc00,
+				SPACE,
+				0xd801,
+				0,
+			]
+		);
+	}
+
+	#[test]
+	fn rejects_embedded_nuls_with_stable_errors() {
+		let cases = [
+			(
+				intent(os(&[b't' as u16, 0]), Vec::new()),
+				"PTY program contains an embedded NUL",
+			),
+			(
+				intent(
+					OsString::from("tool"),
+					vec![ArgIntent::Regular(os(&[b'a' as u16, 0]))],
+				),
+				"PTY argument contains an embedded NUL",
+			),
+			(
+				intent(
+					OsString::from("tool"),
+					vec![ArgIntent::Raw(os(&[b'a' as u16, 0]))],
+				),
+				"PTY raw argument contains an embedded NUL",
+			),
+		];
+
+		for (intent, message) in cases {
+			let error = prepare_command_line(&intent).unwrap_err();
+			assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+			assert_eq!(error.to_string(), message);
+		}
+	}
+}
