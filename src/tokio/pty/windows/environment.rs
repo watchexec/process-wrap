@@ -186,3 +186,214 @@ fn parse_environment_entry(entry: &[u16]) -> io::Result<EnvironmentVariable> {
 		value: entry[separator + 1..].to_vec(),
 	})
 }
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		ffi::{OsStr, OsString},
+		os::windows::ffi::{OsStrExt, OsStringExt},
+	};
+
+	use windows::core::PWSTR;
+
+	use super::*;
+
+	fn units(value: &str) -> Vec<u16> {
+		OsStr::new(value).encode_wide().collect()
+	}
+
+	fn os(units: &[u16]) -> OsString {
+		OsString::from_wide(units)
+	}
+
+	fn variable(key: &str, value: &str) -> EnvironmentVariable {
+		EnvironmentVariable {
+			key: units(key),
+			value: units(value),
+		}
+	}
+
+	fn set(key: &str, value: &str) -> EnvChange {
+		EnvChange::Set(OsString::from(key), OsString::from(value))
+	}
+
+	fn remove(key: &str) -> EnvChange {
+		EnvChange::Remove(OsString::from(key))
+	}
+
+	fn intent(clear: bool, changes: Vec<EnvChange>) -> EnvironmentIntent {
+		EnvironmentIntent { clear, changes }
+	}
+
+	fn block(entries: &[(&str, &str)]) -> PreparedEnvironment {
+		let mut block = Vec::new();
+		for (key, value) in entries {
+			block.extend(units(key));
+			block.push(b'=' as u16);
+			block.extend(units(value));
+			block.push(0);
+		}
+		block.push(0);
+		if block.len() == 1 {
+			block.push(0);
+		}
+		PreparedEnvironment::Block(block)
+	}
+
+	#[test]
+	fn inherits_without_capturing_an_unchanged_environment() {
+		let prepared = prepare_environment_with(&intent(false, Vec::new()), || {
+			panic!("unchanged environment must not be captured")
+		})
+		.unwrap();
+		assert!(prepared.is_inherited());
+		assert!(prepared.as_ptr().is_null());
+	}
+
+	#[test]
+	fn clearing_to_an_empty_environment_does_not_capture_the_parent() {
+		let prepared = prepare_environment_with(&intent(true, Vec::new()), || {
+			panic!("cleared environment must not be captured")
+		})
+		.unwrap();
+		assert_eq!(prepared, PreparedEnvironment::Block(vec![0, 0]));
+	}
+
+	#[test]
+	fn applies_case_insensitive_changes_and_sorts_deterministically() {
+		let parent = vec![
+			variable("Path", "parent"),
+			variable("KEEP", "one"),
+			variable("remove", "gone"),
+			variable("=C:", r"C:\work"),
+		];
+		let changes = vec![
+			set("PATH", "first"),
+			set("path", "second"),
+			remove("ReMoVe"),
+			set("Alpha", "a"),
+			remove("missing"),
+		];
+
+		let first = prepare_environment_with(&intent(false, changes), || Ok(parent)).unwrap();
+		assert_eq!(
+			first,
+			block(&[
+				("=C:", r"C:\work"),
+				("Alpha", "a"),
+				("KEEP", "one"),
+				("path", "second"),
+			])
+		);
+
+		let second = prepare_environment_with(
+			&intent(
+				false,
+				vec![
+					set("PATH", "first"),
+					set("path", "second"),
+					remove("ReMoVe"),
+					set("Alpha", "a"),
+					remove("missing"),
+				],
+			),
+			|| {
+				Ok(vec![
+					variable("Path", "parent"),
+					variable("KEEP", "one"),
+					variable("remove", "gone"),
+					variable("=C:", r"C:\work"),
+				])
+			},
+		)
+		.unwrap();
+		assert_eq!(first, second);
+	}
+
+	#[test]
+	fn clear_discards_the_parent_before_applying_changes() {
+		let prepared = prepare_environment_with(&intent(true, vec![set("Only", "value")]), || {
+			panic!("cleared environment must not be captured")
+		})
+		.unwrap();
+		assert_eq!(prepared, block(&[("Only", "value")]));
+	}
+
+	#[test]
+	fn normalizes_case_collisions_in_the_inherited_environment() {
+		let prepared = prepare_environment_with(&intent(false, vec![remove("absent")]), || {
+			Ok(vec![variable("Name", "first"), variable("NAME", "second")])
+		})
+		.unwrap();
+		assert_eq!(prepared, block(&[("NAME", "second")]));
+	}
+
+	#[test]
+	fn preserves_lone_surrogates() {
+		let key = os(&[b'K' as u16, 0xd800]);
+		let value = os(&[b'V' as u16, 0xdc00]);
+		let prepared =
+			prepare_environment_with(&intent(false, vec![EnvChange::Set(key, value)]), || {
+				Ok(Vec::new())
+			})
+			.unwrap();
+		assert_eq!(
+			prepared,
+			PreparedEnvironment::Block(vec![
+				b'K' as u16,
+				0xd800,
+				b'=' as u16,
+				b'V' as u16,
+				0xdc00,
+				0,
+				0,
+			])
+		);
+	}
+
+	#[test]
+	fn parses_drive_current_directory_variables() {
+		let mut raw = units(r"=C:=C:\work");
+		raw.push(0);
+		raw.extend(units("Name=value"));
+		raw.extend([0, 0]);
+		let parsed = parse_environment_block(PWSTR(raw.as_mut_ptr())).unwrap();
+		assert_eq!(
+			parsed,
+			vec![variable("=C:", r"C:\work"), variable("Name", "value")]
+		);
+	}
+
+	#[test]
+	fn rejects_environment_nuls_before_capturing_the_parent() {
+		let cases = [
+			(
+				intent(
+					false,
+					vec![EnvChange::Set(os(&[b'K' as u16, 0]), OsString::from("v"))],
+				),
+				"PTY environment key contains an embedded NUL",
+			),
+			(
+				intent(
+					false,
+					vec![EnvChange::Set(OsString::from("K"), os(&[b'V' as u16, 0]))],
+				),
+				"PTY environment value contains an embedded NUL",
+			),
+			(
+				intent(false, vec![EnvChange::Remove(os(&[b'K' as u16, 0]))]),
+				"PTY environment key contains an embedded NUL",
+			),
+		];
+
+		for (intent, message) in cases {
+			let error = prepare_environment_with(&intent, || {
+				panic!("invalid explicit environment must be rejected before capture")
+			})
+			.unwrap_err();
+			assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+			assert_eq!(error.to_string(), message);
+		}
+	}
+}
