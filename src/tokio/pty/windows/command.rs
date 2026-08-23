@@ -34,6 +34,7 @@ impl WideCString {
 		self.0.as_mut_ptr()
 	}
 
+	#[cfg(test)]
 	pub(super) fn as_units(&self) -> &[u16] {
 		&self.0
 	}

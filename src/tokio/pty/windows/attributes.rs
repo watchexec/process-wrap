@@ -14,7 +14,7 @@ use windows::Win32::System::{
 #[derive(Debug)]
 pub(super) struct AttributeList {
 	list: LPPROC_THREAD_ATTRIBUTE_LIST,
-	storage: Box<[usize]>,
+	_storage: Box<[usize]>,
 }
 
 impl AttributeList {
@@ -54,7 +54,10 @@ impl AttributeList {
 			return Err(io::Error::other(error));
 		}
 
-		Ok(Self { list, storage })
+		Ok(Self {
+			list,
+			_storage: storage,
+		})
 	}
 
 	pub(super) fn as_ptr(&self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
@@ -80,12 +83,12 @@ mod tests {
 		let attributes = AttributeList::new(HPCON(42)).unwrap();
 		assert!(!attributes.as_ptr().is_invalid());
 		assert_eq!(
-			attributes.storage.as_ptr() as usize % align_of::<usize>(),
+			attributes._storage.as_ptr() as usize % align_of::<usize>(),
 			0
 		);
 		assert_eq!(
 			attributes.as_ptr().0,
-			attributes.storage.as_ptr().cast_mut().cast()
+			attributes._storage.as_ptr().cast_mut().cast()
 		);
 	}
 }

@@ -15,13 +15,14 @@ use tokio::{
 	process::{ChildStderr, ChildStdin, ChildStdout},
 	task::spawn_blocking,
 };
+#[cfg(feature = "job-object")]
+use windows::Win32::System::Threading::ResumeThread;
 use windows::Win32::{
 	Foundation::{
 		DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 	},
 	System::Threading::{
-		GetCurrentProcess, GetExitCodeProcess, INFINITE, ResumeThread, TerminateProcess,
-		WaitForSingleObject,
+		GetCurrentProcess, GetExitCodeProcess, INFINITE, TerminateProcess, WaitForSingleObject,
 	},
 };
 
@@ -30,6 +31,7 @@ use crate::{ChildExitStatus, tokio::ChildWrapper};
 #[derive(Debug)]
 pub(super) struct ConPtyChild {
 	process: OwnedHandle,
+	#[cfg_attr(not(feature = "job-object"), allow(dead_code))]
 	primary_thread: Option<OwnedHandle>,
 	pid: u32,
 	kill_on_drop: bool,
@@ -58,10 +60,12 @@ impl ConPtyChild {
 		}
 	}
 
+	#[cfg(test)]
 	pub(super) fn primary_thread_handle(&self) -> Option<BorrowedHandle<'_>> {
 		self.primary_thread.as_ref().map(OwnedHandle::as_handle)
 	}
 
+	#[cfg(feature = "job-object")]
 	pub(super) fn resume_primary_thread(&mut self) -> io::Result<()> {
 		let thread = self
 			.primary_thread

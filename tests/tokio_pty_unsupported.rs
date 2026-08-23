@@ -1,6 +1,7 @@
 #![cfg(all(
 	feature = "pty",
 	not(any(
+		windows,
 		target_os = "android",
 		target_os = "dragonfly",
 		target_os = "freebsd",

@@ -28,6 +28,8 @@ use super::{
 pub(super) fn spawn(
 	mut command: PreparedWindowsCommand,
 	attributes: &AttributeList,
+	input_server: OwnedHandle,
+	output_server: OwnedHandle,
 ) -> io::Result<SpawnedChild> {
 	let mut startup = STARTUPINFOEXW::default();
 	startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -50,7 +52,7 @@ pub(super) fn spawn(
 	// SAFETY: every pointer references live, NUL-terminated or explicitly bounded storage for the
 	// duration of the call. The command line is uniquely mutable, the startup attribute list owns its
 	// aligned backing storage, no handles are inherited, and information is writable output storage.
-	unsafe {
+	let created = unsafe {
 		CreateProcessW(
 			PCWSTR(command.application_name.as_ptr()),
 			Some(PWSTR(command.command_line.as_mut_ptr())),
@@ -63,8 +65,12 @@ pub(super) fn spawn(
 			&startup.StartupInfo,
 			&mut information,
 		)
-	}
-	.map_err(win32_io_error)?;
+	};
+	// ConPTY retains these synchronous endpoints internally. Dropping the parent copies before any
+	// validation or handle duplication lets both host-facing channels observe closure on every path.
+	drop(input_server);
+	drop(output_server);
+	created.map_err(win32_io_error)?;
 
 	let handles = SpawnedProcess::new(information)?;
 	let cleanup = handles.cleanup()?;

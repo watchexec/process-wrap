@@ -25,6 +25,7 @@ use super::{ChildWrapper, CommandWrap, CommandWrapper};
 ))]
 mod unix;
 #[cfg(not(any(
+	windows,
 	target_os = "android",
 	target_os = "dragonfly",
 	target_os = "freebsd",
@@ -37,7 +38,6 @@ mod unix;
 )))]
 mod unsupported;
 #[cfg(windows)]
-#[allow(dead_code)]
 mod windows;
 #[cfg(any(
 	target_os = "android",
@@ -52,6 +52,7 @@ mod windows;
 ))]
 use unix as imp;
 #[cfg(not(any(
+	windows,
 	target_os = "android",
 	target_os = "dragonfly",
 	target_os = "freebsd",
@@ -63,6 +64,8 @@ use unix as imp;
 	target_os = "solaris"
 )))]
 use unsupported as imp;
+#[cfg(windows)]
+use windows as imp;
 
 /// The character and pixel dimensions of a pseudo-terminal.
 ///

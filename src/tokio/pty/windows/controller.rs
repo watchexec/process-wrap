@@ -29,7 +29,7 @@ struct Master {
 }
 
 #[derive(Debug)]
-pub(super) struct Input {
+pub(in crate::tokio::pty) struct Input {
 	pipe: Option<NamedPipeClient>,
 	master: Option<SharedMaster>,
 }
@@ -86,7 +86,7 @@ impl AsyncWrite for Input {
 }
 
 #[derive(Debug)]
-pub(super) struct Output {
+pub(in crate::tokio::pty) struct Output {
 	pipe: NamedPipeClient,
 	_master: SharedMaster,
 }
@@ -102,12 +102,12 @@ impl AsyncRead for Output {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Resize {
+pub(in crate::tokio::pty) struct Resize {
 	master: Weak<Master>,
 }
 
 impl Resize {
-	pub(super) fn resize(&self, size: PtySize) -> io::Result<()> {
+	pub(in crate::tokio::pty) fn resize(&self, size: PtySize) -> io::Result<()> {
 		let master = self.master.upgrade().ok_or_else(closed)?;
 		master.console.resize(size)
 	}
