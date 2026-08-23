@@ -4,6 +4,7 @@ use std::{
 	env,
 	io::{self, Read, Write},
 	path::{Path, PathBuf},
+	process::ExitStatus,
 	time::Duration,
 };
 
@@ -13,7 +14,9 @@ use process_wrap::tokio::CreationFlags;
 use process_wrap::tokio::JobObject;
 #[cfg(feature = "kill-on-drop")]
 use process_wrap::tokio::KillOnDrop;
-use process_wrap::tokio::{CommandWrap, CommandWrapper, PtyCommand, PtyOptions, PtySize};
+use process_wrap::tokio::{
+	ChildWrapper, CommandWrap, CommandWrapper, PtyCommand, PtyOptions, PtyOutput, PtySize,
+};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	time::timeout,
@@ -59,10 +62,7 @@ impl Drop for ReleaseOnDrop {
 	}
 }
 
-async fn read_through(
-	output: &mut process_wrap::tokio::PtyOutput,
-	needle: &[u8],
-) -> io::Result<Vec<u8>> {
+async fn read_through(output: &mut PtyOutput, needle: &[u8]) -> io::Result<Vec<u8>> {
 	timeout(TIMEOUT, async {
 		let mut bytes = Vec::new();
 		let mut buffer = [0; 1024];
@@ -80,6 +80,19 @@ async fn read_through(
 	})
 	.await
 	.map_err(io::Error::other)?
+}
+
+async fn wait_and_drain(
+	child: &mut dyn ChildWrapper,
+	output: &mut PtyOutput,
+	bytes: &mut Vec<u8>,
+) -> io::Result<ExitStatus> {
+	let (status, _) = timeout(TIMEOUT, async {
+		tokio::try_join!(child.wait(), output.read_to_end(bytes))
+	})
+	.await
+	.map_err(io::Error::other)??;
+	Ok(status)
 }
 
 fn terminal_handles() -> io::Result<(HANDLE, HANDLE, HANDLE)> {
@@ -206,8 +219,11 @@ async fn attaches_standard_handles_before_releasing_console_ownership() -> io::R
 	drop(input);
 
 	let mut bytes = read_through(&mut output, b"PW-TERMINALS:111").await?;
-	assert!(timeout(TIMEOUT, child.wait()).await??.success());
-	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	assert!(
+		wait_and_drain(child.as_mut(), &mut output, &mut bytes)
+			.await?
+			.success()
+	);
 	Ok(())
 }
 
@@ -230,9 +246,12 @@ async fn exposes_terminal_handles_and_preserves_environment_cwd_and_merged_outpu
 	let (mut child, controller) = command.spawn(PtyOptions::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
-	assert!(timeout(TIMEOUT, child.wait()).await??.success());
 	let mut bytes = Vec::new();
-	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	assert!(
+		wait_and_drain(child.as_mut(), &mut output, &mut bytes)
+			.await?
+			.success()
+	);
 	let marker = format!(
 		"PW-TERMINALS:111:child-value:REMOVED=1:CWD={}",
 		directory.path().display()
@@ -264,8 +283,11 @@ async fn passes_bidirectional_terminal_bytes() -> io::Result<()> {
 	let controls = [b'A', 0x1b, b'B', b'C'];
 	input.write_all(&controls).await?;
 	input.shutdown().await?;
-	assert!(timeout(TIMEOUT, child.wait()).await??.success());
-	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	assert!(
+		wait_and_drain(child.as_mut(), &mut output, &mut bytes)
+			.await?
+			.success()
+	);
 	let mut expected = b"PW-BYTES:".to_vec();
 	expected.extend(controls);
 	assert!(
@@ -392,9 +414,12 @@ async fn failed_spawn_leaves_the_tracked_command_reusable() -> io::Result<()> {
 	let (mut child, controller) = command.spawn(PtyOptions::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
-	assert!(timeout(TIMEOUT, child.wait()).await??.success());
 	let mut bytes = Vec::new();
-	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	assert!(
+		wait_and_drain(child.as_mut(), &mut output, &mut bytes)
+			.await?
+			.success()
+	);
 	assert!(
 		bytes
 			.windows(16)
@@ -414,9 +439,12 @@ async fn accepts_ordered_raw_argument_fragments() -> io::Result<()> {
 	let (mut child, controller) = command.spawn(PtyOptions::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
-	assert!(timeout(TIMEOUT, child.wait()).await??.success());
 	let mut bytes = Vec::new();
-	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	assert!(
+		wait_and_drain(child.as_mut(), &mut output, &mut bytes)
+			.await?
+			.success()
+	);
 	assert!(
 		bytes
 			.windows(16)
@@ -435,9 +463,12 @@ async fn creation_flags_compose_without_a_job_object() -> io::Result<()> {
 	let (mut child, controller) = command.spawn(PtyOptions::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
-	assert!(timeout(TIMEOUT, child.wait()).await??.success());
 	let mut bytes = Vec::new();
-	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	assert!(
+		wait_and_drain(child.as_mut(), &mut output, &mut bytes)
+			.await?
+			.success()
+	);
 	assert!(
 		bytes
 			.windows(16)
@@ -454,9 +485,12 @@ async fn job_object_resumes_its_temporarily_suspended_primary_thread() -> io::Re
 	let (mut child, controller) = command.spawn(PtyOptions::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
-	assert!(timeout(TIMEOUT, child.wait()).await??.success());
 	let mut bytes = Vec::new();
-	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	assert!(
+		wait_and_drain(child.as_mut(), &mut output, &mut bytes)
+			.await?
+			.success()
+	);
 	assert!(
 		bytes
 			.windows(16)
@@ -484,9 +518,12 @@ async fn job_object_composes_with_creation_flags_in_both_orders() -> io::Result<
 		let (mut child, controller) = command.spawn(PtyOptions::default())?;
 		let (input, mut output, _resize) = controller.into_parts();
 		drop(input);
-		assert!(timeout(TIMEOUT, child.wait()).await??.success());
 		let mut bytes = Vec::new();
-		timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+		assert!(
+			wait_and_drain(child.as_mut(), &mut output, &mut bytes)
+				.await?
+				.success()
+		);
 		assert!(
 			bytes
 				.windows(16)
