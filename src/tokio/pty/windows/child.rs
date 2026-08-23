@@ -13,7 +13,7 @@ use std::{
 
 use tokio::{
 	process::{ChildStderr, ChildStdin, ChildStdout},
-	task::spawn_blocking,
+	task::{JoinHandle, spawn_blocking},
 };
 #[cfg(feature = "job-object")]
 use windows::Win32::System::Threading::ResumeThread;
@@ -36,6 +36,7 @@ pub(super) struct ConPtyChild {
 	pid: u32,
 	kill_on_drop: bool,
 	exit_status: ChildExitStatus,
+	wait_task: Option<JoinHandle<io::Result<ExitStatus>>>,
 	stdin: Option<ChildStdin>,
 	stdout: Option<ChildStdout>,
 	stderr: Option<ChildStderr>,
@@ -54,6 +55,7 @@ impl ConPtyChild {
 			pid,
 			kill_on_drop,
 			exit_status: ChildExitStatus::Running,
+			wait_task: None,
 			stdin: None,
 			stdout: None,
 			stderr: None,
@@ -139,6 +141,7 @@ impl ChildWrapper for ConPtyChild {
 		let status = process_status(self.raw_process_handle(), 0)?;
 		if let Some(status) = status {
 			self.exit_status = ChildExitStatus::Exited(status);
+			self.wait_task.take();
 		}
 		Ok(status)
 	}
@@ -149,14 +152,21 @@ impl ChildWrapper for ConPtyChild {
 				return Ok(status);
 			}
 
-			let process = duplicate_handle(&self.process)?;
-			let status = spawn_blocking(move || {
-				process_status(HANDLE(process.as_raw_handle()), INFINITE)?.ok_or_else(|| {
-					io::Error::other("infinite process wait returned without an exit status")
-				})
-			})
-			.await
-			.map_err(io::Error::other)??;
+			if self.wait_task.is_none() {
+				let process = duplicate_handle(&self.process)?;
+				self.wait_task = Some(spawn_blocking(move || {
+					process_status(HANDLE(process.as_raw_handle()), INFINITE)?.ok_or_else(|| {
+						io::Error::other("infinite process wait returned without an exit status")
+					})
+				}));
+			}
+			let result = self
+				.wait_task
+				.as_mut()
+				.expect("an in-progress ConPTY wait must retain its task")
+				.await;
+			self.wait_task.take();
+			let status = result.map_err(io::Error::other)??;
 			self.exit_status = ChildExitStatus::Exited(status);
 			Ok(status)
 		})
@@ -251,6 +261,7 @@ mod tests {
 			pid: child.id(),
 			kill_on_drop,
 			exit_status: ChildExitStatus::Running,
+			wait_task: None,
 			stdin: None,
 			stdout: None,
 			stderr: None,
@@ -316,7 +327,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn canceled_async_wait_does_not_invalidate_the_process_handle() {
+	async fn canceled_async_waits_share_one_task_and_preserve_the_process_handle() {
 		let mut native = spawn_long_running();
 		let mut child = wrap(&native, false);
 		assert!(
@@ -324,6 +335,26 @@ mod tests {
 				.await
 				.is_err()
 		);
+		let wait_id = child
+			.wait_task
+			.as_ref()
+			.expect("a canceled wait must retain its task")
+			.id();
+		for _ in 0..7 {
+			assert!(
+				tokio::time::timeout(Duration::from_millis(20), child.wait())
+					.await
+					.is_err()
+			);
+			assert_eq!(
+				child
+					.wait_task
+					.as_ref()
+					.expect("a canceled wait must retain its task")
+					.id(),
+				wait_id
+			);
+		}
 		child.start_kill().unwrap();
 		let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
 			.await
