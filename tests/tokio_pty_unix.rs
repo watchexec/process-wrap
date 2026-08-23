@@ -1,8 +1,28 @@
 #![cfg(all(any(target_os = "linux", target_os = "macos"), feature = "pty"))]
 
+#[cfg(feature = "process-group")]
+use std::any::TypeId;
+#[cfg(feature = "reset-sigmask")]
+use std::os::unix::process::ExitStatusExt;
 use std::{io, time::Duration};
 
+#[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
+use nix::{
+	sys::signal::{Signal, kill},
+	unistd::Pid,
+};
+
+#[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
+use process_wrap::tokio::KillOnDrop;
+#[cfg(feature = "process-session")]
+use process_wrap::tokio::ProcessSession;
+#[cfg(feature = "reset-sigmask")]
+use process_wrap::tokio::ResetSigmask;
+#[cfg(feature = "process-group")]
+use process_wrap::tokio::{ProcessGroup, ProcessGroupChild};
 use process_wrap::tokio::{PtyCommand, PtyOptions, PtySize};
+#[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	time::{sleep, timeout},
@@ -256,6 +276,293 @@ async fn failed_spawn_leaves_command_reusable() -> io::Result<()> {
 	let mut bytes = Vec::new();
 	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
 	assert_eq!(bytes, b"reused");
+	Ok(())
+}
+
+#[tokio::test]
+async fn kill_and_start_kill_preserve_repeated_waits() -> io::Result<()> {
+	for wait_in_kill in [false, true] {
+		let mut command = PtyCommand::new("sh");
+		command.args(["-c", "stty -echo; printf ready; while :; do sleep 1; done"]);
+		let (mut child, controller) = command.spawn(PtyOptions::default())?;
+		let (input, mut output, _resize) = controller.into_parts();
+		let mut ready = [0; 5];
+		timeout(Duration::from_secs(5), output.read_exact(&mut ready)).await??;
+		assert_eq!(&ready, b"ready");
+		drop(input);
+
+		if wait_in_kill {
+			timeout(Duration::from_secs(5), Box::into_pin(child.kill())).await??;
+		} else {
+			child.start_kill()?;
+			timeout(Duration::from_secs(5), child.wait()).await??;
+		}
+		let status = child.try_wait()?.expect("killed child must have exited");
+		assert_eq!(child.try_wait()?, Some(status));
+		assert_eq!(child.wait().await?, status);
+		let mut bytes = Vec::new();
+		timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	}
+	Ok(())
+}
+
+#[cfg(feature = "process-group")]
+async fn assert_group_signal(mut command: PtyCommand) -> io::Result<()> {
+	command.args([
+		"-c",
+		"stty -echo; trap '' HUP; trap 'exit 0' TERM; sleep 30 & printf ready; wait",
+	]);
+	let (mut child, controller) = command.spawn(PtyOptions::default())?;
+	assert_eq!(child.as_ref().type_id(), TypeId::of::<ProcessGroupChild>());
+	assert!(child.try_wait()?.is_none());
+
+	let (input, mut output, _resize) = controller.into_parts();
+	let mut ready = [0; 5];
+	timeout(Duration::from_secs(5), output.read_exact(&mut ready)).await??;
+	assert_eq!(&ready, b"ready");
+	drop(input);
+
+	child.signal(nix::libc::SIGTERM)?;
+	let status = timeout(Duration::from_secs(5), child.wait()).await??;
+	assert_eq!(child.try_wait()?, Some(status));
+	assert_eq!(child.try_wait()?, Some(status));
+	assert_eq!(child.wait().await?, status);
+	let mut bytes = Vec::new();
+	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	Ok(())
+}
+
+#[cfg(feature = "process-group")]
+#[tokio::test]
+async fn process_group_leader_preserves_pty_group_supervision() -> io::Result<()> {
+	let mut command = PtyCommand::new("sh");
+	command.wrap(ProcessGroup::leader());
+	assert_group_signal(command).await
+}
+
+#[cfg(feature = "process-group")]
+#[tokio::test]
+async fn process_group_try_wait_keeps_native_child_synchronized() -> io::Result<()> {
+	let mut command = PtyCommand::new("sh");
+	command.args(["-c", "exit 17"]).wrap(ProcessGroup::leader());
+	let (mut child, controller) = command.spawn(PtyOptions::default())?;
+	let (input, mut output, _resize) = controller.into_parts();
+	drop(input);
+
+	let status = timeout(Duration::from_secs(5), async {
+		loop {
+			if let Some(status) = child.try_wait()? {
+				break Ok::<_, io::Error>(status);
+			}
+			sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await??;
+	let native =
+		unsafe { child.try_inner_child_mut() }.expect("PTY group child must contain Tokio Child");
+	assert_eq!(native.try_wait()?, Some(status));
+	assert_eq!(child.try_wait()?, Some(status));
+	assert_eq!(child.wait().await?, status);
+	let mut bytes = Vec::new();
+	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	Ok(())
+}
+
+#[cfg(feature = "process-group")]
+#[tokio::test]
+async fn process_group_composes_when_registered_after_first_spawn() -> io::Result<()> {
+	let mut command = PtyCommand::new("sh");
+	command.args(["-c", "printf reused"]);
+
+	let (mut child, controller) = command.spawn(PtyOptions::default())?;
+	let (input, mut output, _resize) = controller.into_parts();
+	drop(input);
+	assert!(
+		timeout(Duration::from_secs(5), child.wait())
+			.await??
+			.success()
+	);
+	let mut bytes = Vec::new();
+	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	assert_eq!(bytes, b"reused");
+
+	command.wrap(ProcessGroup::leader());
+	let (mut child, controller) = command.spawn(PtyOptions::default())?;
+	assert_eq!(child.as_ref().type_id(), TypeId::of::<ProcessGroupChild>());
+	let (input, mut output, _resize) = controller.into_parts();
+	drop(input);
+	assert!(
+		timeout(Duration::from_secs(5), child.wait())
+			.await??
+			.success()
+	);
+	bytes.clear();
+	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	assert_eq!(bytes, b"reused");
+	Ok(())
+}
+
+#[cfg(feature = "process-session")]
+#[tokio::test]
+async fn process_session_preserves_pty_group_supervision() -> io::Result<()> {
+	let mut command = PtyCommand::new("sh");
+	command.wrap(ProcessSession);
+	assert_group_signal(command).await
+}
+
+#[cfg(feature = "process-group")]
+#[tokio::test]
+async fn rejects_attaching_a_pty_to_an_existing_group() {
+	for group in [ProcessGroup::attach_to(0), ProcessGroup::attach_to(42)] {
+		let mut command = PtyCommand::new("sh");
+		command.args(["-c", "exit 0"]).wrap(group);
+		assert_eq!(
+			command.spawn(PtyOptions::default()).unwrap_err().kind(),
+			io::ErrorKind::InvalidInput
+		);
+	}
+}
+
+#[cfg(feature = "process-session")]
+#[tokio::test]
+async fn rejects_explicit_group_and_session_in_either_order() {
+	for session_first in [false, true] {
+		let mut command = PtyCommand::new("sh");
+		command.args(["-c", "exit 0"]);
+		if session_first {
+			command.wrap(ProcessSession).wrap(ProcessGroup::leader());
+		} else {
+			command.wrap(ProcessGroup::leader()).wrap(ProcessSession);
+		}
+		assert_eq!(
+			command.spawn(PtyOptions::default()).unwrap_err().kind(),
+			io::ErrorKind::InvalidInput
+		);
+	}
+}
+
+#[cfg(feature = "reset-sigmask")]
+#[tokio::test]
+async fn reset_sigmask_unblocks_signals_before_pty_setup() -> io::Result<()> {
+	use nix::sys::signal::{SigSet, SigmaskHow, Signal, sigprocmask};
+
+	let mut blocked = SigSet::empty();
+	blocked.add(Signal::SIGUSR1);
+	let mut previous = SigSet::empty();
+	sigprocmask(SigmaskHow::SIG_BLOCK, Some(&blocked), Some(&mut previous))?;
+
+	let mut command = PtyCommand::new("sh");
+	command
+		.args(["-c", "test -t 0 || exit 2; kill -USR1 $$; printf survived"])
+		.wrap(ResetSigmask);
+	let spawned = command.spawn(PtyOptions::default());
+	sigprocmask(SigmaskHow::SIG_SETMASK, Some(&previous), None)?;
+	let (mut child, controller) = spawned?;
+
+	let (input, mut output, _resize) = controller.into_parts();
+	drop(input);
+	let status = timeout(Duration::from_secs(5), child.wait()).await??;
+	assert_eq!(status.signal(), Some(Signal::SIGUSR1 as i32));
+	let mut bytes = Vec::new();
+	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	assert!(bytes.is_empty());
+	Ok(())
+}
+
+#[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
+fn pid_alive(pid: Pid) -> bool {
+	fn inner(pid: Pid) -> Result<bool, remoteprocess::Error> {
+		Ok(!remoteprocess::Process::new(pid.as_raw())?
+			.threads()?
+			.is_empty())
+	}
+
+	inner(pid).unwrap_or(false)
+}
+
+#[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
+struct KillPid(Option<Pid>);
+
+#[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
+impl KillPid {
+	fn new(pid: Pid) -> Self {
+		Self(Some(pid))
+	}
+
+	fn disarm(&mut self) {
+		self.0 = None;
+	}
+}
+
+#[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
+impl Drop for KillPid {
+	fn drop(&mut self) {
+		if let Some(pid) = self.0 {
+			let _ = kill(pid, Signal::SIGKILL);
+		}
+	}
+}
+
+#[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
+#[tokio::test]
+async fn kill_on_drop_remains_direct_child_only_with_a_pty_session() -> io::Result<()> {
+	let directory = tempfile::tempdir()?;
+	let ready = directory.path().join("descendant-ready");
+	let mut command = PtyCommand::new("sh");
+	command
+		.args([
+			"-c",
+			r#"stty -echo; trap '' HUP; (trap '' HUP; trap 'printf "descendant-alive\n"; exit 0' USR1; : > "$1"; while :; do sleep 1; done) & printf '%s:%s\n' "$$" "$!"; wait"#,
+			"pty-test",
+		])
+		.arg(&ready)
+		.wrap(ProcessSession)
+		.wrap(KillOnDrop);
+	let (child, controller) = command.spawn(PtyOptions::default())?;
+	let (input, output, _resize) = controller.into_parts();
+	let mut output = BufReader::new(output);
+	let mut line = String::new();
+	timeout(Duration::from_secs(5), output.read_line(&mut line)).await??;
+	let (direct, descendant) = line.trim().split_once(':').unwrap();
+	let direct = Pid::from_raw(direct.parse().unwrap());
+	let descendant = Pid::from_raw(descendant.parse().unwrap());
+	assert_eq!(child.id(), Some(direct.as_raw() as u32));
+	let mut direct_cleanup = KillPid::new(direct);
+	let mut descendant_cleanup = KillPid::new(descendant);
+	assert!(pid_alive(direct));
+	timeout(Duration::from_secs(5), async {
+		while !ready.exists() {
+			sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("descendant did not install its signal handler");
+
+	drop(input);
+	drop(child);
+	timeout(Duration::from_secs(5), async {
+		while pid_alive(direct) {
+			sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("kill-on-drop did not terminate the direct child");
+	direct_cleanup.disarm();
+
+	kill(descendant, Signal::SIGUSR1)?;
+	line.clear();
+	timeout(Duration::from_secs(5), output.read_line(&mut line)).await??;
+	assert_eq!(line.trim(), "descendant-alive");
+	let mut bytes = Vec::new();
+	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	timeout(Duration::from_secs(5), async {
+		while pid_alive(descendant) {
+			sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("acknowledged descendant did not exit");
+	descendant_cleanup.disarm();
 	Ok(())
 }
 
