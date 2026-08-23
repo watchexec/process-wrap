@@ -123,3 +123,164 @@ fn schedule_close(close: api::ClosePseudoConsole, handle: HPCON) {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+		time::{Duration, Instant},
+	};
+
+	use windows::core::HRESULT;
+
+	use super::*;
+
+	static TEST_LOCK: Mutex<()> = Mutex::new(());
+	static CREATE_SIZE: AtomicU32 = AtomicU32::new(0);
+	static CREATE_FLAGS: AtomicU32 = AtomicU32::new(u32::MAX);
+	static RESIZE_SIZE: AtomicU32 = AtomicU32::new(0);
+	static BLOCK_CLOSE: AtomicBool = AtomicBool::new(false);
+	static CLOSE_STARTED: AtomicBool = AtomicBool::new(false);
+	static CLOSE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+	unsafe extern "system" fn create(
+		size: COORD,
+		_input: HANDLE,
+		_output: HANDLE,
+		flags: u32,
+		pseudo_console: *mut HPCON,
+	) -> HRESULT {
+		CREATE_SIZE.store(pack(size), Ordering::SeqCst);
+		CREATE_FLAGS.store(flags, Ordering::SeqCst);
+		// SAFETY: the test caller passes writable storage for the output handle.
+		unsafe { *pseudo_console = HPCON(42) };
+		HRESULT(0)
+	}
+
+	unsafe extern "system" fn resize(_pseudo_console: HPCON, size: COORD) -> HRESULT {
+		RESIZE_SIZE.store(pack(size), Ordering::SeqCst);
+		HRESULT(0)
+	}
+
+	unsafe extern "system" fn close(_pseudo_console: HPCON) {
+		CLOSE_STARTED.store(true, Ordering::SeqCst);
+		for _ in 0..1_000 {
+			if !BLOCK_CLOSE.load(Ordering::SeqCst) {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(1));
+		}
+		CLOSE_COUNT.fetch_add(1, Ordering::SeqCst);
+	}
+
+	static TEST_API: ConPtyApi = ConPtyApi {
+		create,
+		resize,
+		close,
+	};
+
+	fn pack(size: COORD) -> u32 {
+		u32::from(size.X as u16) | (u32::from(size.Y as u16) << 16)
+	}
+
+	fn wait_for(predicate: impl Fn() -> bool) {
+		for _ in 0..1_000 {
+			if predicate() {
+				return;
+			}
+			std::thread::sleep(Duration::from_millis(1));
+		}
+		panic!("timed out waiting for mock ConPTY operation");
+	}
+
+	fn reset_close() {
+		BLOCK_CLOSE.store(false, Ordering::SeqCst);
+		CLOSE_STARTED.store(false, Ordering::SeqCst);
+		CLOSE_COUNT.store(0, Ordering::SeqCst);
+	}
+
+	#[test]
+	fn converts_character_dimensions_and_rejects_windows_overflow() {
+		assert_eq!(
+			coordinate(PtySize::new(24, 80).unwrap()).unwrap(),
+			COORD { X: 80, Y: 24 }
+		);
+		let columns = coordinate(PtySize {
+			rows: 1,
+			columns: 32_768,
+			pixel_width: 0,
+			pixel_height: 0,
+		})
+		.unwrap_err();
+		assert_eq!(columns.kind(), io::ErrorKind::InvalidInput);
+		assert_eq!(
+			columns.to_string(),
+			"PTY columns must not exceed 32767 on Windows"
+		);
+		let rows = coordinate(PtySize {
+			rows: 32_768,
+			columns: 1,
+			pixel_width: 0,
+			pixel_height: 0,
+		})
+		.unwrap_err();
+		assert_eq!(rows.kind(), io::ErrorKind::InvalidInput);
+		assert_eq!(
+			rows.to_string(),
+			"PTY rows must not exceed 32767 on Windows"
+		);
+	}
+
+	#[test]
+	fn creates_and_resizes_through_the_resolved_capabilities() {
+		let _serial = TEST_LOCK.lock().unwrap();
+		reset_close();
+		CREATE_SIZE.store(0, Ordering::SeqCst);
+		CREATE_FLAGS.store(u32::MAX, Ordering::SeqCst);
+		RESIZE_SIZE.store(0, Ordering::SeqCst);
+
+		let console = PseudoConsole::create_with(
+			&TEST_API,
+			PtySize::new(25, 81).unwrap(),
+			HANDLE(1usize as _),
+			HANDLE(2usize as _),
+		)
+		.unwrap();
+		assert_eq!(console.handle(), HPCON(42));
+		assert_eq!(
+			CREATE_SIZE.load(Ordering::SeqCst),
+			pack(COORD { X: 81, Y: 25 })
+		);
+		assert_eq!(CREATE_FLAGS.load(Ordering::SeqCst), 0);
+		console.resize(PtySize::new(40, 120).unwrap()).unwrap();
+		assert_eq!(
+			RESIZE_SIZE.load(Ordering::SeqCst),
+			pack(COORD { X: 120, Y: 40 })
+		);
+
+		drop(console);
+		wait_for(|| CLOSE_COUNT.load(Ordering::SeqCst) == 1);
+	}
+
+	#[test]
+	fn drop_schedules_exactly_one_close_away_from_the_caller() {
+		let _serial = TEST_LOCK.lock().unwrap();
+		reset_close();
+		BLOCK_CLOSE.store(true, Ordering::SeqCst);
+		let console = PseudoConsole {
+			handle: HPCON(42),
+			api: &TEST_API,
+		};
+
+		let started = Instant::now();
+		drop(console);
+		assert!(started.elapsed() < Duration::from_millis(250));
+		wait_for(|| CLOSE_STARTED.load(Ordering::SeqCst));
+		assert_eq!(CLOSE_COUNT.load(Ordering::SeqCst), 0);
+
+		BLOCK_CLOSE.store(false, Ordering::SeqCst);
+		wait_for(|| CLOSE_COUNT.load(Ordering::SeqCst) == 1);
+		std::thread::sleep(Duration::from_millis(10));
+		assert_eq!(CLOSE_COUNT.load(Ordering::SeqCst), 1);
+	}
+}
