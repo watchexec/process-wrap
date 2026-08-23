@@ -6,6 +6,12 @@ use std::{
 	time::Duration,
 };
 
+#[cfg(feature = "creation-flags")]
+use process_wrap::tokio::CreationFlags;
+#[cfg(feature = "job-object")]
+use process_wrap::tokio::JobObject;
+#[cfg(feature = "kill-on-drop")]
+use process_wrap::tokio::KillOnDrop;
 use process_wrap::tokio::{CommandWrap, CommandWrapper, PtyCommand, PtyOptions, PtySize};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
@@ -80,6 +86,9 @@ fn conpty_child_helper() -> io::Result<()> {
 
 	match mode.as_str() {
 		"terminal" => {
+			if let Some(path) = env::var_os("PW_TOUCH") {
+				std::fs::File::create(path)?;
+			}
 			print!(
 				"PW-TERMINALS:{}{}{}:{}:REMOVED={}:CWD={}",
 				is_console(stdin_handle) as u8,
@@ -324,6 +333,158 @@ async fn accepts_ordered_raw_argument_fragments() -> io::Result<()> {
 			.windows(16)
 			.any(|window| window == b"PW-TERMINALS:111")
 	);
+	Ok(())
+}
+
+#[cfg(feature = "creation-flags")]
+#[tokio::test]
+async fn creation_flags_compose_without_a_job_object() -> io::Result<()> {
+	use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+	let mut command = helper("terminal")?;
+	command.wrap(CreationFlags(CREATE_NEW_PROCESS_GROUP));
+	let (mut child, controller) = command.spawn(PtyOptions::default())?;
+	let (input, mut output, _resize) = controller.into_parts();
+	drop(input);
+	assert!(timeout(TIMEOUT, child.wait()).await??.success());
+	let mut bytes = Vec::new();
+	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	assert!(
+		bytes
+			.windows(16)
+			.any(|window| window == b"PW-TERMINALS:111")
+	);
+	Ok(())
+}
+
+#[cfg(feature = "job-object")]
+#[tokio::test]
+async fn job_object_resumes_its_temporarily_suspended_primary_thread() -> io::Result<()> {
+	let mut command = helper("terminal")?;
+	command.wrap(JobObject);
+	let (mut child, controller) = command.spawn(PtyOptions::default())?;
+	let (input, mut output, _resize) = controller.into_parts();
+	drop(input);
+	assert!(timeout(TIMEOUT, child.wait()).await??.success());
+	let mut bytes = Vec::new();
+	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	assert!(
+		bytes
+			.windows(16)
+			.any(|window| window == b"PW-TERMINALS:111")
+	);
+	Ok(())
+}
+
+#[cfg(all(feature = "creation-flags", feature = "job-object"))]
+#[tokio::test]
+async fn job_object_composes_with_creation_flags_in_both_orders() -> io::Result<()> {
+	use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+	for reverse in [false, true] {
+		let mut command = helper("terminal")?;
+		if reverse {
+			command
+				.wrap(JobObject)
+				.wrap(CreationFlags(CREATE_NEW_PROCESS_GROUP));
+		} else {
+			command
+				.wrap(CreationFlags(CREATE_NEW_PROCESS_GROUP))
+				.wrap(JobObject);
+		}
+		let (mut child, controller) = command.spawn(PtyOptions::default())?;
+		let (input, mut output, _resize) = controller.into_parts();
+		drop(input);
+		assert!(timeout(TIMEOUT, child.wait()).await??.success());
+		let mut bytes = Vec::new();
+		timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+		assert!(
+			bytes
+				.windows(16)
+				.any(|window| window == b"PW-TERMINALS:111")
+		);
+	}
+	Ok(())
+}
+
+#[cfg(all(feature = "creation-flags", feature = "job-object"))]
+#[tokio::test]
+async fn job_object_preserves_explicit_suspension() -> io::Result<()> {
+	use windows::Win32::System::Threading::CREATE_SUSPENDED;
+
+	let directory = tempfile::tempdir()?;
+	let touched = directory.path().join("resumed");
+	let mut command = helper("terminal")?;
+	command
+		.env("PW_TOUCH", &touched)
+		.wrap(CreationFlags(CREATE_SUSPENDED))
+		.wrap(JobObject);
+	let (mut child, controller) = command.spawn(PtyOptions::default())?;
+	let (input, mut output, _resize) = controller.into_parts();
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	assert!(
+		!touched.exists(),
+		"an explicitly suspended ConPTY child started running"
+	);
+	child.start_kill()?;
+	timeout(TIMEOUT, child.wait()).await??;
+	drop(input);
+	let mut bytes = Vec::new();
+	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	assert!(
+		!bytes
+			.windows(16)
+			.any(|window| window == b"PW-TERMINALS:111")
+	);
+	Ok(())
+}
+
+#[cfg(feature = "kill-on-drop")]
+async fn assert_killed_on_drop(mut command: PtyCommand) -> io::Result<()> {
+	use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+	use windows::Win32::{
+		Foundation::WAIT_OBJECT_0,
+		System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+	};
+
+	let (child, controller) = command.spawn(PtyOptions::default())?;
+	let pid = child.id().expect("ConPTY children expose a process ID");
+	let (_input, mut output, _resize) = controller.into_parts();
+	read_through(&mut output, b"PW-READY").await?;
+	// SAFETY: pid identifies the live child. Ownership of the non-inheritable handle is transferred.
+	let process =
+		unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.map_err(io::Error::other)?;
+	// SAFETY: OpenProcess returned a unique owned handle.
+	let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
+	drop(child);
+	let wait = tokio::task::spawn_blocking(move || {
+		// SAFETY: process owns the live synchronization handle for this wait.
+		unsafe { WaitForSingleObject(HANDLE(process.as_raw_handle()), 10_000) }
+	});
+	assert_eq!(wait.await.map_err(io::Error::other)?, WAIT_OBJECT_0);
+	Ok(())
+}
+
+#[cfg(feature = "kill-on-drop")]
+#[tokio::test]
+async fn kill_on_drop_terminates_a_conpty_child() -> io::Result<()> {
+	let mut command = helper("wait")?;
+	command.wrap(KillOnDrop);
+	assert_killed_on_drop(command).await
+}
+
+#[cfg(all(feature = "job-object", feature = "kill-on-drop"))]
+#[tokio::test]
+async fn job_object_composes_with_kill_on_drop_in_both_orders() -> io::Result<()> {
+	for reverse in [false, true] {
+		let mut command = helper("wait")?;
+		if reverse {
+			command.wrap(JobObject).wrap(KillOnDrop);
+		} else {
+			command.wrap(KillOnDrop).wrap(JobObject);
+		}
+		assert_killed_on_drop(command).await?;
+	}
 	Ok(())
 }
 
