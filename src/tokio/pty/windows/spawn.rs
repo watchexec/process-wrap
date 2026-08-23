@@ -21,13 +21,14 @@ use windows::{
 };
 
 use super::{
-	PreparedWindowsCommand, attributes::AttributeList, child::ConPtyChild,
+	PreparedWindowsCommand, attributes::AttributeList, child::ConPtyChild, console::Release,
 	environment::PreparedEnvironment,
 };
 
 pub(super) fn spawn(
 	mut command: PreparedWindowsCommand,
 	attributes: &AttributeList,
+	release: Release,
 	input_server: OwnedHandle,
 	output_server: OwnedHandle,
 ) -> io::Result<SpawnedChild> {
@@ -74,7 +75,7 @@ pub(super) fn spawn(
 
 	let handles = SpawnedProcess::new(information)?;
 	let cleanup = handles.cleanup()?;
-	let child = handles.into_child(command.creation.kill_on_drop);
+	let child = handles.into_child(command.creation.kill_on_drop, release)?;
 	Ok(SpawnedChild { child, cleanup })
 }
 
@@ -137,7 +138,7 @@ impl SpawnedProcess {
 		})
 	}
 
-	fn into_child(mut self, kill_on_drop: bool) -> ConPtyChild {
+	fn into_child(mut self, kill_on_drop: bool, release: Release) -> io::Result<ConPtyChild> {
 		let process = self
 			.process
 			.take()
@@ -146,7 +147,7 @@ impl SpawnedProcess {
 			.primary_thread
 			.take()
 			.expect("a spawned process guard must own its primary-thread handle");
-		ConPtyChild::new(process, primary_thread, self.pid, kill_on_drop)
+		ConPtyChild::new(process, primary_thread, self.pid, kill_on_drop, release)
 	}
 }
 

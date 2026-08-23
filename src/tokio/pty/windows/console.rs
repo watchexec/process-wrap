@@ -2,7 +2,7 @@
 
 use std::{
 	io,
-	sync::{Mutex, OnceLock},
+	sync::{Arc, Mutex, OnceLock},
 	thread::JoinHandle,
 };
 
@@ -20,9 +20,25 @@ use super::{
 
 #[derive(Debug)]
 pub(super) struct PseudoConsole {
+	state: Arc<State>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct Release {
+	state: Arc<State>,
+}
+
+#[derive(Debug)]
+struct State {
 	handle: HPCON,
 	api: &'static ConPtyApi,
+	lifecycle: Mutex<Lifecycle>,
+}
+
+#[derive(Debug, Default)]
+struct Lifecycle {
 	released: bool,
+	closed: bool,
 }
 
 impl PseudoConsole {
@@ -48,39 +64,82 @@ impl PseudoConsole {
 			));
 		}
 		Ok(Self {
-			handle,
-			api,
-			released: false,
+			state: Arc::new(State {
+				handle,
+				api,
+				lifecycle: Mutex::new(Lifecycle::default()),
+			}),
 		})
 	}
 
 	pub(super) fn handle(&self) -> HPCON {
-		self.handle
+		self.state.handle
 	}
 
-	pub(super) fn release(&mut self) -> io::Result<()> {
-		if self.released {
-			return Ok(());
+	pub(super) fn releaser(&self) -> Release {
+		Release {
+			state: Arc::clone(&self.state),
 		}
-		// SAFETY: self owns a live pseudo-console and the resolved function has the documented ABI.
-		unsafe { (self.api.release)(self.handle) }
-			.ok()
-			.map_err(io::Error::other)?;
-		self.released = true;
-		Ok(())
+	}
+
+	#[cfg(test)]
+	fn release(&self) -> io::Result<()> {
+		self.releaser().release()
 	}
 
 	pub(super) fn resize(&self, size: PtySize) -> io::Result<()> {
-		// SAFETY: self owns a live pseudo-console and the resolved function has the documented ABI.
-		unsafe { (self.api.resize)(self.handle, coordinate(size)?) }
+		let lifecycle = self
+			.state
+			.lifecycle
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		if lifecycle.released || lifecycle.closed {
+			return Err(io::Error::new(
+				io::ErrorKind::BrokenPipe,
+				"the pseudo-console is no longer application-owned",
+			));
+		}
+		// SAFETY: the application still owns this live pseudo-console and the resolved function has
+		// the documented ABI.
+		unsafe { (self.state.api.resize)(self.state.handle, coordinate(size)?) }
 			.ok()
 			.map_err(io::Error::other)
 	}
 }
 
+impl Release {
+	pub(super) fn release(&self) -> io::Result<()> {
+		let mut lifecycle = self
+			.state
+			.lifecycle
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		if lifecycle.released || lifecycle.closed {
+			return Ok(());
+		}
+		// SAFETY: the application owns this live pseudo-console and the resolved function has the
+		// documented ABI.
+		unsafe { (self.state.api.release)(self.state.handle) }
+			.ok()
+			.map_err(io::Error::other)?;
+		lifecycle.released = true;
+		Ok(())
+	}
+}
+
 impl Drop for PseudoConsole {
 	fn drop(&mut self) {
-		schedule_close(self.api.close, self.handle);
+		let mut lifecycle = self
+			.state
+			.lifecycle
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		if lifecycle.closed {
+			return;
+		}
+		lifecycle.closed = true;
+		drop(lifecycle);
+		schedule_close(self.state.api.close, self.state.handle);
 	}
 }
 
@@ -264,7 +323,7 @@ mod tests {
 		CREATE_FLAGS.store(u32::MAX, Ordering::SeqCst);
 		RESIZE_SIZE.store(0, Ordering::SeqCst);
 
-		let mut console = PseudoConsole::create_with(
+		let console = PseudoConsole::create_with(
 			&TEST_API,
 			PtySize::new(25, 81).unwrap(),
 			HANDLE(1usize as _),
@@ -296,9 +355,11 @@ mod tests {
 		reset_close();
 		BLOCK_CLOSE.store(true, Ordering::SeqCst);
 		let console = PseudoConsole {
-			handle: HPCON(42),
-			api: &TEST_API,
-			released: false,
+			state: Arc::new(State {
+				handle: HPCON(42),
+				api: &TEST_API,
+				lifecycle: Mutex::new(Lifecycle::default()),
+			}),
 		};
 
 		let started = Instant::now();

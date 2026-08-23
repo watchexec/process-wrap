@@ -24,8 +24,9 @@ pub(in crate::tokio::pty) fn spawn(
 
 	let input = PipePair::input()?;
 	let output = PipePair::output()?;
-	let mut console =
+	let console =
 		PseudoConsole::create(options.size, input.server_handle(), output.server_handle())?;
+	let release = console.releaser();
 	let (input_server, input_host) = input.into_parts();
 	let (output_server, output_host) = output.into_parts();
 	let attributes = AttributeList::new(console.handle())?;
@@ -34,7 +35,8 @@ pub(in crate::tokio::pty) fn spawn(
 	let spawned = catch_unwind(AssertUnwindSafe(|| {
 		let cleanup = &mut cleanup;
 		command.command.spawn_with_child(move |_inner| {
-			let spawned = process::spawn(prepared, &attributes, input_server, output_server)?;
+			let spawned =
+				process::spawn(prepared, &attributes, release, input_server, output_server)?;
 			*cleanup = Some(spawned.cleanup);
 			Ok(Box::new(spawned.child) as Box<dyn ChildWrapper>)
 		})
@@ -52,11 +54,6 @@ pub(in crate::tokio::pty) fn spawn(
 			resume_unwind(payload);
 		}
 	};
-	if let Err(error) = console.release() {
-		let _ = child.start_kill();
-		drop(cleanup.take());
-		return Err(error);
-	}
 	let (input, output, resize) = match controller::controller(console, input_host, output_host) {
 		Ok(controller) => controller,
 		Err(error) => {
