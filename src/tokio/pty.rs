@@ -10,7 +10,13 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{ChildWrapper, CommandWrap, CommandWrapper};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod unsupported;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use unix as imp;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use unsupported as imp;
 
 /// The character and pixel dimensions of a pseudo-terminal.
