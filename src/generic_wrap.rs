@@ -29,7 +29,7 @@ macro_rules! Wrap {
 			command: $command,
 			wrappers: ::indexmap::IndexMap<
 				::std::any::TypeId,
-				Box<dyn ErasedCommandWrapper>,
+				Option<Box<dyn ErasedCommandWrapper>>,
 			>,
 		}
 
@@ -82,10 +82,12 @@ macro_rules! Wrap {
 				let typeid = ::std::any::TypeId::of::<W>();
 				let mut wrapper = Some(wrapper);
 				let extant = self.wrappers.entry(typeid).or_insert_with(|| {
-					Box::new(wrapper.take().unwrap()) as Box<dyn ErasedCommandWrapper>
+					Some(Box::new(wrapper.take().unwrap()) as Box<dyn ErasedCommandWrapper>)
 				});
 				if let Some(wrapper) = wrapper {
 					extant
+						.as_mut()
+						.expect("a wrapper cannot be replaced while its hook is active")
 						.as_command_wrapper_mut()
 						.extend(Box::new(wrapper));
 				}
@@ -93,32 +95,68 @@ macro_rules! Wrap {
 				self
 			}
 
-			// poor man's try..finally block
+			#[inline]
+			fn with_wrapper_at<T>(
+				&mut self,
+				index: usize,
+				invoke: impl FnOnce(
+					&mut dyn CommandWrapper,
+					&CommandWrap,
+				) -> ::std::io::Result<T>,
+			) -> ::std::io::Result<T> {
+				let mut wrapper = self
+					.wrappers
+					.get_index_mut(index)
+					.expect("the wrapper index must remain valid")
+					.1
+					.take()
+					.expect("the wrapper must be present before invoking its hook");
+
+				let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+					invoke(wrapper.as_command_wrapper_mut(), self)
+				}));
+
+				let slot = self
+					.wrappers
+					.get_index_mut(index)
+					.expect("the wrapper key must remain present")
+					.1;
+				debug_assert!(slot.is_none());
+				*slot = Some(wrapper);
+
+				match result {
+					Ok(result) => result,
+					Err(payload) => ::std::panic::resume_unwind(payload),
+				}
+			}
+
 			#[inline]
 			fn spawn_inner(
-				&self,
+				&mut self,
 				command: &mut $command,
-				wrappers: &mut ::indexmap::IndexMap<
-					::std::any::TypeId,
-					Box<dyn ErasedCommandWrapper>,
-				>,
 				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<$child>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
-				for (_id, wrapper) in wrappers.iter_mut() {
+				for index in 0..self.wrappers.len() {
 					#[cfg(feature = "tracing")]
-					::tracing::debug!(id = ?_id, "pre_spawn");
-					wrapper
-						.as_command_wrapper_mut()
-						.pre_spawn(command, self)?;
+					{
+						let id = self.wrappers.get_index(index).unwrap().0;
+						::tracing::debug!(?id, "pre_spawn");
+					}
+					self.with_wrapper_at(index, |wrapper, core| {
+						wrapper.pre_spawn(command, core)
+					})?;
 				}
 
 				let mut child = spawner(command)?;
-				for (_id, wrapper) in wrappers.iter_mut() {
+				for index in 0..self.wrappers.len() {
 					#[cfg(feature = "tracing")]
-					::tracing::debug!(id = ?_id, "post_spawn");
-					wrapper
-						.as_command_wrapper_mut()
-						.post_spawn(command, &mut child, self)?;
+					{
+						let id = self.wrappers.get_index(index).unwrap().0;
+						::tracing::debug!(?id, "post_spawn");
+					}
+					self.with_wrapper_at(index, |wrapper, core| {
+						wrapper.post_spawn(command, &mut child, core)
+					})?;
 				}
 
 				let mut child = Box::new(
@@ -126,12 +164,15 @@ macro_rules! Wrap {
 					$first_child_wrapper(child),
 				) as Box<dyn $childer>;
 
-				for (_id, wrapper) in wrappers.iter_mut() {
+				for index in 0..self.wrappers.len() {
 					#[cfg(feature = "tracing")]
-					::tracing::debug!(id = ?_id, "wrap_child");
-					child = wrapper
-						.as_command_wrapper_mut()
-						.wrap_child(child, self)?;
+					{
+						let id = self.wrappers.get_index(index).unwrap().0;
+						::tracing::debug!(?id, "wrap_child");
+					}
+					child = self.with_wrapper_at(index, |wrapper, core| {
+						wrapper.wrap_child(child, core)
+					})?;
 				}
 
 				Ok(child)
@@ -160,14 +201,16 @@ macro_rules! Wrap {
 				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<$child>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
 				let mut command = ::std::mem::replace(&mut self.command, <$command>::new(""));
-				let mut wrappers = ::std::mem::take(&mut self.wrappers);
-
-				let res = self.spawn_inner(&mut command, &mut wrappers, spawner);
+				let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+					self.spawn_inner(&mut command, spawner)
+				}));
 
 				self.command = command;
-				self.wrappers = wrappers;
 
-				res
+				match result {
+					Ok(result) => result,
+					Err(payload) => ::std::panic::resume_unwind(payload),
+				}
 			}
 
 			/// Check if a wrapper of a given type is present.
@@ -181,16 +224,21 @@ macro_rules! Wrap {
 			/// This is useful for getting access to the state of a wrapper, generally from within
 			/// another wrapper.
 			///
-			/// Returns `None` if the wrapper is not present. To merely check if a wrapper is
-			/// present, use `has_wrap` instead.
+			/// Returns `None` if the wrapper is not present. While a wrapper's lifecycle hook is
+			/// running, that active wrapper remains registered but is temporarily unavailable through
+			/// this method; peer wrappers remain available. To merely check registration, use
+			/// `has_wrap` instead.
 			pub fn get_wrap<W: CommandWrapper + 'static>(&self) -> Option<&W> {
 				let typeid = ::std::any::TypeId::of::<W>();
-				self.wrappers.get(&typeid).map(|wrapper| {
-					wrapper
-						.as_any()
-						.downcast_ref()
-						.expect("the wrapper key and concrete type must match")
-				})
+				self.wrappers
+					.get(&typeid)
+					.and_then(Option::as_deref)
+					.map(|wrapper| {
+						wrapper
+							.as_any()
+							.downcast_ref()
+							.expect("the wrapper key and concrete type must match")
+					})
 			}
 		}
 
