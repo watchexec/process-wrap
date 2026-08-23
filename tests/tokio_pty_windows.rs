@@ -3,6 +3,7 @@
 use std::{
 	env,
 	io::{self, Read, Write},
+	path::{Path, PathBuf},
 	time::Duration,
 };
 
@@ -26,6 +27,10 @@ use windows::Win32::{
 	},
 };
 
+#[cfg(all(feature = "creation-flags", feature = "job-object"))]
+#[path = "support/windows_thread.rs"]
+mod windows_thread;
+
 const HELPER_MODE: &str = "PROCESS_WRAP_CONPTY_HELPER";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -35,6 +40,23 @@ fn helper(mode: &str) -> io::Result<PtyCommand> {
 		.args(["--exact", "conpty_child_helper", "--nocapture"])
 		.env(HELPER_MODE, mode);
 	Ok(command)
+}
+
+fn spawn_descendant(release: &Path) -> io::Result<std::process::Child> {
+	std::process::Command::new(env::current_exe()?)
+		.args(["--exact", "conpty_child_helper", "--nocapture"])
+		.env(HELPER_MODE, "descendant")
+		.env("PW_RELEASE", release)
+		.env_remove("PW_DESCENDANT_PID")
+		.spawn()
+}
+
+struct ReleaseOnDrop(PathBuf);
+
+impl Drop for ReleaseOnDrop {
+	fn drop(&mut self) {
+		let _ = std::fs::File::create(&self.0);
+	}
 }
 
 async fn read_through(
@@ -86,9 +108,6 @@ fn conpty_child_helper() -> io::Result<()> {
 
 	match mode.as_str() {
 		"terminal" => {
-			if let Some(path) = env::var_os("PW_TOUCH") {
-				std::fs::File::create(path)?;
-			}
 			print!(
 				"PW-TERMINALS:{}{}{}:{}:REMOVED={}:CWD={}",
 				is_console(stdin_handle) as u8,
@@ -124,6 +143,39 @@ fn conpty_child_helper() -> io::Result<()> {
 			io::stdin().read_line(&mut line)?;
 			print_size(stdout_handle)?;
 			io::stdout().flush()?;
+		}
+		"descendant-parent" => {
+			let release = env::var_os("PW_RELEASE").ok_or_else(|| {
+				io::Error::new(io::ErrorKind::InvalidInput, "PW_RELEASE is unset")
+			})?;
+			drop(spawn_descendant(Path::new(&release))?);
+		}
+		"descendant" => {
+			let release = env::var_os("PW_RELEASE").ok_or_else(|| {
+				io::Error::new(io::ErrorKind::InvalidInput, "PW_RELEASE is unset")
+			})?;
+			print!("PW-DESCENDANT-READY");
+			io::stdout().flush()?;
+			while !Path::new(&release).exists() {
+				std::thread::sleep(Duration::from_millis(10));
+			}
+		}
+		"tree" => {
+			let release = env::var_os("PW_RELEASE").ok_or_else(|| {
+				io::Error::new(io::ErrorKind::InvalidInput, "PW_RELEASE is unset")
+			})?;
+			let pid_file = env::var_os("PW_DESCENDANT_PID").ok_or_else(|| {
+				io::Error::new(io::ErrorKind::InvalidInput, "PW_DESCENDANT_PID is unset")
+			})?;
+			let descendant = spawn_descendant(Path::new(&release))?;
+			std::fs::write(pid_file, descendant.id().to_string())?;
+			drop(descendant);
+			print!("PW-TREE-READY");
+			io::stdout().flush()?;
+			let mut byte = [0];
+			loop {
+				io::stdin().read_exact(&mut byte)?;
+			}
 		}
 		"wait" => {
 			print!("PW-READY");
@@ -290,6 +342,30 @@ async fn dropping_output_keeps_the_terminal_live_while_input_exists() -> io::Res
 }
 
 #[tokio::test]
+async fn direct_child_wait_is_independent_from_descendant_output_eof() -> io::Result<()> {
+	let directory = tempfile::tempdir()?;
+	let release = directory.path().join("release-descendant");
+	let _release_on_drop = ReleaseOnDrop(release.clone());
+	let mut command = helper("descendant-parent")?;
+	command.env("PW_RELEASE", &release);
+
+	let (mut child, controller) = command.spawn(PtyOptions::default())?;
+	let (input, mut output, _resize) = controller.into_parts();
+	drop(input);
+	let mut bytes = read_through(&mut output, b"PW-DESCENDANT-READY").await?;
+	assert!(timeout(TIMEOUT, child.wait()).await??.success());
+	assert!(
+		timeout(Duration::from_millis(100), output.read_to_end(&mut bytes))
+			.await
+			.is_err(),
+		"ConPTY output reached EOF while a descendant remained attached"
+	);
+	std::fs::File::create(&release)?;
+	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	Ok(())
+}
+
+#[tokio::test]
 async fn failed_spawn_leaves_the_tracked_command_reusable() -> io::Result<()> {
 	let mut command = PtyCommand::new("process-wrap-definitely-missing-program");
 	assert_eq!(
@@ -412,19 +488,16 @@ async fn job_object_composes_with_creation_flags_in_both_orders() -> io::Result<
 async fn job_object_preserves_explicit_suspension() -> io::Result<()> {
 	use windows::Win32::System::Threading::CREATE_SUSPENDED;
 
-	let directory = tempfile::tempdir()?;
-	let touched = directory.path().join("resumed");
 	let mut command = helper("terminal")?;
 	command
-		.env("PW_TOUCH", &touched)
 		.wrap(CreationFlags(CREATE_SUSPENDED))
 		.wrap(JobObject);
 	let (mut child, controller) = command.spawn(PtyOptions::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
-	tokio::time::sleep(Duration::from_millis(500)).await;
+	let pid = child.id().expect("ConPTY children expose a process ID");
 	assert!(
-		!touched.exists(),
-		"an explicitly suspended ConPTY child started running"
+		windows_thread::process_has_suspended_thread(pid)?,
+		"an explicitly suspended ConPTY child had no suspended thread"
 	);
 	child.start_kill()?;
 	timeout(TIMEOUT, child.wait()).await??;
@@ -437,6 +510,70 @@ async fn job_object_preserves_explicit_suspension() -> io::Result<()> {
 			.any(|window| window == b"PW-TERMINALS:111")
 	);
 	Ok(())
+}
+
+#[cfg(all(feature = "job-object", feature = "kill-on-drop"))]
+struct ProcessGuard(Option<std::os::windows::io::OwnedHandle>);
+
+#[cfg(all(feature = "job-object", feature = "kill-on-drop"))]
+impl ProcessGuard {
+	fn open(pid: u32) -> io::Result<Self> {
+		use std::os::windows::io::FromRawHandle;
+		use windows::Win32::System::Threading::{
+			OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+		};
+
+		// SAFETY: pid identifies the live descendant and the returned handle is non-inheritable.
+		let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) }
+			.map_err(io::Error::other)?;
+		// SAFETY: OpenProcess returned a unique owned handle.
+		Ok(Self(Some(unsafe {
+			std::os::windows::io::OwnedHandle::from_raw_handle(process.0)
+		})))
+	}
+
+	fn wait(self) -> io::Result<Self> {
+		use std::os::windows::io::AsRawHandle;
+		use windows::Win32::{
+			Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+			System::Threading::WaitForSingleObject,
+		};
+
+		let process = self.0.as_ref().expect("a process guard must be armed");
+		// SAFETY: the guard owns the live process synchronization handle.
+		match unsafe { WaitForSingleObject(HANDLE(process.as_raw_handle()), 10_000) } {
+			WAIT_OBJECT_0 => Ok(self),
+			WAIT_TIMEOUT => Err(io::Error::new(
+				io::ErrorKind::TimedOut,
+				"ConPTY descendant survived dropping the job",
+			)),
+			WAIT_FAILED => Err(io::Error::last_os_error()),
+			result => Err(io::Error::other(format!(
+				"unexpected descendant wait result {}",
+				result.0
+			))),
+		}
+	}
+
+	fn disarm(mut self) {
+		self.0.take();
+	}
+}
+
+#[cfg(all(feature = "job-object", feature = "kill-on-drop"))]
+impl Drop for ProcessGuard {
+	fn drop(&mut self) {
+		use std::os::windows::io::AsRawHandle;
+		use windows::Win32::System::Threading::{INFINITE, TerminateProcess, WaitForSingleObject};
+
+		if let Some(process) = self.0.take() {
+			let process = HANDLE(process.as_raw_handle());
+			// SAFETY: the guard owns this process handle and is cleaning up a failed test descendant.
+			let _ = unsafe { TerminateProcess(process, 1) };
+			// SAFETY: the owned handle remains live until the end of this scope.
+			let _ = unsafe { WaitForSingleObject(process, INFINITE) };
+		}
+	}
 }
 
 #[cfg(feature = "kill-on-drop")]
@@ -477,13 +614,35 @@ async fn kill_on_drop_terminates_a_conpty_child() -> io::Result<()> {
 #[tokio::test]
 async fn job_object_composes_with_kill_on_drop_in_both_orders() -> io::Result<()> {
 	for reverse in [false, true] {
-		let mut command = helper("wait")?;
+		let directory = tempfile::tempdir()?;
+		let release = directory.path().join("release-descendant");
+		let pid_file = directory.path().join("descendant-pid");
+		let _release_on_drop = ReleaseOnDrop(release.clone());
+		let mut command = helper("tree")?;
+		command
+			.env("PW_RELEASE", &release)
+			.env("PW_DESCENDANT_PID", &pid_file);
 		if reverse {
 			command.wrap(JobObject).wrap(KillOnDrop);
 		} else {
 			command.wrap(KillOnDrop).wrap(JobObject);
 		}
-		assert_killed_on_drop(command).await?;
+
+		let (child, controller) = command.spawn(PtyOptions::default())?;
+		let (input, mut output, _resize) = controller.into_parts();
+		read_through(&mut output, b"PW-TREE-READY").await?;
+		let pid = std::fs::read_to_string(&pid_file)?
+			.parse::<u32>()
+			.map_err(io::Error::other)?;
+		let guard = ProcessGuard::open(pid)?;
+		drop(child);
+		let guard = tokio::task::spawn_blocking(move || guard.wait())
+			.await
+			.map_err(io::Error::other)??;
+		guard.disarm();
+		drop(input);
+		let mut bytes = Vec::new();
+		timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
 	}
 	Ok(())
 }
