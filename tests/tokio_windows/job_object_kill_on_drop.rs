@@ -1,6 +1,10 @@
-use std::{fs::read_to_string, io::ErrorKind, time::Instant};
+use std::{
+	io::{ErrorKind, Write},
+	process::Command as StdCommand,
+	time::Instant,
+};
 
-use tempfile::NamedTempFile;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use windows::Win32::{
 	Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0},
 	System::Threading::{
@@ -12,6 +16,7 @@ use super::prelude::*;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const DESCENDANT_MARKER: &str = "PW-DESCENDANT:";
 
 #[derive(Clone, Copy)]
 enum Order {
@@ -49,24 +54,41 @@ impl Drop for ProcessGuard {
 	}
 }
 
-async fn descendant_pid(file: &NamedTempFile) -> Result<u32> {
-	let deadline = Instant::now() + STARTUP_TIMEOUT;
-	loop {
-		match read_to_string(file.path()) {
-			Ok(contents) if !contents.trim().is_empty() => {
-				return contents.trim().parse().map_err(std::io::Error::other);
+async fn descendant_pid(child: &mut dyn ChildWrapper) -> Result<u32> {
+	let stdout = child.stdout().take().ok_or_else(|| {
+		std::io::Error::new(
+			ErrorKind::BrokenPipe,
+			"descendant helper stdout was not piped",
+		)
+	})?;
+	let mut lines = BufReader::new(stdout).lines();
+	let result = tokio::time::timeout(STARTUP_TIMEOUT, async {
+		while let Some(line) = lines.next_line().await? {
+			if let Some(pid) = line.strip_prefix(DESCENDANT_MARKER) {
+				return pid.trim().parse().map_err(std::io::Error::other);
 			}
-			Ok(_) => {}
-			Err(error) if error.kind() == ErrorKind::NotFound => {}
-			Err(error) => return Err(error),
 		}
-		if Instant::now() >= deadline {
-			return Err(std::io::Error::new(
-				ErrorKind::TimedOut,
-				"descendant pid was not written",
-			));
+
+		let status = child.wait().await?;
+		let mut stderr = String::new();
+		if let Some(mut pipe) = child.stderr().take() {
+			pipe.read_to_string(&mut stderr).await?;
 		}
-		sleep(Duration::from_millis(10)).await;
+		Err(std::io::Error::other(format!(
+			"descendant helper exited with {status} before reporting its pid: {stderr}"
+		)))
+	})
+	.await;
+
+	match result {
+		Ok(result) => result,
+		Err(_) => Err(std::io::Error::new(
+			ErrorKind::TimedOut,
+			format!(
+				"descendant helper did not report its pid; process status: {:?}",
+				child.try_wait()?
+			),
+		)),
 	}
 }
 
@@ -90,16 +112,42 @@ async fn wait_for_process_exit(handle: HANDLE) -> Result<()> {
 	}
 }
 
+#[test]
+#[ignore = "subprocess helper"]
+fn descendant_leaf() {
+	std::thread::sleep(Duration::from_secs(300));
+}
+
+#[test]
+#[ignore = "subprocess helper"]
+fn descendant_parent() {
+	let mut descendant = StdCommand::new(std::env::current_exe().unwrap())
+		.args([
+			"--ignored",
+			"--exact",
+			concat!(module_path!(), "::descendant_leaf"),
+			"--nocapture",
+		])
+		.spawn()
+		.unwrap();
+	println!("{DESCENDANT_MARKER}{}", descendant.id());
+	std::io::stdout().flush().unwrap();
+	descendant.wait().unwrap();
+}
+
 #[tokio::test]
 async fn job_detects_kill_on_drop_in_both_orders() -> Result<()> {
 	for order in [Order::KillOnDropFirst, Order::JobObjectFirst] {
-		let pid_file = NamedTempFile::new()?;
-		let path = pid_file.path().display().to_string().replace('\'', "''");
-		let script = format!(
-			"$child = Start-Process powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 300') -PassThru; Set-Content -LiteralPath '{path}' -Value $child.Id -NoNewline; Start-Sleep -Seconds 300"
-		);
-		let mut command = CommandWrap::with_new("powershell.exe", |command| {
-			command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+		let mut command = CommandWrap::with_new(std::env::current_exe()?, |command| {
+			command
+				.args([
+					"--ignored",
+					"--exact",
+					concat!(module_path!(), "::descendant_parent"),
+					"--nocapture",
+				])
+				.stdout(Stdio::piped())
+				.stderr(Stdio::piped());
 		});
 		match order {
 			Order::KillOnDropFirst => {
@@ -110,8 +158,8 @@ async fn job_detects_kill_on_drop_in_both_orders() -> Result<()> {
 			}
 		}
 
-		let child = command.spawn()?;
-		let pid = descendant_pid(&pid_file).await?;
+		let mut child = command.spawn()?;
+		let pid = descendant_pid(child.as_mut()).await?;
 		let guard = ProcessGuard::open(pid)?;
 		drop(child);
 		wait_for_process_exit(guard.handle()).await?;
