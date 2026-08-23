@@ -102,6 +102,7 @@ async fn passes_bidirectional_control_bytes_unchanged() -> io::Result<()> {
 #[tokio::test]
 async fn preserves_tracked_command_intent() -> io::Result<()> {
 	let directory = tempfile::tempdir()?;
+	let expected_directory = directory.path().canonicalize()?;
 	let mut command = PtyCommand::new("/bin/sh");
 	command
 		.args([
@@ -126,7 +127,7 @@ async fn preserves_tracked_command_intent() -> io::Result<()> {
 		String::from_utf8(bytes).unwrap(),
 		format!(
 			"argument|environment|unset|unset|{}",
-			directory.path().display()
+			expected_directory.display()
 		)
 	);
 	Ok(())
