@@ -187,3 +187,131 @@ fn process_status(process: HANDLE, timeout: u32) -> io::Result<Option<ExitStatus
 		))),
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		os::windows::io::{AsRawHandle, FromRawHandle},
+		process::{Child, Command},
+		thread::sleep,
+		time::{Duration, Instant},
+	};
+
+	use super::*;
+
+	fn duplicate_process(child: &Child) -> OwnedHandle {
+		// SAFETY: the current-process pseudo-handle and child's process handle are live, and duplicate
+		// points to initialized writable storage. Ownership of the result is transferred once.
+		unsafe {
+			let current = GetCurrentProcess();
+			let mut duplicate = HANDLE::default();
+			DuplicateHandle(
+				current,
+				HANDLE(child.as_raw_handle()),
+				current,
+				&mut duplicate,
+				0,
+				false,
+				DUPLICATE_SAME_ACCESS,
+			)
+			.unwrap();
+			OwnedHandle::from_raw_handle(duplicate.0)
+		}
+	}
+
+	fn wrap(child: &Child, kill_on_drop: bool) -> ConPtyChild {
+		ConPtyChild {
+			process: duplicate_process(child),
+			primary_thread: None,
+			pid: child.id(),
+			kill_on_drop,
+			exit_status: ChildExitStatus::Running,
+			stdin: None,
+			stdout: None,
+			stderr: None,
+		}
+	}
+
+	fn spawn_exit_259() -> Child {
+		Command::new("cmd.exe")
+			.args(["/D", "/C", "exit /b 259"])
+			.spawn()
+			.unwrap()
+	}
+
+	fn spawn_long_running() -> Child {
+		Command::new("ping.exe")
+			.args(["-n", "30", "127.0.0.1"])
+			.spawn()
+			.unwrap()
+	}
+
+	fn wait_native(child: &mut Child) -> ExitStatus {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		loop {
+			if let Some(status) = child.try_wait().unwrap() {
+				return status;
+			}
+			assert!(Instant::now() < deadline, "native test child did not exit");
+			sleep(Duration::from_millis(10));
+		}
+	}
+
+	#[tokio::test]
+	async fn preserves_exit_code_259_and_repeated_waits() {
+		let mut native = spawn_exit_259();
+		let mut child = wrap(&native, false);
+		assert_eq!(child.id(), Some(native.id()));
+		assert!(child.process_handle().is_some());
+		assert!(child.primary_thread_handle().is_none());
+		assert!((&child as &dyn ChildWrapper).try_inner_child().is_none());
+
+		let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(status.code(), Some(259));
+		assert_eq!(child.try_wait().unwrap(), Some(status));
+		assert_eq!(child.wait().await.unwrap(), status);
+		assert_eq!(wait_native(&mut native), status);
+	}
+
+	#[tokio::test]
+	async fn kills_and_reaps_the_direct_process() {
+		let mut native = spawn_long_running();
+		let mut child = wrap(&native, false);
+		assert!(child.try_wait().unwrap().is_none());
+		child.start_kill().unwrap();
+		let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(child.try_wait().unwrap(), Some(status));
+		assert_eq!(wait_native(&mut native), status);
+	}
+
+	#[tokio::test]
+	async fn canceled_async_wait_does_not_invalidate_the_process_handle() {
+		let mut native = spawn_long_running();
+		let mut child = wrap(&native, false);
+		assert!(
+			tokio::time::timeout(Duration::from_millis(20), child.wait())
+				.await
+				.is_err()
+		);
+		child.start_kill().unwrap();
+		let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(wait_native(&mut native), status);
+	}
+
+	#[test]
+	fn kill_on_drop_terminates_a_running_process() {
+		let mut native = spawn_long_running();
+		let child = wrap(&native, true);
+		drop(child);
+		let _ = wait_native(&mut native);
+	}
+}
