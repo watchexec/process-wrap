@@ -6,8 +6,14 @@ fn nowrap() -> Result<()> {
 		command.arg("/C").arg("echo hello").stdout(Stdio::null());
 	})
 	.spawn()?;
-	sleep(DIE_TIME);
-	let status = child.try_wait()?;
+	let mut status = None;
+	for _ in 0..200 {
+		status = child.try_wait()?;
+		if status.is_some() {
+			break;
+		}
+		sleep(Duration::from_millis(50));
+	}
 	assert!(status.is_some());
 	assert!(status.unwrap().success());
 
@@ -21,8 +27,14 @@ fn job_object() -> Result<()> {
 	})
 	.wrap(JobObject)
 	.spawn()?;
-	sleep(DIE_TIME);
-	let status = child.try_wait()?;
+	let mut status = None;
+	for _ in 0..200 {
+		status = child.try_wait()?;
+		if status.is_some() {
+			break;
+		}
+		sleep(Duration::from_millis(50));
+	}
 	assert!(status.is_some());
 	assert!(status.unwrap().success());
 
