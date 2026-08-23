@@ -68,3 +68,24 @@ impl Drop for AttributeList {
 		unsafe { DeleteProcThreadAttributeList(self.list) };
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use std::mem::align_of;
+
+	use super::*;
+
+	#[test]
+	fn allocates_an_aligned_single_pseudoconsole_attribute() {
+		let attributes = AttributeList::new(HPCON(42)).unwrap();
+		assert!(!attributes.as_ptr().is_invalid());
+		assert_eq!(
+			attributes.storage.as_ptr() as usize % align_of::<usize>(),
+			0
+		);
+		assert_eq!(
+			attributes.as_ptr().0,
+			attributes.storage.as_ptr().cast_mut().cast()
+		);
+	}
+}
