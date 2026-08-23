@@ -151,6 +151,13 @@ impl CommandIntent {
 	}
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PtyMarker;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl CommandWrapper for PtyMarker {}
+
 /// A tracked command builder for pseudo-terminal spawning.
 ///
 /// The builder owns the complete portable command intent instead of exposing unrestricted mutable

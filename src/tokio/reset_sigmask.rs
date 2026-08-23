@@ -16,18 +16,13 @@ pub struct ResetSigmask;
 
 impl CommandWrapper for ResetSigmask {
 	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
+		#[cfg(feature = "tracing")]
+		trace!("registering child sigmask reset");
+
 		unsafe {
 			command.pre_exec(|| {
-				let mut oldset = SigSet::empty();
 				let newset = SigSet::all();
-
-				#[cfg(feature = "tracing")]
-				trace!(unblocking=?newset, "resetting process sigmask");
-
-				sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&newset), Some(&mut oldset))?;
-
-				#[cfg(feature = "tracing")]
-				trace!(?oldset, "sigmask reset");
+				sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&newset), None)?;
 				Ok(())
 			});
 		}

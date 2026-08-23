@@ -1,3 +1,5 @@
+#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+use std::io::ErrorKind;
 use std::{
 	future::Future,
 	io::{Error, Result},
@@ -22,6 +24,8 @@ use tracing::instrument;
 
 use crate::ChildExitStatus;
 
+#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+use super::pty::PtyMarker;
 use super::{ChildWrapper, CommandWrap, CommandWrapper};
 
 /// Wrapper which sets the process group of a `Command`.
@@ -38,6 +42,8 @@ use super::{ChildWrapper, CommandWrap, CommandWrapper};
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessGroup {
 	leader: Pid,
+	#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+	attach: bool,
 }
 
 impl ProcessGroup {
@@ -45,6 +51,8 @@ impl ProcessGroup {
 	pub fn leader() -> Self {
 		Self {
 			leader: Pid::from_raw(0),
+			#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+			attach: false,
 		}
 	}
 
@@ -52,6 +60,8 @@ impl ProcessGroup {
 	pub fn attach_to(leader: u32) -> Self {
 		Self {
 			leader: Pid::from_raw(leader as i32),
+			#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+			attach: true,
 		}
 	}
 }
@@ -85,6 +95,24 @@ impl ProcessGroupChild {
 impl CommandWrapper for ProcessGroup {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
+		#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+		if _core.has_wrap::<PtyMarker>() {
+			#[cfg(feature = "process-session")]
+			if _core.has_wrap::<super::ProcessSession>() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"ProcessGroup and ProcessSession cannot both be used with a PTY",
+				));
+			}
+			if self.attach {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"ProcessGroup::attach_to cannot be used with a PTY",
+				));
+			}
+			return Ok(());
+		}
+
 		command.process_group(self.leader.as_raw());
 		Ok(())
 	}
@@ -210,21 +238,14 @@ impl ChildWrapper for ProcessGroupChild {
 			return Ok(Some(*status));
 		}
 
-		match Self::wait_imp(self.pgid, WaitPidFlag::WNOHANG)? {
-			ControlFlow::Break(res) => {
-				if let Some(status) = res {
-					self.exit_status = ChildExitStatus::Exited(status);
-				}
-				Ok(res)
-			}
-			ControlFlow::Continue(()) => {
-				let exited = self.inner.try_wait()?;
-				if let Some(exited) = exited {
-					self.exit_status = ChildExitStatus::Exited(exited);
-				}
-				Ok(exited)
-			}
+		let exited = self.inner.try_wait()?;
+		if let Some(status) = exited {
+			self.exit_status = ChildExitStatus::Exited(status);
+			// The native child must reap the leader so its own cached state remains synchronized.
+			// Once that has happened, opportunistically reap any exited descendants in the group.
+			let _ = Self::wait_imp(self.pgid, WaitPidFlag::WNOHANG)?;
 		}
+		Ok(exited)
 	}
 
 	fn signal(&self, sig: i32) -> Result<()> {

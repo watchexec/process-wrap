@@ -1,3 +1,5 @@
+#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+use std::io::ErrorKind;
 use std::io::{Error, Result};
 
 use nix::unistd::{Pid, setsid};
@@ -5,6 +7,8 @@ use tokio::process::Command;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
+#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+use super::pty::PtyMarker;
 use super::{CommandWrap, CommandWrapper};
 
 /// Wrapper which creates a new session and group for the `Command`.
@@ -25,6 +29,17 @@ pub struct ProcessSession;
 impl CommandWrapper for ProcessSession {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
+		#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+		if _core.has_wrap::<PtyMarker>() {
+			if _core.has_wrap::<super::ProcessGroup>() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"ProcessGroup and ProcessSession cannot both be used with a PTY",
+				));
+			}
+			return Ok(());
+		}
+
 		unsafe {
 			command.pre_exec(move || setsid().map_err(Error::from).map(|_| ()));
 		}

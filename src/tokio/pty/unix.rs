@@ -22,7 +22,7 @@ use nix::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, unix::AsyncFd};
 
-use super::{ChildWrapper, PtyCommand, PtyController, PtyOptions, PtySize};
+use super::{ChildWrapper, PtyCommand, PtyController, PtyMarker, PtyOptions, PtySize};
 
 type Master = Arc<AsyncFd<PtyMaster>>;
 
@@ -120,6 +120,7 @@ pub(super) fn spawn(
 
 	let master = Arc::new(AsyncFd::new(master)?);
 	command.rebuild_command();
+	command.command.wrap(PtyMarker);
 	let spawned = catch_unwind(AssertUnwindSafe(|| {
 		command.command.spawn_with(move |inner| {
 			with_slave_stdio(inner, slave_stdin, slave_stdout, slave, |inner| {
