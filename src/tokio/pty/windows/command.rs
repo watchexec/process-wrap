@@ -1,3 +1,8 @@
+//! Win32 application-name and mutable command-line encoding.
+//!
+//! Program and argument data stays in WTF-16. Regular arguments follow the Microsoft C runtime's
+//! backslash-and-quote rules, while raw fragments are appended unchanged and in registration order.
+
 use std::{ffi::OsStr, io, os::windows::ffi::OsStrExt};
 
 use super::super::{ArgIntent, CommandIntent};

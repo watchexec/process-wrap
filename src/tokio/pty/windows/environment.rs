@@ -1,3 +1,9 @@
+//! Win32 environment inheritance and explicit block construction.
+//!
+//! An unchanged environment remains native inheritance. Once modified, the inherited block is read
+//! without converting through Unicode scalar values, changes use Windows case-insensitive key
+//! semantics, and the resulting WTF-16 block is sorted deterministically and double-NUL terminated.
+
 use std::{cmp::Ordering, io, slice};
 
 use windows::{

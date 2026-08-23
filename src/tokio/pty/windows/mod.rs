@@ -1,3 +1,9 @@
+//! Exact Win32 process-spawn intent prepared from [`PtyCommand`].
+//!
+//! This private model never reconstructs arguments or environment operations from a Tokio command.
+//! It retains the WTF-16 data and wrapper policy needed by the ConPTY backend's `CreateProcessW`
+//! call without committing those implementation invariants to the public API.
+
 use std::{any::TypeId, io};
 
 use windows::Win32::System::Threading::{CREATE_SUSPENDED, PROCESS_CREATION_FLAGS};
