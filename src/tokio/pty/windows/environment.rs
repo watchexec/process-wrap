@@ -410,6 +410,28 @@ mod tests {
 	}
 
 	#[test]
+	fn applies_explicit_drive_current_directory_changes() {
+		let prepared = prepare_environment_with(
+			&intent(false, vec![remove("=C:"), set("=D:", r"D:\child")]),
+			|| {
+				Ok(vec![
+					variable("=C:", r"C:\parent"),
+					variable("Name", "value"),
+				])
+			},
+		)
+		.unwrap();
+		assert_eq!(prepared, block(&[("=D:", r"D:\child"), ("Name", "value")]));
+
+		let cleared =
+			prepare_environment_with(&intent(true, vec![set("=C:", r"C:\restored")]), || {
+				panic!("a cleared environment must not be captured")
+			})
+			.unwrap();
+		assert_eq!(cleared, block(&[("=C:", r"C:\restored")]));
+	}
+
+	#[test]
 	fn rejects_invalid_explicit_keys_before_capturing_the_parent() {
 		let cases = [
 			(
@@ -422,11 +444,15 @@ mod tests {
 			),
 			(
 				intent(false, vec![set("A=B", "value")]),
-				"PTY environment key contains an equals sign",
+				"PTY environment key contains an invalid equals sign",
 			),
 			(
-				intent(false, vec![remove("=C:")]),
-				"PTY environment key contains an equals sign",
+				intent(false, vec![remove("=")]),
+				"PTY environment key contains an invalid equals sign",
+			),
+			(
+				intent(false, vec![remove("=C:=")]),
+				"PTY environment key contains an invalid equals sign",
 			),
 		];
 
