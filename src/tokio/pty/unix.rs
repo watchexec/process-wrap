@@ -4,7 +4,7 @@ use std::ffi::CStr;
 use std::path::Path;
 use std::{
 	io,
-	os::fd::{AsRawFd, FromRawFd, OwnedFd},
+	os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
 	panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
 	pin::Pin,
 	process::Stdio,
@@ -12,13 +12,6 @@ use std::{
 	task::{Context, Poll, ready},
 };
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
-use nix::pty::ptsname_r;
-use nix::{
-	fcntl::{FcntlArg, fcntl},
-	libc,
-	pty::Winsize,
-};
 #[cfg(any(
 	target_os = "dragonfly",
 	target_os = "freebsd",
@@ -27,15 +20,19 @@ use nix::{
 	target_os = "openbsd",
 	target_os = "solaris"
 ))]
-use nix::{
-	fcntl::{FdFlag, OFlag},
-	pty::openpty,
-};
+use nix::pty::openpty;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use nix::pty::ptsname_r;
 #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
 use nix::{
-	fcntl::{OFlag, open},
+	fcntl::open,
 	pty::{PtyMaster, grantpt, posix_openpt, unlockpt},
 	sys::stat::Mode,
+};
+use nix::{
+	fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
+	libc,
+	pty::Winsize,
 };
 #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
 use std::os::fd::IntoRawFd;
@@ -197,8 +194,9 @@ fn with_slave_stdio<T>(
 
 #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
 fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
-	let master =
-		posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)?;
+	let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)?;
+	set_close_on_exec(&master)?;
+	set_nonblocking(&master)?;
 	grantpt(&master)?;
 	unlockpt(&master)?;
 	let slave = open_slave(&master)?;
@@ -225,28 +223,12 @@ fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	Ok((pair.master, pair.slave))
 }
 
-#[cfg(any(
-	target_os = "dragonfly",
-	target_os = "freebsd",
-	target_os = "illumos",
-	target_os = "netbsd",
-	target_os = "openbsd",
-	target_os = "solaris"
-))]
-fn set_close_on_exec(fd: &OwnedFd) -> io::Result<()> {
+fn set_close_on_exec(fd: &impl AsFd) -> io::Result<()> {
 	fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
 	Ok(())
 }
 
-#[cfg(any(
-	target_os = "dragonfly",
-	target_os = "freebsd",
-	target_os = "illumos",
-	target_os = "netbsd",
-	target_os = "openbsd",
-	target_os = "solaris"
-))]
-fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+fn set_nonblocking(fd: &impl AsFd) -> io::Result<()> {
 	let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
 	fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
 	Ok(())
@@ -395,6 +377,19 @@ mod tests {
 		assert_eq!(native.ws_col, 97);
 		assert_eq!(native.ws_xpixel, 640);
 		assert_eq!(native.ws_ypixel, 480);
+	}
+
+	#[test]
+	fn allocated_master_has_close_on_exec_and_nonblocking() {
+		let (master, _slave) = open_pty(PtySize::default()).unwrap();
+		let descriptor_flags = FdFlag::from_bits_truncate(
+			fcntl(&master, FcntlArg::F_GETFD).expect("read descriptor flags"),
+		);
+		let status_flags = OFlag::from_bits_truncate(
+			fcntl(&master, FcntlArg::F_GETFL).expect("read status flags"),
+		);
+		assert!(descriptor_flags.contains(FdFlag::FD_CLOEXEC));
+		assert!(status_flags.contains(OFlag::O_NONBLOCK));
 	}
 
 	#[test]

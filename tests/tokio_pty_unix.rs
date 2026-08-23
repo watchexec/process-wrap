@@ -484,13 +484,7 @@ async fn reset_sigmask_unblocks_signals_before_pty_setup() -> io::Result<()> {
 
 #[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
 fn pid_alive(pid: Pid) -> bool {
-	fn inner(pid: Pid) -> Result<bool, remoteprocess::Error> {
-		Ok(!remoteprocess::Process::new(pid.as_raw())?
-			.threads()?
-			.is_empty())
-	}
-
-	inner(pid).unwrap_or(false)
+	!matches!(kill(pid, None), Err(nix::errno::Errno::ESRCH))
 }
 
 #[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
