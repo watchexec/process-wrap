@@ -282,7 +282,9 @@ impl PtyCommand {
 
 	/// Append a raw command-line fragment on Windows.
 	///
-	/// Raw fragments are preserved in their registration order relative to regular arguments.
+	/// Each call inserts one leading ASCII space before appending the fragment exactly, without
+	/// quoting or escaping it. An empty fragment therefore still contributes one space. Raw fragments
+	/// retain their registration order relative to regular arguments.
 	#[cfg(windows)]
 	pub fn raw_arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
 		self.intent
@@ -341,6 +343,11 @@ impl PtyCommand {
 	/// individually and retain their group-aware child wrapper. `ProcessGroup::attach_to(...)` is
 	/// incompatible with a new PTY session, and explicitly registering both group and session
 	/// wrappers is ambiguous; spawning returns [`io::ErrorKind::InvalidInput`] in either case.
+	///
+	/// When Windows PTY spawning is supported, its backend accepts only the exact built-in
+	/// `CreationFlags`, `JobObject`, and `KillOnDrop` wrapper types whose crate features are enabled.
+	/// Any other command wrapper causes spawning to return [`io::ErrorKind::InvalidInput`] before
+	/// command hooks run.
 	pub fn wrap<W: CommandWrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
 		#[cfg(windows)]
 		{
