@@ -63,10 +63,13 @@ async fn descendant_pid(child: &mut dyn ChildWrapper) -> Result<u32> {
 	})?;
 	let mut lines = BufReader::new(stdout).lines();
 	let result = tokio::time::timeout(STARTUP_TIMEOUT, async {
+		let mut transcript = String::new();
 		while let Some(line) = lines.next_line().await? {
 			if let Some(pid) = line.strip_prefix(DESCENDANT_MARKER) {
 				return pid.trim().parse().map_err(std::io::Error::other);
 			}
+			transcript.push_str(&line);
+			transcript.push('\n');
 		}
 
 		let status = child.wait().await?;
@@ -75,7 +78,7 @@ async fn descendant_pid(child: &mut dyn ChildWrapper) -> Result<u32> {
 			pipe.read_to_string(&mut stderr).await?;
 		}
 		Err(std::io::Error::other(format!(
-			"descendant helper exited with {status} before reporting its pid: {stderr}"
+			"descendant helper exited with {status} before reporting its pid; stdout: {transcript}; stderr: {stderr}"
 		)))
 	})
 	.await;
@@ -122,12 +125,7 @@ fn descendant_leaf() {
 #[ignore = "subprocess helper"]
 fn descendant_parent() {
 	let mut descendant = StdCommand::new(std::env::current_exe().unwrap())
-		.args([
-			"--ignored",
-			"--exact",
-			concat!(module_path!(), "::descendant_leaf"),
-			"--nocapture",
-		])
+		.args(["descendant_leaf", "--ignored", "--nocapture"])
 		.spawn()
 		.unwrap();
 	println!("{DESCENDANT_MARKER}{}", descendant.id());
@@ -140,12 +138,7 @@ async fn job_detects_kill_on_drop_in_both_orders() -> Result<()> {
 	for order in [Order::KillOnDropFirst, Order::JobObjectFirst] {
 		let mut command = CommandWrap::with_new(std::env::current_exe()?, |command| {
 			command
-				.args([
-					"--ignored",
-					"--exact",
-					concat!(module_path!(), "::descendant_parent"),
-					"--nocapture",
-				])
+				.args(["descendant_parent", "--ignored", "--nocapture"])
 				.stdout(Stdio::piped())
 				.stderr(Stdio::piped());
 		});
