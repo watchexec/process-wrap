@@ -52,10 +52,15 @@ fn encode_key(key: &OsStr) -> io::Result<Vec<u16>> {
 			"PTY environment key cannot be empty",
 		));
 	}
-	if key.contains(&(b'=' as u16)) {
+	let name = if key.first() == Some(&(b'=' as u16)) {
+		&key[1..]
+	} else {
+		&key[..]
+	};
+	if name.is_empty() || name.contains(&(b'=' as u16)) {
 		return Err(io::Error::new(
 			io::ErrorKind::InvalidInput,
-			"PTY environment key contains an equals sign",
+			"PTY environment key contains an invalid equals sign",
 		));
 	}
 	Ok(key)
