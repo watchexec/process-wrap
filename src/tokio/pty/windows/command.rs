@@ -265,6 +265,87 @@ mod tests {
 	}
 
 	#[test]
+	fn encodes_argv0_with_its_special_windows_rules() {
+		let prepared =
+			prepare_command_line(&intent(OsString::from(r"C:\Program Files\"), Vec::new()))
+				.unwrap();
+		assert_eq!(
+			prepared.command_line.as_units(),
+			[
+				DOUBLE_QUOTE,
+				b'C' as u16,
+				b':' as u16,
+				BACKSLASH,
+				b'P' as u16,
+				b'r' as u16,
+				b'o' as u16,
+				b'g' as u16,
+				b'r' as u16,
+				b'a' as u16,
+				b'm' as u16,
+				SPACE,
+				b'F' as u16,
+				b'i' as u16,
+				b'l' as u16,
+				b'e' as u16,
+				b's' as u16,
+				BACKSLASH,
+				DOUBLE_QUOTE,
+				0,
+			]
+		);
+	}
+
+	#[test]
+	fn quotes_multiple_backslash_runs_in_regular_arguments() {
+		let arg = os(&[
+			b'a' as u16,
+			BACKSLASH,
+			BACKSLASH,
+			DOUBLE_QUOTE,
+			b'b' as u16,
+			BACKSLASH,
+			BACKSLASH,
+		]);
+		let prepared = prepare_command_line(&intent(
+			OsString::from("tool"),
+			vec![ArgIntent::Regular(arg)],
+		))
+		.unwrap();
+		assert_eq!(
+			prepared.command_line.as_units(),
+			[
+				DOUBLE_QUOTE,
+				b't' as u16,
+				b'o' as u16,
+				b'o' as u16,
+				b'l' as u16,
+				DOUBLE_QUOTE,
+				SPACE,
+				b'a' as u16,
+				BACKSLASH,
+				BACKSLASH,
+				BACKSLASH,
+				BACKSLASH,
+				BACKSLASH,
+				DOUBLE_QUOTE,
+				b'b' as u16,
+				BACKSLASH,
+				BACKSLASH,
+				0,
+			]
+		);
+	}
+
+	#[test]
+	fn rejects_unrepresentable_quotes_in_argv0() {
+		let error =
+			prepare_command_line(&intent(OsString::from("bad\"program"), Vec::new())).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+		assert_eq!(error.to_string(), "PTY program contains a double quote");
+	}
+
+	#[test]
 	fn rejects_embedded_nuls_with_stable_errors() {
 		let cases = [
 			(

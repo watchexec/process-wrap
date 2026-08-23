@@ -140,6 +140,35 @@ jobs:
             cargo check --locked --target "${{ matrix.target }}" --no-default-features --features pty --lib
           fi
 
+  windows-pty-wrapper-features:
+    strategy:
+      fail-fast: false
+      matrix:
+        wrapper:
+          - creation-flags
+          - job-object
+          - kill-on-drop
+
+    name: "Test Windows PTY with isolated ${{ matrix.wrapper }} wrapper"
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+          rustup component add clippy
+
+      - name: Test isolated wrapper
+        run: cargo test --locked --no-default-features --features "pty,${{ matrix.wrapper }}" --all-targets
+
+      - name: Lint isolated wrapper
+        run: cargo clippy --locked --no-default-features --features "pty,${{ matrix.wrapper }}" --all-targets -- -D warnings
+
   rustdoc:
     name: Rustdoc
     runs-on: ubuntu-latest

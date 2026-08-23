@@ -350,6 +350,15 @@ mod tests {
 	}
 
 	#[test]
+	fn applies_non_ascii_case_insensitive_collisions() {
+		let prepared = prepare_environment_with(&intent(false, vec![set("äBC", "child")]), || {
+			Ok(vec![variable("Äbc", "parent")])
+		})
+		.unwrap();
+		assert_eq!(prepared, block(&[("äBC", "child")]));
+	}
+
+	#[test]
 	fn preserves_lone_surrogates() {
 		let key = os(&[b'K' as u16, 0xd800]);
 		let value = os(&[b'V' as u16, 0xdc00]);
@@ -373,6 +382,16 @@ mod tests {
 	}
 
 	#[test]
+	fn captures_and_releases_the_native_parent_environment() {
+		let variables = inherited_environment().unwrap();
+		assert!(
+			variables
+				.iter()
+				.all(|variable| !variable.key.contains(&0) && !variable.value.contains(&0))
+		);
+	}
+
+	#[test]
 	fn parses_drive_current_directory_variables() {
 		let mut raw = units(r"=C:=C:\work");
 		raw.push(0);
@@ -383,6 +402,37 @@ mod tests {
 			parsed,
 			vec![variable("=C:", r"C:\work"), variable("Name", "value")]
 		);
+	}
+
+	#[test]
+	fn rejects_invalid_explicit_keys_before_capturing_the_parent() {
+		let cases = [
+			(
+				intent(false, vec![set("", "value")]),
+				"PTY environment key cannot be empty",
+			),
+			(
+				intent(false, vec![remove("")]),
+				"PTY environment key cannot be empty",
+			),
+			(
+				intent(false, vec![set("A=B", "value")]),
+				"PTY environment key contains an equals sign",
+			),
+			(
+				intent(false, vec![remove("=C:")]),
+				"PTY environment key contains an equals sign",
+			),
+		];
+
+		for (intent, message) in cases {
+			let error = prepare_environment_with(&intent, || {
+				panic!("invalid explicit keys must be rejected before capture")
+			})
+			.unwrap_err();
+			assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+			assert_eq!(error.to_string(), message);
+		}
 	}
 
 	#[test]

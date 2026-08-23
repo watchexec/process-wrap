@@ -162,6 +162,58 @@ mod tests {
 		prepare_with(command, |_| Ok(PreparedEnvironment::Inherit))
 	}
 
+	fn terminated(value: &str) -> Vec<u16> {
+		value.encode_utf16().chain([0]).collect()
+	}
+
+	fn environment_block(entries: &[(&str, &str)]) -> PreparedEnvironment {
+		let mut block = Vec::new();
+		for (key, value) in entries {
+			block.extend(key.encode_utf16());
+			block.push(b'=' as u16);
+			block.extend(value.encode_utf16());
+			block.push(0);
+		}
+		block.push(0);
+		PreparedEnvironment::Block(block)
+	}
+
+	#[test]
+	fn prepares_ordered_public_builder_intent() {
+		let mut command = PtyCommand::new("tool");
+		command
+			.arg("two words")
+			.raw_arg(r#"/D "literal""#)
+			.args(["tail"])
+			.envs([("Name", "child"), ("Second", "two")])
+			.env_remove("gone");
+
+		let prepared = prepare_with(&command, |intent| {
+			environment::prepare_environment_with(intent, || {
+				Ok(vec![
+					environment::EnvironmentVariable {
+						key: "Name".encode_utf16().collect(),
+						value: "parent".encode_utf16().collect(),
+					},
+					environment::EnvironmentVariable {
+						key: "gone".encode_utf16().collect(),
+						value: "remove".encode_utf16().collect(),
+					},
+				])
+			})
+		})
+		.unwrap();
+
+		assert_eq!(
+			prepared.command_line.as_units(),
+			terminated(r#""tool" "two words" /D "literal" tail"#)
+		);
+		assert_eq!(
+			prepared.environment,
+			environment_block(&[("Name", "child"), ("Second", "two")])
+		);
+	}
+
 	#[test]
 	fn rejects_unknown_wrappers_before_preparing_the_environment() {
 		let mut command = PtyCommand::new("tool");
@@ -256,6 +308,31 @@ mod tests {
 		assert!(!policy.explicit_suspension);
 		assert!(!policy.has_job_object);
 		assert!(!policy.resume_after_assignment);
+	}
+
+	#[cfg(feature = "job-object")]
+	#[test]
+	fn derives_temporary_suspension_for_a_job_without_creation_flags() {
+		let mut command = PtyCommand::new("tool");
+		command.wrap(JobObject);
+
+		let policy = prepare_without_parent(&command).unwrap().creation;
+		assert_eq!(policy.user_flags, PROCESS_CREATION_FLAGS(0));
+		assert_eq!(policy.spawn_flags, CREATE_SUSPENDED);
+		assert!(!policy.explicit_suspension);
+		assert!(policy.has_job_object);
+		assert!(policy.resume_after_assignment);
+	}
+
+	#[cfg(feature = "kill-on-drop")]
+	#[test]
+	fn records_kill_on_drop_without_a_job_object() {
+		let mut command = PtyCommand::new("tool");
+		command.wrap(KillOnDrop);
+
+		let policy = prepare_without_parent(&command).unwrap().creation;
+		assert!(!policy.has_job_object);
+		assert!(policy.kill_on_drop);
 	}
 
 	#[cfg(all(feature = "job-object", feature = "kill-on-drop"))]
