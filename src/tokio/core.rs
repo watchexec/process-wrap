@@ -6,6 +6,9 @@ use std::{
 	process::{ExitStatus, Output},
 };
 
+#[cfg(windows)]
+use std::os::windows::io::BorrowedHandle;
+
 use futures::future::try_join3;
 #[cfg(unix)]
 use nix::{
@@ -24,9 +27,13 @@ crate::generic_wrap::Wrap!(Command, Child, ChildWrapper, |child| child);
 /// This trait exposes most of the functionality of the underlying [`Child`]. It is implemented for
 /// [`Child`] and by wrappers.
 ///
-/// The required methods are `inner`, `inner_mut`, and `into_inner`. That provides access to the
-/// underlying `Child` and allows the wrapper to be dropped and the `Child` to be used directly if
-/// necessary.
+/// The required methods are `inner`, `inner_mut`, and `into_inner`. Each non-terminal wrapper must
+/// use them to expose its direct lower layer. A terminal non-native child returns itself from all
+/// three methods. Wrapper chains must otherwise be acyclic and terminate in either a native
+/// [`Child`] or a self-returning non-native child.
+///
+/// The `try_inner_child`, `try_inner_child_mut`, and `try_into_inner_child` convenience methods on
+/// the trait object traverse these layers when access to a native [`Child`] is required.
 ///
 /// It also makes it possible for all the other methods to have default implementations. Some are
 /// direct passthroughs to the underlying `Child`, while others are more complex.
@@ -52,6 +59,13 @@ crate::generic_wrap::Wrap!(Command, Child, ChildWrapper, |child| child);
 ///     fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
 ///         Box::new((*self).0)
 ///     }
+///
+///     #[cfg(windows)]
+///     fn process_handle(
+///         &self,
+///     ) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+///         self.0.process_handle()
+///     }
 /// }
 /// ```
 pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
@@ -67,6 +81,20 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	/// ensure that the wrapped child is in a consistent state when this is called or they are
 	/// dropped, so that this is always safe.
 	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper>;
+
+	/// Borrow the handle for the process represented by this child, if available.
+	///
+	/// This method is only available on Windows. The returned handle cannot outlive the borrow of
+	/// `self`. Transparent child wrappers should override this method and delegate directly to the
+	/// child they own. Terminal custom children which do not represent a native process may retain the
+	/// default implementation.
+	///
+	/// Implementations returning `Some` must return a process handle, rather than another kind of
+	/// Windows object.
+	#[cfg(windows)]
+	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
+		None
+	}
 
 	/// Obtain a clone if possible.
 	///
@@ -207,7 +235,14 @@ impl ChildWrapper for Child {
 		self
 	}
 	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-		Box::new(*self)
+		self
+	}
+	#[cfg(windows)]
+	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
+		let handle = self.raw_handle()?;
+		// SAFETY: `raw_handle` returns the handle owned by `self`, and the returned borrow cannot
+		// outlive `self`.
+		Some(unsafe { BorrowedHandle::borrow_raw(handle) })
 	}
 	fn stdin(&mut self) -> &mut Option<ChildStdin> {
 		&mut self.stdin
@@ -244,7 +279,13 @@ impl ChildWrapper for Child {
 	}
 }
 
-impl dyn ChildWrapper {
+const INNER_CHILD_INVARIANT: &str = "ChildWrapper chain did not terminate in tokio::process::Child";
+
+fn same_child(left: &dyn ChildWrapper, right: &dyn ChildWrapper) -> bool {
+	std::ptr::addr_eq(left, right) && left.type_id() == right.type_id()
+}
+
+impl dyn ChildWrapper + '_ {
 	fn downcast_ref<T: 'static>(&self) -> Option<&T> {
 		(self as &dyn Any).downcast_ref()
 	}
@@ -253,41 +294,123 @@ impl dyn ChildWrapper {
 		self.downcast_ref::<Child>().is_some()
 	}
 
-	/// Obtain a reference to the underlying [`Child`].
-	pub fn inner_child(&self) -> &Child {
+	/// Try to obtain a reference to the underlying native [`Child`].
+	///
+	/// Returns `None` if the wrapper chain terminates in a non-native child.
+	pub fn try_inner_child(&self) -> Option<&Child> {
 		let mut inner = self;
-		while !inner.is_raw_child() {
-			inner = inner.inner();
-		}
+		loop {
+			if let Some(child) = inner.downcast_ref::<Child>() {
+				return Some(child);
+			}
 
-		// UNWRAP: we've just checked that it's Some with is_raw_child()
-		inner.downcast_ref().unwrap()
+			let next = inner.inner();
+			if same_child(inner, next) {
+				return None;
+			}
+			inner = next;
+		}
 	}
 
-	/// Obtain a mutable reference to the underlying [`Child`].
+	/// Try to obtain a mutable reference to the underlying native [`Child`].
 	///
-	/// Modifying the raw child may be unsound depending on the layering of wrappers.
-	pub unsafe fn inner_child_mut(&mut self) -> &mut Child {
+	/// Returns `None` if the wrapper chain terminates in a non-native child.
+	///
+	/// # Safety
+	///
+	/// The caller must ensure that using the returned mutable child does not violate invariants
+	/// maintained by any wrapper in the chain.
+	pub unsafe fn try_inner_child_mut(&mut self) -> Option<&mut Child> {
 		let mut inner = self;
-		while !inner.is_raw_child() {
-			inner = inner.inner_mut();
-		}
+		loop {
+			if inner.is_raw_child() {
+				return (inner as &mut dyn Any).downcast_mut();
+			}
 
-		// UNWRAP: we've just checked that with is_raw_child()
-		(inner as &mut dyn Any).downcast_mut().unwrap()
+			let inner_type = (&*inner as &dyn Any).type_id();
+			let inner_ptr = std::ptr::from_mut(inner);
+			let next = inner.inner_mut();
+			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
+				&& inner_type == (&*next as &dyn Any).type_id()
+			{
+				return None;
+			}
+			inner = next;
+		}
 	}
 
-	/// Obtain the underlying [`Child`].
+	/// Try to consume the wrapper chain and obtain the underlying native [`Child`].
 	///
-	/// Unwrapping everything may be unsound depending on the state of the wrappers.
-	pub unsafe fn into_inner_child(self: Box<Self>) -> Child {
+	/// If the chain terminates in a non-native child, returns that terminal child without calling its
+	/// `into_inner` method. Wrappers already traversed before reaching it have been consumed.
+	///
+	/// # Safety
+	///
+	/// The caller must ensure that removing every traversed wrapper does not violate wrapper
+	/// invariants or bypass required cleanup. This also applies when the method returns `Err`, because
+	/// wrappers above the returned terminal child have already been consumed.
+	pub unsafe fn try_into_inner_child(self: Box<Self>) -> std::result::Result<Child, Box<Self>> {
 		let mut inner = self;
-		while !inner.is_raw_child() {
+		loop {
+			if inner.is_raw_child() {
+				return match (inner as Box<dyn Any>).downcast::<Child>() {
+					Ok(child) => Ok(*child),
+					Err(_) => unreachable!("native child type was checked before downcasting"),
+				};
+			}
+
+			let terminal = {
+				let next = inner.inner();
+				same_child(inner.as_ref(), next)
+			};
+			if terminal {
+				return Err(inner);
+			}
 			inner = inner.into_inner();
 		}
+	}
 
-		// UNWRAP: we've just checked that with is_raw_child()
-		*(inner as Box<dyn Any>).downcast().unwrap()
+	/// Obtain a reference to the underlying native [`Child`].
+	///
+	/// # Panics
+	///
+	/// Panics if the wrapper chain terminates in a non-native child.
+	#[track_caller]
+	pub fn inner_child(&self) -> &Child {
+		self.try_inner_child().expect(INNER_CHILD_INVARIANT)
+	}
+
+	/// Obtain a mutable reference to the underlying native [`Child`].
+	///
+	/// # Panics
+	///
+	/// Panics if the wrapper chain terminates in a non-native child.
+	///
+	/// # Safety
+	///
+	/// The caller must ensure that using the returned mutable child does not violate invariants
+	/// maintained by any wrapper in the chain.
+	#[track_caller]
+	pub unsafe fn inner_child_mut(&mut self) -> &mut Child {
+		unsafe { self.try_inner_child_mut() }.expect(INNER_CHILD_INVARIANT)
+	}
+
+	/// Consume the wrapper chain and obtain the underlying native [`Child`].
+	///
+	/// # Panics
+	///
+	/// Panics if the wrapper chain terminates in a non-native child.
+	///
+	/// # Safety
+	///
+	/// The caller must ensure that removing every traversed wrapper does not violate wrapper
+	/// invariants or bypass required cleanup.
+	#[track_caller]
+	pub unsafe fn into_inner_child(self: Box<Self>) -> Child {
+		match unsafe { self.try_into_inner_child() } {
+			Ok(child) => child,
+			Err(_) => panic!("{INNER_CHILD_INVARIANT}"),
+		}
 	}
 }
 
