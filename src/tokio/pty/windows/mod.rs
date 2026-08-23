@@ -22,6 +22,7 @@ use environment::{PreparedEnvironment, prepare_environment};
 
 mod api;
 pub(super) mod command;
+mod console;
 pub(super) mod environment;
 mod pipe;
 
