@@ -14,10 +14,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - macos
-          - ubuntu
-          - windows
+        runner:
+          - macos-latest
+          - ubuntu-latest
+          - windows-2025
         toolchain:
           - stable
           - 1.87.0
@@ -26,8 +26,8 @@ jobs:
           - std
           - pty
 
-    name: "Test on ${{ matrix.platform }} with Rust ${{ matrix.toolchain }} (feat: ${{ matrix.features }})"
-    runs-on: "${{ matrix.platform }}-latest"
+    name: "Test on ${{ matrix.runner }} with Rust ${{ matrix.toolchain }} (feat: ${{ matrix.features }})"
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -72,13 +72,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - macos
-          - ubuntu
-          - windows
+        runner:
+          - macos-latest
+          - ubuntu-latest
+          - windows-2025
 
-    name: "Test all features on ${{ matrix.platform }}"
-    runs-on: "${{ matrix.platform }}-latest"
+    name: "Test all features on ${{ matrix.runner }}"
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -144,13 +144,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        wrapper:
+        wrappers:
           - creation-flags
           - job-object
           - kill-on-drop
+          - "creation-flags,job-object"
+          - "job-object,kill-on-drop"
 
-    name: "Test Windows PTY with isolated ${{ matrix.wrapper }} wrapper"
-    runs-on: windows-latest
+    name: "Test Windows PTY wrappers (${{ matrix.wrappers }})"
+    runs-on: windows-2025
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -163,15 +165,15 @@ jobs:
           rustup default stable
           rustup component add clippy
 
-      - name: Test isolated wrapper
-        run: cargo test --locked --no-default-features --features "pty,${{ matrix.wrapper }}" --all-targets
+      - name: Test wrapper feature set
+        run: cargo test --locked --no-default-features --features "pty,${{ matrix.wrappers }}" --all-targets
 
-      - name: Lint isolated wrapper
-        run: cargo clippy --locked --no-default-features --features "pty,${{ matrix.wrapper }}" --all-targets -- -D warnings
+      - name: Lint wrapper feature set
+        run: cargo clippy --locked --no-default-features --features "pty,${{ matrix.wrappers }}" --all-targets -- -D warnings
 
   windows-conpty-imports:
     name: Check ConPTY dynamic imports
-    runs-on: windows-latest
+    runs-on: windows-2025
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -184,35 +186,46 @@ jobs:
           rustup default stable
           rustup component add llvm-tools-preview
 
-      - name: Build minimal PTY test artifact
+      - name: Build ConPTY integration test artifacts
         shell: pwsh
         run: |
-          $artifacts = cargo test --locked --no-default-features --features pty --lib --no-run --message-format=json |
-            ForEach-Object { $_ | ConvertFrom-Json } |
-            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'process_wrap' -and $_.profile.test }
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Cargo failed to build the process-wrap test executable'
+          function Build-ConPtyArtifact {
+            param([string[]] $FeatureArgs)
+            $artifacts = cargo test --locked @FeatureArgs --test tokio_pty_windows --no-run --message-format=json |
+              ForEach-Object { $_ | ConvertFrom-Json } |
+              Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'tokio_pty_windows' -and $_.profile.test }
+            if ($LASTEXITCODE -ne 0) {
+              throw "Cargo failed to build tokio_pty_windows with arguments: $FeatureArgs"
+            }
+            $executable = ($artifacts | Select-Object -Last 1).executable
+            if (-not $executable) {
+              throw 'Cargo did not report the tokio_pty_windows test executable'
+            }
+            return $executable
           }
-          $executable = ($artifacts | Select-Object -Last 1).executable
-          if (-not $executable) {
-            throw 'Cargo did not report the process-wrap test executable'
-          }
-          $executable | Set-Content "$env:RUNNER_TEMP\process-wrap-test-executable.txt"
+
+          $executables = @(
+            Build-ConPtyArtifact -FeatureArgs @('--no-default-features', '--features', 'pty')
+            Build-ConPtyArtifact -FeatureArgs @('--all-features')
+          )
+          $executables | Set-Content "$env:RUNNER_TEMP\process-wrap-conpty-test-executables.txt"
 
       - name: Reject static ConPTY imports
         shell: pwsh
         run: |
           $hostTriple = ((rustc -vV | Select-String '^host: ').Line -replace '^host: ', '')
           $readobj = Join-Path (rustc --print sysroot) "lib\rustlib\$hostTriple\bin\llvm-readobj.exe"
-          $executable = Get-Content "$env:RUNNER_TEMP\process-wrap-test-executable.txt"
-          $imports = & $readobj --coff-imports $executable
-          if ($LASTEXITCODE -ne 0) {
-            throw 'llvm-readobj failed to inspect the process-wrap test executable'
-          }
-          $forbidden = $imports | Select-String 'Symbol: (CreatePseudoConsole|ResizePseudoConsole|ReleasePseudoConsole|ClosePseudoConsole)'
-          if ($forbidden) {
-            $forbidden | Write-Error
-            throw 'ConPTY functions must be resolved dynamically'
+          $executables = Get-Content "$env:RUNNER_TEMP\process-wrap-conpty-test-executables.txt"
+          foreach ($executable in $executables) {
+            $imports = & $readobj --coff-imports $executable
+            if ($LASTEXITCODE -ne 0) {
+              throw "llvm-readobj failed to inspect $executable"
+            }
+            $forbidden = $imports | Select-String 'Symbol: (CreatePseudoConsole|ResizePseudoConsole|ReleasePseudoConsole|ClosePseudoConsole)'
+            if ($forbidden) {
+              $forbidden | Write-Error
+              throw "ConPTY functions in $executable must be resolved dynamically"
+            }
           }
 
   rustdoc:
