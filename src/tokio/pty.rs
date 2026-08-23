@@ -135,7 +135,7 @@ impl PtyOptions {
 }
 
 #[derive(Debug)]
-enum CommandArg {
+enum ArgIntent {
 	Regular(OsString),
 	#[cfg(windows)]
 	Raw(OsString),
@@ -148,11 +148,16 @@ enum EnvChange {
 }
 
 #[derive(Debug)]
+struct EnvironmentIntent {
+	clear: bool,
+	changes: Vec<EnvChange>,
+}
+
+#[derive(Debug)]
 struct CommandIntent {
 	program: OsString,
-	args: Vec<CommandArg>,
-	env_clear: bool,
-	env: Vec<EnvChange>,
+	args: Vec<ArgIntent>,
+	environment: EnvironmentIntent,
 	current_dir: Option<OsString>,
 }
 
@@ -161,20 +166,20 @@ impl CommandIntent {
 		let mut command = tokio::process::Command::new(&self.program);
 		for arg in &self.args {
 			match arg {
-				CommandArg::Regular(arg) => {
+				ArgIntent::Regular(arg) => {
 					command.arg(arg);
 				}
 				#[cfg(windows)]
-				CommandArg::Raw(arg) => {
+				ArgIntent::Raw(arg) => {
 					command.raw_arg(arg);
 				}
 			}
 		}
 
-		if self.env_clear {
+		if self.environment.clear {
 			command.env_clear();
 		}
-		for change in &self.env {
+		for change in &self.environment.changes {
 			match change {
 				EnvChange::Set(key, value) => {
 					command.env(key, value);
@@ -224,8 +229,10 @@ impl PtyCommand {
 			intent: CommandIntent {
 				program,
 				args: Vec::new(),
-				env_clear: false,
-				env: Vec::new(),
+				environment: EnvironmentIntent {
+					clear: false,
+					changes: Vec::new(),
+				},
 				current_dir: None,
 			},
 		}
@@ -241,7 +248,7 @@ impl PtyCommand {
 	pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
 		self.intent
 			.args
-			.push(CommandArg::Regular(arg.as_ref().to_os_string()));
+			.push(ArgIntent::Regular(arg.as_ref().to_os_string()));
 		self
 	}
 
@@ -264,13 +271,13 @@ impl PtyCommand {
 	pub fn raw_arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
 		self.intent
 			.args
-			.push(CommandArg::Raw(arg.as_ref().to_os_string()));
+			.push(ArgIntent::Raw(arg.as_ref().to_os_string()));
 		self
 	}
 
 	/// Set an environment variable for the child.
 	pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
-		self.intent.env.push(EnvChange::Set(
+		self.intent.environment.changes.push(EnvChange::Set(
 			key.as_ref().to_os_string(),
 			value.as_ref().to_os_string(),
 		));
@@ -293,15 +300,16 @@ impl PtyCommand {
 	/// Remove an inherited or explicitly set environment variable.
 	pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
 		self.intent
-			.env
+			.environment
+			.changes
 			.push(EnvChange::Remove(key.as_ref().to_os_string()));
 		self
 	}
 
 	/// Clear the inherited environment and all prior environment changes.
 	pub fn env_clear(&mut self) -> &mut Self {
-		self.intent.env_clear = true;
-		self.intent.env.clear();
+		self.intent.environment.clear = true;
+		self.intent.environment.changes.clear();
 		self
 	}
 
