@@ -27,6 +27,7 @@ mod attributes;
 mod child;
 pub(super) mod command;
 mod console;
+mod controller;
 pub(super) mod environment;
 mod pipe;
 mod program;
