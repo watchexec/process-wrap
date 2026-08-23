@@ -29,6 +29,7 @@ pub(super) mod command;
 mod console;
 pub(super) mod environment;
 mod pipe;
+mod program;
 
 #[derive(Debug, Eq, PartialEq)]
 struct PreparedWindowsCommand {
@@ -57,7 +58,9 @@ pub(super) fn try_resume_primary_thread(child: &mut dyn ChildWrapper) -> Option<
 }
 
 fn prepare(command: &PtyCommand) -> io::Result<PreparedWindowsCommand> {
-	prepare_with(command, prepare_environment)
+	let mut prepared = prepare_with(command, prepare_environment)?;
+	prepared.application_name = program::resolve(&command.intent)?;
+	Ok(prepared)
 }
 
 fn prepare_with(

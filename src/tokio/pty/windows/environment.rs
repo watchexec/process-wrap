@@ -137,7 +137,7 @@ fn set_variable(variables: &mut Vec<EnvironmentVariable>, variable: EnvironmentV
 	}
 }
 
-fn windows_equal(left: &[u16], right: &[u16]) -> bool {
+pub(super) fn windows_equal(left: &[u16], right: &[u16]) -> bool {
 	windows_compare(left, right) == Ordering::Equal
 }
 
