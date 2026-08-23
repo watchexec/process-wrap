@@ -9,6 +9,10 @@ use super::{CommandWrap, CommandWrapper};
 /// This wrapper exists to be able to set the kill-on-drop flag on a `Command` and also store that
 /// fact in the wrapper, so that it can be used by other wrappers. Notably this is used by the
 /// `JobObject` wrapper.
+///
+/// On Unix, dropping a process-group or session child still applies Tokio's kill-on-drop behavior to
+/// the direct native child only. Use the group-aware child's explicit kill or signal methods when
+/// the entire process group must be targeted.
 #[derive(Clone, Copy, Debug)]
 pub struct KillOnDrop;
 

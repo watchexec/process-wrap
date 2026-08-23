@@ -38,6 +38,11 @@ use super::{ChildWrapper, CommandWrap, CommandWrapper};
 /// Process groups direct signals to all members of the group, and also serve to control job
 /// placement in foreground or background, among other actions.
 ///
+/// With a supported Unix `PtyCommand`, [`leader`](Self::leader) leaves session and process-group
+/// creation to the PTY backend while retaining group-aware child supervision. Attaching a new PTY
+/// session to an existing group is invalid, so [`attach_to`](Self::attach_to) causes PTY spawning to
+/// return [`std::io::ErrorKind::InvalidInput`].
+///
 /// This wrapper provides a child wrapper: [`ProcessGroupChild`].
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessGroup {

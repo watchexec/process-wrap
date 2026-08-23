@@ -23,6 +23,10 @@ use super::{CommandWrap, CommandWrapper};
 ///
 /// This wrapper uses [the same child wrapper as `ProcessGroup`](super::ProcessGroupChild) and does
 /// the same setup (plus the session setup); using both together is unnecessary and may misbehave.
+///
+/// With a supported Unix `PtyCommand`, the PTY backend performs the required session setup and this
+/// wrapper retains its group-aware child supervision. Explicitly registering both `ProcessGroup`
+/// and `ProcessSession` for a PTY is ambiguous and returns [`std::io::ErrorKind::InvalidInput`].
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessSession;
 

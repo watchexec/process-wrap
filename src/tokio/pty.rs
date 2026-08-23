@@ -160,6 +160,10 @@ impl CommandWrapper for PtyMarker {}
 
 /// A tracked command builder for pseudo-terminal spawning.
 ///
+/// This API is available with the non-default `pty` crate feature. Linux and macOS provide a native
+/// backend; other targets compile the same API but [`spawn`](Self::spawn) returns
+/// [`io::ErrorKind::Unsupported`] without falling back to pipes.
+///
 /// The builder owns the complete portable command intent instead of exposing unrestricted mutable
 /// access to the underlying Tokio command. This lets platform backends preserve arguments,
 /// environment operations, the working directory, and wrapper registration exactly.
@@ -266,6 +270,11 @@ impl PtyCommand {
 	}
 
 	/// Register a process wrapper.
+	///
+	/// On the Unix PTY backend, `ProcessGroup::leader()` and `ProcessSession` each compose
+	/// individually and retain their group-aware child wrapper. `ProcessGroup::attach_to(...)` is
+	/// incompatible with a new PTY session, and explicitly registering both group and session
+	/// wrappers is ambiguous; spawning returns [`io::ErrorKind::InvalidInput`] in either case.
 	pub fn wrap<W: CommandWrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
 		self.command.wrap(wrapper);
 		self
@@ -273,8 +282,14 @@ impl PtyCommand {
 
 	/// Spawn the command attached to a pseudo-terminal.
 	///
+	/// A bare Unix PTY creates the session, controlling terminal, and foreground process group needed
+	/// by the child. Standard output and standard error share the terminal and are returned as one
+	/// ordered byte stream through [`PtyOutput`].
+	///
 	/// This API never falls back to ordinary pipes. On a target without a backend it returns
-	/// [`io::ErrorKind::Unsupported`].
+	/// [`io::ErrorKind::Unsupported`], even when the supplied options would be invalid on a supported
+	/// target. Supported backends return [`io::ErrorKind::InvalidInput`] for zero character dimensions
+	/// or incompatible supervision wrappers.
 	pub fn spawn(
 		&mut self,
 		options: PtyOptions,

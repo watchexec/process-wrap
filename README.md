@@ -80,6 +80,52 @@ let status = child.wait().await?;
 dbg!(status);
 ```
 
+### or in a pseudo-terminal
+
+The non-default `pty` feature enables Tokio PTY transport on Linux and macOS. It implies `tokio1`.
+Other targets return `std::io::ErrorKind::Unsupported` rather than falling back to ordinary pipes.
+
+```toml
+[dependencies]
+process-wrap = { version = "9.1.0", features = ["pty"] }
+```
+
+```rust
+use process_wrap::tokio::*;
+use tokio::io::AsyncReadExt;
+
+let mut command = PtyCommand::new("ls");
+command.wrap(ProcessSession);
+let (mut child, controller) = command.spawn(PtyOptions::default())?;
+let (input, mut output, _resize) = controller.into_parts();
+drop(input);
+
+let drain = tokio::spawn(async move {
+  let mut bytes = Vec::new();
+  output.read_to_end(&mut bytes).await?;
+  Ok::<_, std::io::Error>(bytes)
+});
+let status = child.wait().await?;
+let terminal_bytes = drain.await??;
+dbg!(status, terminal_bytes);
+```
+
+A PTY intentionally merges stdout and stderr. `PtyInput` and `PtyOutput` are strong owners of one
+bidirectional master descriptor, so dropping either one alone does not half-close the terminal. The
+terminal hangs up after both are gone; `PtyResize` is weak and cannot keep it alive. Send the
+terminal's VEOF character when that is the desired terminal policy rather than expecting a separate
+input half-close or clonable force-close handle.
+
+Child waiting and PTY draining are independent: descendants can retain the slave after the direct
+child exits. The transport passes terminal bytes through without owning parent-terminal raw mode,
+relays, key handling, VT parsing, scrollback, or pager policy.
+
+A bare PTY creates the required session. `ProcessGroup::leader()` and `ProcessSession` each preserve
+their group-aware child supervision when used individually; `ProcessGroup::attach_to(...)` and
+explicitly registering both wrappers return `InvalidInput`. `ResetSigmask` composes normally.
+`KillOnDrop` remains Tokio's direct-child behavior—it does not promise to kill an entire group or
+session.
+
 ### or with std
 
 ```toml
@@ -256,6 +302,8 @@ Refer to [the API documentation][docs] for more detail and the specifics of chil
 
 - `std`: enables the std-based API.
 - `tokio1`: enables the Tokio-based API.
+- `pty`: enables the Tokio [pseudo-terminal transport](#or-in-a-pseudo-terminal) and implies
+  `tokio1`.
 
 Both can exist at the same time, but generally you should use one or the other.
 
