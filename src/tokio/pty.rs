@@ -215,6 +215,11 @@ pub(super) struct PtyMarker;
 #[cfg(unix)]
 impl CommandWrapper for PtyMarker {}
 
+#[cfg(all(windows, feature = "job-object"))]
+pub(crate) fn try_resume_primary_thread(child: &mut dyn ChildWrapper) -> Option<io::Result<()>> {
+	windows::try_resume_primary_thread(child)
+}
+
 /// A tracked command builder for pseudo-terminal spawning.
 ///
 /// This API is available with the non-default `pty` crate feature. Linux, Android, macOS, the BSDs,

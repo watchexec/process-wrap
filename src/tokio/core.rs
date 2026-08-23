@@ -290,6 +290,11 @@ impl dyn ChildWrapper + '_ {
 		(self as &dyn Any).downcast_ref()
 	}
 
+	#[cfg(all(windows, feature = "pty", feature = "job-object"))]
+	pub(crate) fn downcast_mut<T: 'static>(&mut self) -> Option<&mut T> {
+		(self as &mut dyn Any).downcast_mut()
+	}
+
 	fn is_raw_child(&self) -> bool {
 		self.downcast_ref::<Child>().is_some()
 	}

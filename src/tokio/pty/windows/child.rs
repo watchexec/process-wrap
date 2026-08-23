@@ -20,7 +20,8 @@ use windows::Win32::{
 		DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 	},
 	System::Threading::{
-		GetCurrentProcess, GetExitCodeProcess, INFINITE, TerminateProcess, WaitForSingleObject,
+		GetCurrentProcess, GetExitCodeProcess, INFINITE, ResumeThread, TerminateProcess,
+		WaitForSingleObject,
 	},
 };
 
@@ -59,6 +60,26 @@ impl ConPtyChild {
 
 	pub(super) fn primary_thread_handle(&self) -> Option<BorrowedHandle<'_>> {
 		self.primary_thread.as_ref().map(OwnedHandle::as_handle)
+	}
+
+	pub(super) fn resume_primary_thread(&mut self) -> io::Result<()> {
+		let thread = self
+			.primary_thread
+			.take()
+			.ok_or_else(|| io::Error::other("ConPTY child has no primary thread handle"))?;
+		// SAFETY: thread is the live primary-thread handle returned by CreateProcessW.
+		let previous_count = unsafe { ResumeThread(HANDLE(thread.as_raw_handle())) };
+		match previous_count {
+			u32::MAX => Err(io::Error::last_os_error()),
+			1 => Ok(()),
+			0 => Err(io::Error::other(
+				"ConPTY primary thread was not suspended for job assignment",
+			)),
+			count => Err(io::Error::other(format!(
+				"ConPTY primary thread remains suspended with count {}",
+				count - 1
+			))),
+		}
 	}
 
 	fn raw_process_handle(&self) -> HANDLE {

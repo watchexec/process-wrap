@@ -14,6 +14,8 @@ use super::super::CreationFlags;
 use super::super::JobObject;
 #[cfg(feature = "kill-on-drop")]
 use super::super::KillOnDrop;
+#[cfg(feature = "job-object")]
+use super::ChildWrapper;
 use super::{EnvironmentIntent, PtyCommand, WrapperRegistration};
 #[cfg(feature = "job-object")]
 use crate::windows::job_creation_flags;
@@ -45,6 +47,13 @@ struct WindowsCreationPolicy {
 	has_job_object: bool,
 	resume_after_assignment: bool,
 	kill_on_drop: bool,
+}
+
+#[cfg(feature = "job-object")]
+pub(super) fn try_resume_primary_thread(child: &mut dyn ChildWrapper) -> Option<io::Result<()>> {
+	child
+		.downcast_mut::<child::ConPtyChild>()
+		.map(child::ConPtyChild::resume_primary_thread)
 }
 
 fn prepare(command: &PtyCommand) -> io::Result<PreparedWindowsCommand> {

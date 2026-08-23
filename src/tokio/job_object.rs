@@ -118,7 +118,12 @@ impl CommandWrapper for JobObject {
 		};
 
 		if policy.resume_after_assignment {
-			if let Err(error) = resume_threads(handle) {
+			#[cfg(feature = "pty")]
+			let resume_result = super::pty::try_resume_primary_thread(inner.as_mut())
+				.unwrap_or_else(|| resume_threads(handle));
+			#[cfg(not(feature = "pty"))]
+			let resume_result = resume_threads(handle);
+			if let Err(error) = resume_result {
 				let _ = terminate_job(job_port.job, 1);
 				terminate_child(&mut *inner);
 				return Err(error);
