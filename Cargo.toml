@@ -52,6 +52,9 @@ std = ["dep:nix"]
 ## Frontend: TokioCommandWrap
 tokio1 = ["dep:nix", "dep:futures", "dep:tokio"]
 
+## Tokio pseudo-terminal transport
+pty = ["tokio1", "nix/term", "tokio/net"]
+
 ## Wrapper: Creation Flags
 creation-flags = ["dep:windows", "windows/Win32_System_Threading"]
 

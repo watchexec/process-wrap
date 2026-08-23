@@ -25,6 +25,10 @@ pub use process_group::{ProcessGroup, ProcessGroupChild};
 #[cfg(all(unix, feature = "process-session"))]
 #[doc(inline)]
 pub use process_session::ProcessSession;
+#[cfg(feature = "pty")]
+#[doc(inline)]
+/// Pseudo-terminal support, available with the non-default `pty` crate feature.
+pub use pty::{PtyCommand, PtyController, PtyInput, PtyOptions, PtyOutput, PtyResize, PtySize};
 #[cfg(all(unix, feature = "reset-sigmask"))]
 #[doc(inline)]
 pub use reset_sigmask::ResetSigmask;
@@ -40,5 +44,7 @@ mod kill_on_drop;
 mod process_group;
 #[cfg(all(unix, feature = "process-session"))]
 mod process_session;
+#[cfg(feature = "pty")]
+mod pty;
 #[cfg(all(unix, feature = "reset-sigmask"))]
 mod reset_sigmask;
