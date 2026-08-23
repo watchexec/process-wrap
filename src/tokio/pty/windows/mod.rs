@@ -23,6 +23,7 @@ use environment::{PreparedEnvironment, prepare_environment};
 mod api;
 pub(super) mod command;
 pub(super) mod environment;
+mod pipe;
 
 #[derive(Debug, Eq, PartialEq)]
 struct PreparedWindowsCommand {
