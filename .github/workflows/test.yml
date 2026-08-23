@@ -169,6 +169,52 @@ jobs:
       - name: Lint isolated wrapper
         run: cargo clippy --locked --no-default-features --features "pty,${{ matrix.wrapper }}" --all-targets -- -D warnings
 
+  windows-conpty-imports:
+    name: Check ConPTY dynamic imports
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+          rustup component add llvm-tools-preview
+
+      - name: Build minimal PTY test artifact
+        shell: pwsh
+        run: |
+          $artifacts = cargo test --locked --no-default-features --features pty --lib --no-run --message-format=json |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'process_wrap' -and $_.profile.test }
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Cargo failed to build the process-wrap test executable'
+          }
+          $executable = ($artifacts | Select-Object -Last 1).executable
+          if (-not $executable) {
+            throw 'Cargo did not report the process-wrap test executable'
+          }
+          $executable | Set-Content "$env:RUNNER_TEMP\process-wrap-test-executable.txt"
+
+      - name: Reject static ConPTY imports
+        shell: pwsh
+        run: |
+          $hostTriple = ((rustc -vV | Select-String '^host: ').Line -replace '^host: ', '')
+          $readobj = Join-Path (rustc --print sysroot) "lib\rustlib\$hostTriple\bin\llvm-readobj.exe"
+          $executable = Get-Content "$env:RUNNER_TEMP\process-wrap-test-executable.txt"
+          $imports = & $readobj --coff-imports $executable
+          if ($LASTEXITCODE -ne 0) {
+            throw 'llvm-readobj failed to inspect the process-wrap test executable'
+          }
+          $forbidden = $imports | Select-String 'Symbol: (CreatePseudoConsole|ResizePseudoConsole|ClosePseudoConsole)'
+          if ($forbidden) {
+            $forbidden | Write-Error
+            throw 'ConPTY functions must be resolved dynamically'
+          }
+
   rustdoc:
     name: Rustdoc
     runs-on: ubuntu-latest

@@ -66,3 +66,101 @@ fn resolve_with(mut lookup: impl FnMut(&CStr) -> FARPROC) -> Option<ConPtyApi> {
 		}
 	})
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	unsafe extern "system" fn create(
+		_size: COORD,
+		_input: HANDLE,
+		_output: HANDLE,
+		_flags: u32,
+		_pseudo_console: *mut HPCON,
+	) -> HRESULT {
+		HRESULT(0)
+	}
+
+	unsafe extern "system" fn resize(_pseudo_console: HPCON, _size: COORD) -> HRESULT {
+		HRESULT(0)
+	}
+
+	unsafe extern "system" fn close(_pseudo_console: HPCON) {}
+
+	fn create_proc() -> FARPROC {
+		// SAFETY: tests erase this pointer only so resolve_with can restore its original signature.
+		Some(unsafe {
+			std::mem::transmute::<CreatePseudoConsole, unsafe extern "system" fn() -> isize>(create)
+		})
+	}
+
+	fn resize_proc() -> FARPROC {
+		// SAFETY: tests erase this pointer only so resolve_with can restore its original signature.
+		Some(unsafe {
+			std::mem::transmute::<ResizePseudoConsole, unsafe extern "system" fn() -> isize>(resize)
+		})
+	}
+
+	fn close_proc() -> FARPROC {
+		// SAFETY: tests erase this pointer only so resolve_with can restore its original signature.
+		Some(unsafe {
+			std::mem::transmute::<ClosePseudoConsole, unsafe extern "system" fn() -> isize>(close)
+		})
+	}
+
+	fn lookup(name: &CStr) -> FARPROC {
+		match name.to_bytes() {
+			b"CreatePseudoConsole" => create_proc(),
+			b"ResizePseudoConsole" => resize_proc(),
+			b"ClosePseudoConsole" => close_proc(),
+			_ => None,
+		}
+	}
+
+	#[test]
+	fn resolves_all_three_exports_by_exact_name() {
+		let mut requested = Vec::new();
+		let api = resolve_with(|name| {
+			requested.push(name.to_bytes().to_vec());
+			lookup(name)
+		})
+		.unwrap();
+
+		let expected_create: CreatePseudoConsole = create;
+		let expected_resize: ResizePseudoConsole = resize;
+		let expected_close: ClosePseudoConsole = close;
+		assert_eq!(api.create as *const (), expected_create as *const ());
+		assert_eq!(api.resize as *const (), expected_resize as *const ());
+		assert_eq!(api.close as *const (), expected_close as *const ());
+		assert_eq!(
+			requested,
+			[
+				b"CreatePseudoConsole".to_vec(),
+				b"ResizePseudoConsole".to_vec(),
+				b"ClosePseudoConsole".to_vec(),
+			]
+		);
+	}
+
+	#[test]
+	fn rejects_an_incomplete_capability_set() {
+		for missing in [
+			b"CreatePseudoConsole".as_slice(),
+			b"ResizePseudoConsole".as_slice(),
+			b"ClosePseudoConsole".as_slice(),
+		] {
+			let api = resolve_with(|name| {
+				if name.to_bytes() == missing {
+					None
+				} else {
+					lookup(name)
+				}
+			});
+			assert!(
+				api.is_none(),
+				"missing {}",
+				String::from_utf8_lossy(missing)
+			);
+		}
+	}
+}
