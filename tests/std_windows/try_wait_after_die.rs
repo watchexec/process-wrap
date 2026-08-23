@@ -1,42 +1,39 @@
 use super::prelude::*;
 
+fn assert_exits(child: &mut dyn ChildWrapper) -> Result<()> {
+	let deadline = std::time::Instant::now() + Duration::from_secs(5);
+	loop {
+		if let Some(status) = child.try_wait()? {
+			assert!(status.success());
+			return Ok(());
+		}
+		if std::time::Instant::now() >= deadline {
+			child.kill()?;
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::TimedOut,
+				"command did not exit before try_wait deadline",
+			));
+		}
+		sleep(Duration::from_millis(10));
+	}
+}
+
+fn command() -> CommandWrap {
+	CommandWrap::with_new("cmd.exe", |command| {
+		command
+			.args(["/D", "/S", "/C", "exit /b 0"])
+			.stdout(Stdio::null());
+	})
+}
+
 #[test]
 fn nowrap() -> Result<()> {
-	let mut child = CommandWrap::with_new("powershell.exe", |command| {
-		command.arg("/C").arg("echo hello").stdout(Stdio::null());
-	})
-	.spawn()?;
-	let mut status = None;
-	for _ in 0..200 {
-		status = child.try_wait()?;
-		if status.is_some() {
-			break;
-		}
-		sleep(Duration::from_millis(50));
-	}
-	assert!(status.is_some());
-	assert!(status.unwrap().success());
-
-	Ok(())
+	let mut child = command().spawn()?;
+	assert_exits(child.as_mut())
 }
 
 #[test]
 fn job_object() -> Result<()> {
-	let mut child = CommandWrap::with_new("powershell.exe", |command| {
-		command.arg("/C").arg("echo hello").stdout(Stdio::null());
-	})
-	.wrap(JobObject)
-	.spawn()?;
-	let mut status = None;
-	for _ in 0..200 {
-		status = child.try_wait()?;
-		if status.is_some() {
-			break;
-		}
-		sleep(Duration::from_millis(50));
-	}
-	assert!(status.is_some());
-	assert!(status.unwrap().success());
-
-	Ok(())
+	let mut child = command().wrap(JobObject).spawn()?;
+	assert_exits(child.as_mut())
 }
