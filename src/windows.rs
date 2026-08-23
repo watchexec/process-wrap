@@ -8,22 +8,82 @@ use std::{
 
 #[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
-use windows::Win32::{
-	Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
-	System::{
-		Diagnostics::ToolHelp::{
-			CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+use windows::{
+	Win32::{
+		Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE},
+		System::{
+			Diagnostics::ToolHelp::{
+				CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
+				Thread32Next,
+			},
+			IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED},
+			JobObjects::{
+				AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+				JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+				JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
+				SetInformationJobObject, TerminateJobObject,
+			},
+			Threading::{
+				CREATE_SUSPENDED, GetProcessId, INFINITE, OpenThread, PROCESS_CREATION_FLAGS,
+				ResumeThread, THREAD_SUSPEND_RESUME,
+			},
 		},
-		IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED},
-		JobObjects::{
-			AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-			JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-			JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
-			SetInformationJobObject, TerminateJobObject,
-		},
-		Threading::{GetProcessId, INFINITE, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
 	},
+	core::HRESULT,
 };
+
+#[derive(Debug)]
+struct OwnedHandle(HANDLE);
+
+impl OwnedHandle {
+	fn into_raw(self) -> HANDLE {
+		let handle = self.0;
+		std::mem::forget(self);
+		handle
+	}
+}
+
+impl Drop for OwnedHandle {
+	fn drop(&mut self) {
+		unsafe { CloseHandle(self.0) }.ok();
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JobCreationFlags {
+	pub flags: PROCESS_CREATION_FLAGS,
+	pub resume_after_assignment: bool,
+}
+
+pub(crate) fn job_creation_flags(user_flags: PROCESS_CREATION_FLAGS) -> JobCreationFlags {
+	JobCreationFlags {
+		flags: user_flags | CREATE_SUSPENDED,
+		resume_after_assignment: !user_flags.contains(CREATE_SUSPENDED),
+	}
+}
+
+#[cfg(test)]
+mod creation_flag_tests {
+	use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+	use super::*;
+
+	#[test]
+	fn adds_suspension_without_losing_user_flags() {
+		let user_flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+		let policy = job_creation_flags(user_flags);
+		assert_eq!(policy.flags, user_flags | CREATE_SUSPENDED);
+		assert!(policy.resume_after_assignment);
+	}
+
+	#[test]
+	fn preserves_explicit_suspension() {
+		let user_flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
+		let policy = job_creation_flags(user_flags);
+		assert_eq!(policy.flags, user_flags);
+		assert!(!policy.resume_after_assignment);
+	}
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct JobHandle(pub HANDLE);
@@ -59,12 +119,12 @@ impl Drop for JobPort {
 /// essentially implements the "reap children" feature of Unix systems directly in Win32.
 #[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Result<JobPort> {
-	let job = JobHandle(unsafe { CreateJobObjectW(None, None) }.map_err(Error::other)?);
+	let job = OwnedHandle(unsafe { CreateJobObjectW(None, None) }.map_err(Error::other)?);
 	#[cfg(feature = "tracing")]
 	debug!(?job, "done CreateJobObjectW");
 
 	let completion_port =
-		PortHandle(unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) }?);
+		OwnedHandle(unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) }?);
 	#[cfg(feature = "tracing")]
 	debug!(?completion_port, "done CreateIoCompletionPort");
 
@@ -113,8 +173,8 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 	debug!(?job, ?process_handle, "done AssignProcessToJobObject");
 
 	Ok(JobPort {
-		job,
-		completion_port,
+		job: JobHandle(job.into_raw()),
+		completion_port: PortHandle(completion_port.into_raw()),
 	})
 }
 
@@ -127,38 +187,51 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 	#[inline]
 	unsafe fn inner(pid: u32, tool_handle: HANDLE) -> Result<()> {
 		let mut entry = THREADENTRY32 {
-			dwSize: 28,
-			cntUsage: 0,
-			th32ThreadID: 0,
-			th32OwnerProcessID: 0,
-			tpBasePri: 0,
-			tpDeltaPri: 0,
-			dwFlags: 0,
+			dwSize: std::mem::size_of::<THREADENTRY32>()
+				.try_into()
+				.expect("THREADENTRY32 size must fit in a DWORD"),
+			..Default::default()
 		};
+		unsafe { Thread32First(tool_handle, &mut entry) }.map_err(Error::other)?;
 
-		let mut res = unsafe { Thread32First(tool_handle, &mut entry) };
-		while res.is_ok() {
+		let mut resumed = false;
+		loop {
 			if entry.th32OwnerProcessID == pid {
-				let thread_handle =
-					unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) }?;
-				if unsafe { ResumeThread(thread_handle) } == u32::MAX {
-					unsafe { CloseHandle(thread_handle) }?;
+				let thread_handle = OwnedHandle(unsafe {
+					OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
+				}?);
+				let previous_count = unsafe { ResumeThread(thread_handle.0) };
+				if previous_count == u32::MAX {
 					return Err(Error::last_os_error());
 				}
-				unsafe { CloseHandle(thread_handle) }?;
+				if previous_count > 0 {
+					resumed = true;
+				}
 			}
 
-			res = unsafe { Thread32Next(tool_handle, &mut entry) };
+			match unsafe { Thread32Next(tool_handle, &mut entry) } {
+				Ok(()) => {}
+				Err(error) if error.code() == HRESULT::from_win32(ERROR_NO_MORE_FILES.0) => {
+					break;
+				}
+				Err(error) => return Err(Error::other(error)),
+			}
 		}
 
-		Ok(())
+		if resumed {
+			Ok(())
+		} else {
+			Err(Error::other("no thread belonging to the child was found"))
+		}
 	}
 
 	let child_id = unsafe { GetProcessId(child_process) };
-	let tool_handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }?;
-	let ret = unsafe { inner(child_id, tool_handle) };
-	unsafe { CloseHandle(tool_handle) }.map_err(Error::other)?;
-	ret
+	if child_id == 0 {
+		return Err(Error::last_os_error());
+	}
+
+	let tool_handle = OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }?);
+	unsafe { inner(child_id, tool_handle.0) }
 }
 
 /// Terminate a job object without waiting for the processes to exit.

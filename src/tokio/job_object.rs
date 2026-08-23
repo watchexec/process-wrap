@@ -5,12 +5,14 @@ use tokio::{process::Command, task::spawn_blocking};
 use tracing::{debug, instrument};
 use windows::Win32::{
 	Foundation::{CloseHandle, HANDLE},
-	System::Threading::CREATE_SUSPENDED,
+	System::Threading::PROCESS_CREATION_FLAGS,
 };
 
 use crate::{
 	ChildExitStatus,
-	windows::{JobPort, make_job_object, resume_threads, terminate_job, wait_on_job},
+	windows::{
+		JobPort, job_creation_flags, make_job_object, resume_threads, terminate_job, wait_on_job,
+	},
 };
 
 #[cfg(feature = "creation-flags")]
@@ -29,29 +31,40 @@ use super::{ChildWrapper, CommandWrap, CommandWrapper};
 ///
 /// This wrapper provides a child wrapper: [`JobObjectChild`].
 ///
-/// When both [`CreationFlags`] and [`JobObject`] are used together, either:
-/// - `CreationFlags` must come first, or
-/// - `CreationFlags` must include `CREATE_SUSPENDED`
+/// [`CreationFlags`] may be registered before or after `JobObject`; process-wrap preserves its flags
+/// and distinguishes explicit suspension from the temporary suspension needed for assignment.
 #[derive(Clone, Copy, Debug)]
 pub struct JobObject;
+
+fn user_creation_flags(core: &CommandWrap) -> PROCESS_CREATION_FLAGS {
+	#[cfg(feature = "creation-flags")]
+	{
+		core.get_wrap::<CreationFlags>()
+			.map_or(PROCESS_CREATION_FLAGS(0), |flags| flags.0)
+	}
+	#[cfg(not(feature = "creation-flags"))]
+	{
+		let _ = core;
+		PROCESS_CREATION_FLAGS(0)
+	}
+}
+
+fn terminate_child(child: &mut dyn ChildWrapper) {
+	let _ = child.start_kill();
+}
 
 impl CommandWrapper for JobObject {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, core: &CommandWrap) -> Result<()> {
-		let mut flags = CREATE_SUSPENDED;
-		#[cfg(feature = "creation-flags")]
-		if let Some(CreationFlags(user_flags)) = core.get_wrap::<CreationFlags>() {
-			flags |= *user_flags;
-		}
-
-		command.creation_flags(flags.0);
+		let policy = job_creation_flags(user_creation_flags(core));
+		command.creation_flags(policy.flags.0);
 		Ok(())
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
-		inner: Box<dyn ChildWrapper>,
+		mut inner: Box<dyn ChildWrapper>,
 		core: &CommandWrap,
 	) -> Result<Box<dyn ChildWrapper>> {
 		#[cfg(feature = "kill-on-drop")]
@@ -59,17 +72,12 @@ impl CommandWrapper for JobObject {
 		#[cfg(not(feature = "kill-on-drop"))]
 		let kill_on_drop = false;
 
-		#[cfg(feature = "creation-flags")]
-		let create_suspended = core
-			.get_wrap::<CreationFlags>()
-			.map_or(false, |flags| flags.0.contains(CREATE_SUSPENDED));
-		#[cfg(not(feature = "creation-flags"))]
-		let create_suspended = false;
+		let policy = job_creation_flags(user_creation_flags(core));
 
 		#[cfg(feature = "tracing")]
 		debug!(
 			?kill_on_drop,
-			?create_suspended,
+			resume_after_assignment = policy.resume_after_assignment,
 			"options from other wrappers"
 		);
 
@@ -80,11 +88,20 @@ impl CommandWrapper for JobObject {
 				.expect("child has exited but it has not even started") as _,
 		);
 
-		let job_port = make_job_object(handle, kill_on_drop)?;
+		let job_port = match make_job_object(handle, kill_on_drop) {
+			Ok(job_port) => job_port,
+			Err(error) => {
+				terminate_child(&mut *inner);
+				return Err(error);
+			}
+		};
 
-		// only resume if the user didn't specify CREATE_SUSPENDED
-		if !create_suspended {
-			resume_threads(handle)?;
+		if policy.resume_after_assignment {
+			if let Err(error) = resume_threads(handle) {
+				let _ = terminate_job(job_port.job, 1);
+				terminate_child(&mut *inner);
+				return Err(error);
+			}
 		}
 
 		Ok(Box::new(JobObjectChild::new(inner, job_port)))
