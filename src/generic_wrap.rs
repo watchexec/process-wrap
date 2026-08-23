@@ -5,6 +5,21 @@
 
 macro_rules! Wrap {
 	($command:ty, $child:ty, $childer:ident, $first_child_wrapper:expr) => {
+		trait ErasedCommandWrapper: ::std::fmt::Debug + Send + Sync {
+			fn as_command_wrapper_mut(&mut self) -> &mut dyn CommandWrapper;
+			fn as_any(&self) -> &dyn ::std::any::Any;
+		}
+
+		impl<W: CommandWrapper + 'static> ErasedCommandWrapper for W {
+			fn as_command_wrapper_mut(&mut self) -> &mut dyn CommandWrapper {
+				self
+			}
+
+			fn as_any(&self) -> &dyn ::std::any::Any {
+				self
+			}
+		}
+
 		/// A wrapper around a `Command` that allows for additional functionality to be added.
 		///
 		/// This is the core type of the `process-wrap` crate. It is a wrapper around a
@@ -12,7 +27,10 @@ macro_rules! Wrap {
 		#[derive(Debug)]
 		pub struct CommandWrap {
 			command: $command,
-			wrappers: ::indexmap::IndexMap<::std::any::TypeId, Box<dyn CommandWrapper>>,
+			wrappers: ::indexmap::IndexMap<
+				::std::any::TypeId,
+				Box<dyn ErasedCommandWrapper>,
+			>,
 		}
 
 		impl CommandWrap {
@@ -62,13 +80,14 @@ macro_rules! Wrap {
 			/// Returns `&mut self` for chaining.
 			pub fn wrap<W: CommandWrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
 				let typeid = ::std::any::TypeId::of::<W>();
-				let mut wrapper = Some(Box::new(wrapper));
-				let extant = self
-					.wrappers
-					.entry(typeid)
-					.or_insert_with(|| wrapper.take().unwrap());
+				let mut wrapper = Some(wrapper);
+				let extant = self.wrappers.entry(typeid).or_insert_with(|| {
+					Box::new(wrapper.take().unwrap()) as Box<dyn ErasedCommandWrapper>
+				});
 				if let Some(wrapper) = wrapper {
-					extant.extend(wrapper);
+					extant
+						.as_command_wrapper_mut()
+						.extend(Box::new(wrapper));
 				}
 
 				self
@@ -79,20 +98,27 @@ macro_rules! Wrap {
 			fn spawn_inner(
 				&self,
 				command: &mut $command,
-				wrappers: &mut ::indexmap::IndexMap<::std::any::TypeId, Box<dyn CommandWrapper>>,
+				wrappers: &mut ::indexmap::IndexMap<
+					::std::any::TypeId,
+					Box<dyn ErasedCommandWrapper>,
+				>,
 				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<$child>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
-				for (id, wrapper) in wrappers.iter_mut() {
+				for (_id, wrapper) in wrappers.iter_mut() {
 					#[cfg(feature = "tracing")]
-					::tracing::debug!(?id, "pre_spawn");
-					wrapper.pre_spawn(command, self)?;
+					::tracing::debug!(id = ?_id, "pre_spawn");
+					wrapper
+						.as_command_wrapper_mut()
+						.pre_spawn(command, self)?;
 				}
 
 				let mut child = spawner(command)?;
-				for (id, wrapper) in wrappers.iter_mut() {
+				for (_id, wrapper) in wrappers.iter_mut() {
 					#[cfg(feature = "tracing")]
-					::tracing::debug!(?id, "post_spawn");
-					wrapper.post_spawn(command, &mut child, self)?;
+					::tracing::debug!(id = ?_id, "post_spawn");
+					wrapper
+						.as_command_wrapper_mut()
+						.post_spawn(command, &mut child, self)?;
 				}
 
 				let mut child = Box::new(
@@ -100,10 +126,12 @@ macro_rules! Wrap {
 					$first_child_wrapper(child),
 				) as Box<dyn $childer>;
 
-				for (id, wrapper) in wrappers.iter_mut() {
+				for (_id, wrapper) in wrappers.iter_mut() {
 					#[cfg(feature = "tracing")]
-					::tracing::debug!(?id, "wrap_child");
-					child = wrapper.wrap_child(child, self)?;
+					::tracing::debug!(id = ?_id, "wrap_child");
+					child = wrapper
+						.as_command_wrapper_mut()
+						.wrap_child(child, self)?;
 				}
 
 				Ok(child)
@@ -157,11 +185,11 @@ macro_rules! Wrap {
 			/// present, use `has_wrap` instead.
 			pub fn get_wrap<W: CommandWrapper + 'static>(&self) -> Option<&W> {
 				let typeid = ::std::any::TypeId::of::<W>();
-				self.wrappers.get(&typeid).map(|w| {
-					let w_any = w as &dyn ::std::any::Any;
-					w_any
+				self.wrappers.get(&typeid).map(|wrapper| {
+					wrapper
+						.as_any()
 						.downcast_ref()
-						.expect("downcasting is guaranteed to succeed due to wrap()'s internals")
+						.expect("the wrapper key and concrete type must match")
 				})
 			}
 		}
