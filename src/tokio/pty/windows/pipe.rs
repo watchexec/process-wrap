@@ -123,3 +123,66 @@ impl PipePair {
 		(self.server, self.host)
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		fs::File,
+		io::{Read, Write},
+		os::windows::io::AsRawHandle,
+	};
+
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	use windows::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+
+	use super::*;
+
+	fn assert_not_inheritable(handle: HANDLE) {
+		let mut flags = 0;
+		// SAFETY: handle is borrowed from a live owner and flags points to initialized writable storage.
+		unsafe { GetHandleInformation(handle, &mut flags) }.unwrap();
+		assert_eq!(flags & HANDLE_FLAG_INHERIT.0, 0);
+	}
+
+	#[tokio::test]
+	async fn input_pair_has_a_synchronous_reader_and_overlapped_writer() {
+		let pair = PipePair::input().unwrap();
+		assert_not_inheritable(pair.server_handle());
+		assert_not_inheritable(HANDLE(pair.host.as_raw_handle()));
+		let (server, mut host) = pair.into_parts();
+
+		let reader = std::thread::spawn(move || {
+			let mut server = File::from(server);
+			let mut bytes = [0; 4];
+			server.read_exact(&mut bytes).unwrap();
+			bytes
+		});
+		host.write_all(b"ping").await.unwrap();
+		host.shutdown().await.unwrap();
+		assert_eq!(reader.join().unwrap(), *b"ping");
+	}
+
+	#[tokio::test]
+	async fn output_pair_has_a_synchronous_writer_and_overlapped_reader() {
+		let pair = PipePair::output().unwrap();
+		assert_not_inheritable(pair.server_handle());
+		assert_not_inheritable(HANDLE(pair.host.as_raw_handle()));
+		let (server, mut host) = pair.into_parts();
+
+		let writer = std::thread::spawn(move || {
+			let mut server = File::from(server);
+			server.write_all(b"pong").unwrap();
+		});
+		let mut bytes = [0; 4];
+		host.read_exact(&mut bytes).await.unwrap();
+		writer.join().unwrap();
+		assert_eq!(bytes, *b"pong");
+	}
+
+	#[tokio::test]
+	async fn pipe_names_are_unique_across_live_pairs() {
+		let first = PipePair::input().unwrap();
+		let second = PipePair::input().unwrap();
+		assert_ne!(first.server.as_raw_handle(), second.server.as_raw_handle());
+	}
+}
