@@ -165,3 +165,115 @@ fn query_directory(mut query: impl FnMut(Option<&mut [u16]>) -> u32) -> io::Resu
 		buffer.resize(length as usize + 1, 0);
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		fs::File,
+		os::windows::ffi::{OsStrExt, OsStringExt},
+	};
+
+	use tempfile::tempdir;
+
+	use super::*;
+	use crate::tokio::pty::EnvironmentIntent;
+
+	fn intent(program: impl Into<OsString>) -> CommandIntent {
+		CommandIntent {
+			program: program.into(),
+			args: Vec::new(),
+			environment: EnvironmentIntent {
+				clear: false,
+				changes: Vec::new(),
+			},
+			current_dir: None,
+		}
+	}
+
+	fn units(path: &OsStr) -> Vec<u16> {
+		path.encode_wide().chain([0]).collect()
+	}
+
+	#[test]
+	fn preserves_explicit_executable_paths_and_wtf16() {
+		let current = env::current_exe().unwrap();
+		let resolved = resolve(&intent(current.as_os_str())).unwrap();
+		assert_eq!(resolved.as_units(), units(current.as_os_str()));
+
+		let raw = OsString::from_wide(&[
+			b'C' as u16,
+			b':' as u16,
+			b'\\' as u16,
+			0xd800,
+			b'.' as u16,
+			b'e' as u16,
+			b'x' as u16,
+			b'e' as u16,
+		]);
+		let resolved = resolve(&intent(raw.clone())).unwrap();
+		assert_eq!(resolved.as_units(), units(&raw));
+	}
+
+	#[test]
+	fn searches_the_application_and_system_directories() {
+		let current = env::current_exe().unwrap();
+		let file_name = current.file_name().unwrap().to_os_string();
+		let resolved = resolve(&intent(file_name)).unwrap();
+		assert_eq!(resolved.as_units(), units(current.as_os_str()));
+
+		let command = resolve(&intent("cmd")).unwrap();
+		let command = PathBuf::from(OsString::from_wide(
+			&command.as_units()[..command.as_units().len() - 1],
+		));
+		assert!(command.exists());
+		assert!(
+			command
+				.file_name()
+				.unwrap()
+				.to_string_lossy()
+				.eq_ignore_ascii_case("cmd.exe")
+		);
+	}
+
+	#[test]
+	fn searches_the_explicit_child_path_case_insensitively() {
+		let directory = tempdir().unwrap();
+		let executable = directory.path().join("tracked.exe");
+		File::create(&executable).unwrap();
+		let mut intent = intent("tracked");
+		intent.environment.changes.push(EnvChange::Set(
+			OsString::from("Path"),
+			directory.path().as_os_str().to_os_string(),
+		));
+
+		let resolved = resolve(&intent).unwrap();
+		assert_eq!(resolved.as_units(), units(executable.as_os_str()));
+	}
+
+	#[test]
+	fn appends_exe_to_an_existing_direct_path() {
+		let directory = tempdir().unwrap();
+		let requested = directory.path().join("direct");
+		let executable = directory.path().join("direct.exe");
+		File::create(&executable).unwrap();
+
+		let resolved = resolve(&intent(requested.as_os_str())).unwrap();
+		assert_eq!(resolved.as_units(), units(executable.as_os_str()));
+	}
+
+	#[test]
+	fn rejects_batch_files_and_missing_bare_programs() {
+		for program in ["script.bat", "SCRIPT.CMD"] {
+			let error = resolve(&intent(program)).unwrap_err();
+			assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+			assert_eq!(
+				error.to_string(),
+				"Windows PTY spawning does not execute batch scripts directly"
+			);
+		}
+
+		let error = resolve(&intent("process-wrap-definitely-missing-program")).unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::NotFound);
+		assert_eq!(error.to_string(), "PTY program not found");
+	}
+}
