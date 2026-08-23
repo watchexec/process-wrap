@@ -24,6 +24,7 @@ fn nowrap() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(feature = "job-object")]
 #[test]
 fn job_object() -> Result<()> {
 	let mut child = CommandWrap::with_new("findstr", |command| {

@@ -12,6 +12,7 @@ fn nowrap() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(feature = "job-object")]
 #[test]
 fn job_object() -> Result<()> {
 	let child = CommandWrap::with_new("powershell.exe", |command| {

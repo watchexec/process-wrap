@@ -32,6 +32,7 @@ async fn nowrap() -> Result<()> {
 	assert_exits(child.as_mut()).await
 }
 
+#[cfg(feature = "job-object")]
 #[tokio::test]
 async fn job_object() -> Result<()> {
 	let mut child = command().wrap(JobObject).spawn()?;

@@ -32,6 +32,7 @@ fn nowrap() -> Result<()> {
 	assert_exits(child.as_mut())
 }
 
+#[cfg(feature = "job-object")]
 #[test]
 fn job_object() -> Result<()> {
 	let mut child = command().wrap(JobObject).spawn()?;

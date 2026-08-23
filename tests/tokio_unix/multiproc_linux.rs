@@ -2,6 +2,7 @@
 
 use super::prelude::*;
 
+#[cfg(all(feature = "kill-on-drop", feature = "process-group"))]
 #[tokio::test]
 async fn process_group_kill_leader() -> Result<()> {
 	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
@@ -45,6 +46,7 @@ async fn process_group_kill_leader() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(all(feature = "kill-on-drop", feature = "process-group"))]
 #[tokio::test]
 async fn process_group_kill_group() -> Result<()> {
 	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
@@ -89,6 +91,7 @@ async fn process_group_kill_group() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
 #[tokio::test]
 async fn process_session_kill_leader() -> Result<()> {
 	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
@@ -132,6 +135,7 @@ async fn process_session_kill_leader() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
 #[tokio::test]
 async fn process_session_kill_group() -> Result<()> {
 	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {

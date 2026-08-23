@@ -12,6 +12,7 @@ fn nowrap() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(feature = "process-group")]
 #[test]
 fn process_group() -> Result<()> {
 	let child = CommandWrap::with_new("echo", |command| {
@@ -25,6 +26,7 @@ fn process_group() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(feature = "process-session")]
 #[test]
 fn process_session() -> Result<()> {
 	let child = CommandWrap::with_new("echo", |command| {
