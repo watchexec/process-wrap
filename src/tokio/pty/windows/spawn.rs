@@ -13,28 +13,25 @@ use windows::{
 		System::Threading::{
 			CREATE_UNICODE_ENVIRONMENT, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
 			GetCurrentProcess, GetProcessIdOfThread, INFINITE, OpenProcess, PROCESS_INFORMATION,
-			PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, STARTUPINFOEXW, TerminateProcess,
-			WaitForSingleObject,
+			PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+			TerminateProcess, WaitForSingleObject,
 		},
 	},
 	core::{PCWSTR, PWSTR},
 };
 
 use super::{
-	PreparedWindowsCommand, attributes::AttributeList, child::ConPtyChild, console::Release,
+	PreparedWindowsCommand, attributes::AttributeList, child::ConPtyChild,
 	environment::PreparedEnvironment,
 };
 
 pub(super) fn spawn(
 	mut command: PreparedWindowsCommand,
 	attributes: &AttributeList,
-	release: Release,
 	input_server: OwnedHandle,
 	output_server: OwnedHandle,
 ) -> io::Result<SpawnedChild> {
-	let mut startup = STARTUPINFOEXW::default();
-	startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-	startup.lpAttributeList = attributes.as_ptr();
+	let startup = startup_info(attributes);
 
 	let mut flags = command.creation.spawn_flags | EXTENDED_STARTUPINFO_PRESENT;
 	let environment = match &command.environment {
@@ -52,7 +49,9 @@ pub(super) fn spawn(
 
 	// SAFETY: every pointer references live, NUL-terminated or explicitly bounded storage for the
 	// duration of the call. The command line is uniquely mutable, the startup attribute list owns its
-	// aligned backing storage, no handles are inherited, and information is writable output storage.
+	// aligned backing storage, no handles are inherited, and STARTF_USESTDHANDLES with three null slots
+	// asks ConPTY to install its console handles. The process-information value is writable output
+	// storage.
 	let created = unsafe {
 		CreateProcessW(
 			PCWSTR(command.application_name.as_ptr()),
@@ -75,8 +74,19 @@ pub(super) fn spawn(
 
 	let handles = SpawnedProcess::new(information)?;
 	let cleanup = handles.cleanup()?;
-	let child = handles.into_child(command.creation.kill_on_drop, release)?;
+	let child = handles.into_child(command.creation.kill_on_drop);
 	Ok(SpawnedChild { child, cleanup })
+}
+
+fn startup_info(attributes: &AttributeList) -> STARTUPINFOEXW {
+	let mut startup = STARTUPINFOEXW::default();
+	startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+	startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+	startup.StartupInfo.hStdInput = HANDLE::default();
+	startup.StartupInfo.hStdOutput = HANDLE::default();
+	startup.StartupInfo.hStdError = HANDLE::default();
+	startup.lpAttributeList = attributes.as_ptr();
+	startup
 }
 
 pub(super) struct SpawnedChild {
@@ -138,7 +148,7 @@ impl SpawnedProcess {
 		})
 	}
 
-	fn into_child(mut self, kill_on_drop: bool, release: Release) -> io::Result<ConPtyChild> {
+	fn into_child(mut self, kill_on_drop: bool) -> ConPtyChild {
 		let process = self
 			.process
 			.take()
@@ -147,7 +157,7 @@ impl SpawnedProcess {
 			.primary_thread
 			.take()
 			.expect("a spawned process guard must own its primary-thread handle");
-		ConPtyChild::new(process, primary_thread, self.pid, kill_on_drop, release)
+		ConPtyChild::new(process, primary_thread, self.pid, kill_on_drop)
 	}
 }
 
@@ -223,4 +233,21 @@ fn win32_io_error(error: windows::core::Error) -> io::Error {
 	WIN32_ERROR::from_error(&error)
 		.and_then(|error| i32::try_from(error.0).ok())
 		.map_or_else(|| io::Error::other(error), io::Error::from_raw_os_error)
+}
+
+#[cfg(test)]
+mod tests {
+	use windows::Win32::System::Console::HPCON;
+
+	use super::*;
+
+	#[test]
+	fn requests_conpty_replacement_for_all_standard_handles() {
+		let attributes = AttributeList::new(HPCON(42)).unwrap();
+		let startup = startup_info(&attributes);
+		assert_eq!(startup.StartupInfo.dwFlags, STARTF_USESTDHANDLES);
+		assert_eq!(startup.StartupInfo.hStdInput, HANDLE::default());
+		assert_eq!(startup.StartupInfo.hStdOutput, HANDLE::default());
+		assert_eq!(startup.StartupInfo.hStdError, HANDLE::default());
+	}
 }

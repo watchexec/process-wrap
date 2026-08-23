@@ -28,8 +28,6 @@ use windows::Win32::{
 
 use crate::{ChildExitStatus, tokio::ChildWrapper};
 
-use super::console::Release;
-
 #[derive(Debug)]
 pub(super) struct ConPtyChild {
 	process: OwnedHandle,
@@ -50,28 +48,18 @@ impl ConPtyChild {
 		primary_thread: OwnedHandle,
 		pid: u32,
 		kill_on_drop: bool,
-		release: Release,
-	) -> io::Result<Self> {
-		let wait_process = duplicate_handle(&process)?;
-		let wait_task = spawn_blocking(move || {
-			let status = process_status(HANDLE(wait_process.as_raw_handle()), INFINITE)?
-				.ok_or_else(|| {
-					io::Error::other("infinite process wait returned without an exit status")
-				})?;
-			let _ = release.release();
-			Ok(status)
-		});
-		Ok(Self {
+	) -> Self {
+		Self {
 			process,
 			primary_thread: Some(primary_thread),
 			pid,
 			kill_on_drop,
 			exit_status: ChildExitStatus::Running,
-			wait_task: Some(wait_task),
+			wait_task: None,
 			stdin: None,
 			stdout: None,
 			stderr: None,
-		})
+		}
 	}
 
 	#[cfg(test)]

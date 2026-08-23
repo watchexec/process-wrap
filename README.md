@@ -125,10 +125,10 @@ Child waiting and PTY draining are independent. On most supported Unix systems, 
 retain the slave after the direct child exits. On macOS, drain output concurrently with waiting: the
 kernel drains queued output as the session leader exits, then revokes the controlling terminal from
 its descendants. Windows descendants can remain attached to the pseudoconsole after the direct child
-exits; process-wrap releases application ownership when the direct child exits, so output then reaches
-EOF naturally once every client disconnects. Final pseudoconsole cleanup runs away from the Tokio
-reactor. The transport passes terminal bytes through without owning parent-terminal raw mode, relays,
-key handling, VT parsing, scrollback, or pager policy.
+exits; process-wrap releases ConPTY's startup reference after child setup, so output reaches EOF
+naturally once every client disconnects. Final pseudoconsole cleanup runs away from the Tokio reactor.
+The transport passes terminal bytes through without owning parent-terminal raw mode, relays, key
+handling, VT parsing, scrollback, or pager policy.
 
 A bare Unix PTY creates the required session. `ProcessGroup::leader()` and `ProcessSession` each
 preserve their group-aware child supervision when used individually; `ProcessGroup::attach_to(...)`

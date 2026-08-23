@@ -440,9 +440,9 @@ impl AsyncWrite for PtyInput {
 /// This is a strong owner of the shared terminal. On most supported Unix systems, output EOF means
 /// that every slave descriptor has closed and a descendant may retain the slave after the direct
 /// child exits. On macOS, drain output concurrently with waiting: session-leader exit drains queued
-/// output and then revokes the controlling terminal from its descendants. On Windows, application
-/// ownership of the pseudoconsole is released when the direct child exits, and its output pipe closes
-/// once every attached client disconnects.
+/// output and then revokes the controlling terminal from its descendants. On Windows, ConPTY's
+/// startup reference is released after child setup, and its output pipe closes once every attached
+/// client disconnects.
 #[derive(Debug)]
 pub struct PtyOutput {
 	inner: imp::Output,

@@ -35,8 +35,7 @@ pub(in crate::tokio::pty) fn spawn(
 	let spawned = catch_unwind(AssertUnwindSafe(|| {
 		let cleanup = &mut cleanup;
 		command.command.spawn_with_child(move |_inner| {
-			let spawned =
-				process::spawn(prepared, &attributes, release, input_server, output_server)?;
+			let spawned = process::spawn(prepared, &attributes, input_server, output_server)?;
 			*cleanup = Some(spawned.cleanup);
 			Ok(Box::new(spawned.child) as Box<dyn ChildWrapper>)
 		})
@@ -54,6 +53,11 @@ pub(in crate::tokio::pty) fn spawn(
 			resume_unwind(payload);
 		}
 	};
+	if let Err(error) = release.release() {
+		let _ = child.start_kill();
+		drop(cleanup.take());
+		return Err(error);
+	}
 	let (input, output, resize) = match controller::controller(console, input_host, output_host) {
 		Ok(controller) => controller,
 		Err(error) => {

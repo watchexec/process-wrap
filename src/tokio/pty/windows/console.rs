@@ -93,14 +93,13 @@ impl PseudoConsole {
 			.lifecycle
 			.lock()
 			.unwrap_or_else(|poison| poison.into_inner());
-		if lifecycle.released || lifecycle.closed {
+		if lifecycle.closed {
 			return Err(io::Error::new(
 				io::ErrorKind::BrokenPipe,
-				"the pseudo-console is no longer application-owned",
+				"the pseudo-console is closed",
 			));
 		}
-		// SAFETY: the application still owns this live pseudo-console and the resolved function has
-		// the documented ABI.
+		// SAFETY: this is a live pseudo-console and the resolved function has the documented ABI.
 		unsafe { (self.state.api.resize)(self.state.handle, coordinate(size)?) }
 			.ok()
 			.map_err(io::Error::other)
@@ -344,6 +343,11 @@ mod tests {
 		console.release().unwrap();
 		console.release().unwrap();
 		assert_eq!(RELEASE_COUNT.load(Ordering::SeqCst), 1);
+		console.resize(PtySize::new(41, 121).unwrap()).unwrap();
+		assert_eq!(
+			RESIZE_SIZE.load(Ordering::SeqCst),
+			pack(COORD { X: 121, Y: 41 })
+		);
 
 		drop(console);
 		wait_for(|| CLOSE_COUNT.load(Ordering::SeqCst) == 1);
