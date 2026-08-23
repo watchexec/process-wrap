@@ -61,7 +61,7 @@ pub(super) fn prepare_command_line(intent: &CommandIntent) -> io::Result<Prepare
 	})
 }
 
-fn encode(value: &OsStr, field: &'static str) -> io::Result<Vec<u16>> {
+pub(super) fn encode(value: &OsStr, field: &'static str) -> io::Result<Vec<u16>> {
 	let units = value.encode_wide().collect::<Vec<_>>();
 	if units.contains(&0) {
 		return Err(io::Error::new(
