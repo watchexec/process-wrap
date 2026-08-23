@@ -14,9 +14,9 @@ use super::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct EnvironmentVariable {
-	key: Vec<u16>,
-	value: Vec<u16>,
+pub(super) struct EnvironmentVariable {
+	pub(super) key: Vec<u16>,
+	pub(super) value: Vec<u16>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -42,7 +42,7 @@ pub(super) fn prepare_environment(intent: &EnvironmentIntent) -> io::Result<Prep
 	prepare_environment_with(intent, inherited_environment)
 }
 
-fn prepare_environment_with(
+pub(super) fn prepare_environment_with(
 	intent: &EnvironmentIntent,
 	capture: impl FnOnce() -> io::Result<Vec<EnvironmentVariable>>,
 ) -> io::Result<PreparedEnvironment> {

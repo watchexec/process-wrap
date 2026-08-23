@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::any::{TypeId, type_name};
 use std::{
 	ffi::{OsStr, OsString},
 	io,
@@ -164,6 +166,13 @@ struct CommandIntent {
 	current_dir: Option<OsString>,
 }
 
+#[cfg(windows)]
+#[derive(Debug)]
+struct WrapperRegistration {
+	type_id: TypeId,
+	type_name: &'static str,
+}
+
 impl CommandIntent {
 	fn command(&self) -> tokio::process::Command {
 		let mut command = tokio::process::Command::new(&self.program);
@@ -221,6 +230,8 @@ impl CommandWrapper for PtyMarker {}
 pub struct PtyCommand {
 	command: CommandWrap,
 	intent: CommandIntent,
+	#[cfg(windows)]
+	wrappers: Vec<WrapperRegistration>,
 }
 
 impl PtyCommand {
@@ -238,6 +249,8 @@ impl PtyCommand {
 				},
 				current_dir: None,
 			},
+			#[cfg(windows)]
+			wrappers: Vec::new(),
 		}
 	}
 
@@ -329,6 +342,16 @@ impl PtyCommand {
 	/// incompatible with a new PTY session, and explicitly registering both group and session
 	/// wrappers is ambiguous; spawning returns [`io::ErrorKind::InvalidInput`] in either case.
 	pub fn wrap<W: CommandWrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
+		#[cfg(windows)]
+		{
+			let type_id = TypeId::of::<W>();
+			if !self.wrappers.iter().any(|known| known.type_id == type_id) {
+				self.wrappers.push(WrapperRegistration {
+					type_id,
+					type_name: type_name::<W>(),
+				});
+			}
+		}
 		self.command.wrap(wrapper);
 		self
 	}

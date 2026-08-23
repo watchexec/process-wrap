@@ -17,6 +17,10 @@ impl WideCString {
 		Self(units)
 	}
 
+	pub(super) fn from_os(value: &OsStr, field: &'static str) -> io::Result<Self> {
+		Ok(Self::from_units(encode(value, field)?))
+	}
+
 	pub(super) fn as_ptr(&self) -> *const u16 {
 		self.0.as_ptr()
 	}
