@@ -17,7 +17,7 @@
 use std::any::TypeId;
 #[cfg(feature = "reset-sigmask")]
 use std::os::unix::process::ExitStatusExt;
-use std::{io, time::Duration};
+use std::{io, process::ExitStatus, time::Duration};
 
 #[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
 use nix::{
@@ -31,15 +31,28 @@ use process_wrap::tokio::KillOnDrop;
 use process_wrap::tokio::ProcessSession;
 #[cfg(feature = "reset-sigmask")]
 use process_wrap::tokio::ResetSigmask;
+use process_wrap::tokio::{ChildWrapper, PtyCommand, PtyOptions, PtyOutput, PtySize};
 #[cfg(feature = "process-group")]
 use process_wrap::tokio::{ProcessGroup, ProcessGroupChild};
-use process_wrap::tokio::{PtyCommand, PtyOptions, PtySize};
 #[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	time::{sleep, timeout},
 };
+
+async fn wait_and_drain(
+	child: &mut dyn ChildWrapper,
+	output: &mut PtyOutput,
+) -> io::Result<(ExitStatus, Vec<u8>)> {
+	let mut bytes = Vec::new();
+	let status = timeout(Duration::from_secs(5), async {
+		let (status, _) = tokio::try_join!(child.wait(), output.read_to_end(&mut bytes))?;
+		Ok::<_, io::Error>(status)
+	})
+	.await??;
+	Ok((status, bytes))
+}
 
 #[tokio::test]
 async fn spawns_with_terminal_fds_and_merged_output() -> io::Result<()> {
@@ -52,11 +65,8 @@ async fn spawns_with_terminal_fds_and_merged_output() -> io::Result<()> {
 	let (mut child, controller) = command.spawn(PtyOptions::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
-	let status = timeout(Duration::from_secs(5), child.wait()).await??;
+	let (status, bytes) = wait_and_drain(child.as_mut(), &mut output).await?;
 	assert!(status.success());
-
-	let mut bytes = Vec::new();
-	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
 	assert_eq!(bytes, b"stdin-ttystdout-ttystderr-ttystdoutstderr");
 	Ok(())
 }
@@ -110,14 +120,8 @@ async fn preserves_tracked_command_intent() -> io::Result<()> {
 	let (mut child, controller) = command.spawn(PtyOptions::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
-	assert!(
-		timeout(Duration::from_secs(5), child.wait())
-			.await??
-			.success()
-	);
-
-	let mut bytes = Vec::new();
-	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	let (status, bytes) = wait_and_drain(child.as_mut(), &mut output).await?;
+	assert!(status.success());
 	assert_eq!(
 		String::from_utf8(bytes).unwrap(),
 		format!(
@@ -224,6 +228,7 @@ async fn dropping_output_does_not_hang_up_while_input_exists() -> io::Result<()>
 	Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
 async fn direct_child_wait_is_independent_from_descendant_output_eof() -> io::Result<()> {
 	struct ReleaseOnDrop(std::path::PathBuf);
@@ -281,13 +286,8 @@ async fn failed_spawn_leaves_command_reusable() -> io::Result<()> {
 	let (mut child, controller) = command.spawn(PtyOptions::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
-	assert!(
-		timeout(Duration::from_secs(5), child.wait())
-			.await??
-			.success()
-	);
-	let mut bytes = Vec::new();
-	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	let (status, bytes) = wait_and_drain(child.as_mut(), &mut output).await?;
+	assert!(status.success());
 	assert_eq!(bytes, b"reused");
 	Ok(())
 }
@@ -390,13 +390,8 @@ async fn process_group_composes_when_registered_after_first_spawn() -> io::Resul
 	let (mut child, controller) = command.spawn(PtyOptions::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
-	assert!(
-		timeout(Duration::from_secs(5), child.wait())
-			.await??
-			.success()
-	);
-	let mut bytes = Vec::new();
-	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	let (status, bytes) = wait_and_drain(child.as_mut(), &mut output).await?;
+	assert!(status.success());
 	assert_eq!(bytes, b"reused");
 
 	command.wrap(ProcessGroup::leader());
@@ -404,13 +399,8 @@ async fn process_group_composes_when_registered_after_first_spawn() -> io::Resul
 	assert_eq!(child.as_ref().type_id(), TypeId::of::<ProcessGroupChild>());
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
-	assert!(
-		timeout(Duration::from_secs(5), child.wait())
-			.await??
-			.success()
-	);
-	bytes.clear();
-	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	let (status, bytes) = wait_and_drain(child.as_mut(), &mut output).await?;
+	assert!(status.success());
 	assert_eq!(bytes, b"reused");
 	Ok(())
 }
@@ -515,14 +505,16 @@ impl Drop for KillPid {
 async fn kill_on_drop_remains_direct_child_only_with_a_pty_session() -> io::Result<()> {
 	let directory = tempfile::tempdir()?;
 	let ready = directory.path().join("descendant-ready");
+	let acknowledged = directory.path().join("descendant-acknowledged");
 	let mut command = PtyCommand::new("sh");
 	command
 		.args([
 			"-c",
-			r#"stty -echo; trap '' HUP; (trap '' HUP; trap 'printf "descendant-alive\n"; exit 0' USR1; : > "$1"; while :; do sleep 1; done) & printf '%s:%s\n' "$$" "$!"; wait"#,
+			r#"stty -echo; trap '' HUP; (trap '' HUP; trap ': > "$2"; exit 0' USR1; : > "$1"; while :; do sleep 1; done) & printf '%s:%s\n' "$$" "$!"; wait"#,
 			"pty-test",
 		])
 		.arg(&ready)
+		.arg(&acknowledged)
 		.wrap(ProcessSession)
 		.wrap(KillOnDrop);
 	let (child, controller) = command.spawn(PtyOptions::default())?;
@@ -557,11 +549,13 @@ async fn kill_on_drop_remains_direct_child_only_with_a_pty_session() -> io::Resu
 	direct_cleanup.disarm();
 
 	kill(descendant, Signal::SIGUSR1)?;
-	line.clear();
-	timeout(Duration::from_secs(5), output.read_line(&mut line)).await??;
-	assert_eq!(line.trim(), "descendant-alive");
-	let mut bytes = Vec::new();
-	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	timeout(Duration::from_secs(5), async {
+		while !acknowledged.exists() {
+			sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("descendant did not acknowledge its signal");
 	timeout(Duration::from_secs(5), async {
 		while pid_alive(descendant) {
 			sleep(Duration::from_millis(10)).await;

@@ -375,9 +375,10 @@ impl AsyncWrite for PtyInput {
 
 /// The asynchronous merged output side of a pseudo-terminal.
 ///
-/// This is a strong owner of the shared bidirectional PTY master. Output EOF means that every slave
-/// descriptor has closed; it is independent from waiting for the direct child because a descendant
-/// may retain the slave after that child exits.
+/// This is a strong owner of the shared bidirectional PTY master. On most supported Unix systems,
+/// output EOF means that every slave descriptor has closed and a descendant may retain the slave
+/// after the direct child exits. On macOS, drain output concurrently with waiting: session-leader
+/// exit drains queued output and then revokes the controlling terminal from its descendants.
 #[derive(Debug)]
 pub struct PtyOutput {
 	inner: imp::Output,
@@ -420,7 +421,9 @@ impl PtyResize {
 /// or pager policy in this transport.
 ///
 /// Process supervision and PTY draining are separate lifecycles. Waiting for the direct child does
-/// not imply output EOF, because descendants can retain slave descriptors.
+/// not imply output EOF on most supported Unix systems, because descendants can retain slave
+/// descriptors. On macOS, drive waiting and draining concurrently because session-leader exit waits
+/// for queued output before revoking the controlling terminal.
 #[derive(Debug)]
 pub struct PtyController {
 	input: PtyInput,

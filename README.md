@@ -118,8 +118,10 @@ terminal hangs up after both are gone; `PtyResize` is weak and cannot keep it al
 terminal's VEOF character when that is the desired terminal policy rather than expecting a separate
 input half-close or clonable force-close handle.
 
-Child waiting and PTY draining are independent: descendants can retain the slave after the direct
-child exits. The transport passes terminal bytes through without owning parent-terminal raw mode,
+Child waiting and PTY draining are independent. On most supported Unix systems, descendants can retain
+the slave after the direct child exits. On macOS, drain output concurrently with waiting: the kernel
+drains queued output as the session leader exits, then revokes the controlling terminal from its
+descendants. The transport passes terminal bytes through without owning parent-terminal raw mode,
 relays, key handling, VT parsing, scrollback, or pager policy.
 
 A bare PTY creates the required session. `ProcessGroup::leader()` and `ProcessSession` each preserve
