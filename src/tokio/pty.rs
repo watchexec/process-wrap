@@ -347,7 +347,7 @@ impl PtyCommand {
 	/// When Windows PTY spawning is supported, its backend accepts only the exact built-in
 	/// `CreationFlags`, `JobObject`, and `KillOnDrop` wrapper types whose crate features are enabled.
 	/// Any other command wrapper causes spawning to return [`io::ErrorKind::InvalidInput`] before
-	/// command hooks run.
+	/// spawn-time hooks (`pre_spawn`, `post_spawn`, and `wrap_child`) run.
 	pub fn wrap<W: CommandWrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
 		#[cfg(windows)]
 		{
