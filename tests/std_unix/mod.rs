@@ -1,6 +1,11 @@
 mod prelude {
+	#[cfg(all(
+		target_os = "linux",
+		any(feature = "process-group", feature = "process-session")
+	))]
+	pub use std::io::{BufRead, BufReader};
 	pub use std::{
-		io::{BufRead, BufReader, Read, Result, Write},
+		io::{Read, Result, Write},
 		os::unix::process::ExitStatusExt,
 		process::Stdio,
 		thread::sleep,
@@ -12,6 +17,10 @@ mod prelude {
 
 	pub const DIE_TIME: Duration = Duration::from_millis(100);
 
+	#[cfg(all(
+		target_os = "linux",
+		any(feature = "process-group", feature = "process-session")
+	))]
 	#[track_caller]
 	pub fn pid_alive(pid: i32) -> bool {
 		#[inline]

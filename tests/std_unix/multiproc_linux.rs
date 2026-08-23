@@ -1,4 +1,7 @@
-#![cfg(target_os = "linux")]
+#![cfg(all(
+	target_os = "linux",
+	any(feature = "process-group", feature = "process-session")
+))]
 
 use super::prelude::*;
 
