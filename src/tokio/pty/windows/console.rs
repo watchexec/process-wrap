@@ -22,6 +22,7 @@ use super::{
 pub(super) struct PseudoConsole {
 	handle: HPCON,
 	api: &'static ConPtyApi,
+	released: bool,
 }
 
 impl PseudoConsole {
@@ -46,11 +47,27 @@ impl PseudoConsole {
 				"CreatePseudoConsole returned an invalid handle",
 			));
 		}
-		Ok(Self { handle, api })
+		Ok(Self {
+			handle,
+			api,
+			released: false,
+		})
 	}
 
 	pub(super) fn handle(&self) -> HPCON {
 		self.handle
+	}
+
+	pub(super) fn release(&mut self) -> io::Result<()> {
+		if self.released {
+			return Ok(());
+		}
+		// SAFETY: self owns a live pseudo-console and the resolved function has the documented ABI.
+		unsafe { (self.api.release)(self.handle) }
+			.ok()
+			.map_err(io::Error::other)?;
+		self.released = true;
+		Ok(())
 	}
 
 	pub(super) fn resize(&self, size: PtySize) -> io::Result<()> {
@@ -139,6 +156,7 @@ mod tests {
 	static CREATE_SIZE: AtomicU32 = AtomicU32::new(0);
 	static CREATE_FLAGS: AtomicU32 = AtomicU32::new(u32::MAX);
 	static RESIZE_SIZE: AtomicU32 = AtomicU32::new(0);
+	static RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
 	static BLOCK_CLOSE: AtomicBool = AtomicBool::new(false);
 	static CLOSE_STARTED: AtomicBool = AtomicBool::new(false);
 	static CLOSE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -162,6 +180,11 @@ mod tests {
 		HRESULT(0)
 	}
 
+	unsafe extern "system" fn release(_pseudo_console: HPCON) -> HRESULT {
+		RELEASE_COUNT.fetch_add(1, Ordering::SeqCst);
+		HRESULT(0)
+	}
+
 	unsafe extern "system" fn close(_pseudo_console: HPCON) {
 		CLOSE_STARTED.store(true, Ordering::SeqCst);
 		for _ in 0..1_000 {
@@ -176,6 +199,7 @@ mod tests {
 	static TEST_API: ConPtyApi = ConPtyApi {
 		create,
 		resize,
+		release,
 		close,
 	};
 
@@ -194,6 +218,7 @@ mod tests {
 	}
 
 	fn reset_close() {
+		RELEASE_COUNT.store(0, Ordering::SeqCst);
 		BLOCK_CLOSE.store(false, Ordering::SeqCst);
 		CLOSE_STARTED.store(false, Ordering::SeqCst);
 		CLOSE_COUNT.store(0, Ordering::SeqCst);
@@ -239,7 +264,7 @@ mod tests {
 		CREATE_FLAGS.store(u32::MAX, Ordering::SeqCst);
 		RESIZE_SIZE.store(0, Ordering::SeqCst);
 
-		let console = PseudoConsole::create_with(
+		let mut console = PseudoConsole::create_with(
 			&TEST_API,
 			PtySize::new(25, 81).unwrap(),
 			HANDLE(1usize as _),
@@ -257,6 +282,9 @@ mod tests {
 			RESIZE_SIZE.load(Ordering::SeqCst),
 			pack(COORD { X: 120, Y: 40 })
 		);
+		console.release().unwrap();
+		console.release().unwrap();
+		assert_eq!(RELEASE_COUNT.load(Ordering::SeqCst), 1);
 
 		drop(console);
 		wait_for(|| CLOSE_COUNT.load(Ordering::SeqCst) == 1);
@@ -270,6 +298,7 @@ mod tests {
 		let console = PseudoConsole {
 			handle: HPCON(42),
 			api: &TEST_API,
+			released: false,
 		};
 
 		let started = Instant::now();

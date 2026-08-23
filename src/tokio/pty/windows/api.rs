@@ -19,12 +19,14 @@ use windows::{
 pub(super) type CreatePseudoConsole =
 	unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT;
 pub(super) type ResizePseudoConsole = unsafe extern "system" fn(HPCON, COORD) -> HRESULT;
+pub(super) type ReleasePseudoConsole = unsafe extern "system" fn(HPCON) -> HRESULT;
 pub(super) type ClosePseudoConsole = unsafe extern "system" fn(HPCON);
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ConPtyApi {
 	pub(super) create: CreatePseudoConsole,
 	pub(super) resize: ResizePseudoConsole,
+	pub(super) release: ReleasePseudoConsole,
 	pub(super) close: ClosePseudoConsole,
 }
 
@@ -48,6 +50,7 @@ fn resolve() -> Option<ConPtyApi> {
 fn resolve_with(mut lookup: impl FnMut(&CStr) -> FARPROC) -> Option<ConPtyApi> {
 	let create = lookup(c"CreatePseudoConsole")?;
 	let resize = lookup(c"ResizePseudoConsole")?;
+	let release = lookup(c"ReleasePseudoConsole")?;
 	let close = lookup(c"ClosePseudoConsole")?;
 
 	// SAFETY: each address was resolved under the matching exported function name. Win32 function
@@ -60,6 +63,10 @@ fn resolve_with(mut lookup: impl FnMut(&CStr) -> FARPROC) -> Option<ConPtyApi> {
 			resize: std::mem::transmute::<unsafe extern "system" fn() -> isize, ResizePseudoConsole>(
 				resize,
 			),
+			release: std::mem::transmute::<
+				unsafe extern "system" fn() -> isize,
+				ReleasePseudoConsole,
+			>(release),
 			close: std::mem::transmute::<unsafe extern "system" fn() -> isize, ClosePseudoConsole>(
 				close,
 			),
@@ -85,6 +92,10 @@ mod tests {
 		HRESULT(0)
 	}
 
+	unsafe extern "system" fn release(_pseudo_console: HPCON) -> HRESULT {
+		HRESULT(0)
+	}
+
 	unsafe extern "system" fn close(_pseudo_console: HPCON) {}
 
 	fn create_proc() -> FARPROC {
@@ -101,6 +112,15 @@ mod tests {
 		})
 	}
 
+	fn release_proc() -> FARPROC {
+		// SAFETY: tests erase this pointer only so resolve_with can restore its original signature.
+		Some(unsafe {
+			std::mem::transmute::<ReleasePseudoConsole, unsafe extern "system" fn() -> isize>(
+				release,
+			)
+		})
+	}
+
 	fn close_proc() -> FARPROC {
 		// SAFETY: tests erase this pointer only so resolve_with can restore its original signature.
 		Some(unsafe {
@@ -112,13 +132,14 @@ mod tests {
 		match name.to_bytes() {
 			b"CreatePseudoConsole" => create_proc(),
 			b"ResizePseudoConsole" => resize_proc(),
+			b"ReleasePseudoConsole" => release_proc(),
 			b"ClosePseudoConsole" => close_proc(),
 			_ => None,
 		}
 	}
 
 	#[test]
-	fn resolves_all_three_exports_by_exact_name() {
+	fn resolves_all_four_exports_by_exact_name() {
 		let mut requested = Vec::new();
 		let api = resolve_with(|name| {
 			requested.push(name.to_bytes().to_vec());
@@ -128,15 +149,18 @@ mod tests {
 
 		let expected_create: CreatePseudoConsole = create;
 		let expected_resize: ResizePseudoConsole = resize;
+		let expected_release: ReleasePseudoConsole = release;
 		let expected_close: ClosePseudoConsole = close;
 		assert_eq!(api.create as *const (), expected_create as *const ());
 		assert_eq!(api.resize as *const (), expected_resize as *const ());
+		assert_eq!(api.release as *const (), expected_release as *const ());
 		assert_eq!(api.close as *const (), expected_close as *const ());
 		assert_eq!(
 			requested,
 			[
 				b"CreatePseudoConsole".to_vec(),
 				b"ResizePseudoConsole".to_vec(),
+				b"ReleasePseudoConsole".to_vec(),
 				b"ClosePseudoConsole".to_vec(),
 			]
 		);
@@ -147,6 +171,7 @@ mod tests {
 		for missing in [
 			b"CreatePseudoConsole".as_slice(),
 			b"ResizePseudoConsole".as_slice(),
+			b"ReleasePseudoConsole".as_slice(),
 			b"ClosePseudoConsole".as_slice(),
 		] {
 			let api = resolve_with(|name| {
