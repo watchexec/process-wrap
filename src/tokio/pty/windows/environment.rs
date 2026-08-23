@@ -4,7 +4,7 @@
 //! without converting through Unicode scalar values, changes use Windows case-insensitive key
 //! semantics, and the resulting WTF-16 block is sorted deterministically and double-NUL terminated.
 
-use std::{cmp::Ordering, io, slice};
+use std::{cmp::Ordering, ffi::OsStr, io, slice};
 
 use windows::{
 	Win32::{
@@ -44,6 +44,23 @@ impl PreparedEnvironment {
 	}
 }
 
+fn encode_key(key: &OsStr) -> io::Result<Vec<u16>> {
+	let key = encode(key, "PTY environment key")?;
+	if key.is_empty() {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			"PTY environment key cannot be empty",
+		));
+	}
+	if key.contains(&(b'=' as u16)) {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			"PTY environment key contains an equals sign",
+		));
+	}
+	Ok(key)
+}
+
 pub(super) fn prepare_environment(intent: &EnvironmentIntent) -> io::Result<PreparedEnvironment> {
 	prepare_environment_with(intent, inherited_environment)
 }
@@ -57,12 +74,10 @@ pub(super) fn prepare_environment_with(
 		.iter()
 		.map(|change| match change {
 			EnvChange::Set(key, value) => Ok(EncodedChange::Set(EnvironmentVariable {
-				key: encode(key, "PTY environment key")?,
+				key: encode_key(key)?,
 				value: encode(value, "PTY environment value")?,
 			})),
-			EnvChange::Remove(key) => {
-				Ok(EncodedChange::Remove(encode(key, "PTY environment key")?))
-			}
+			EnvChange::Remove(key) => Ok(EncodedChange::Remove(encode_key(key)?)),
 		})
 		.collect::<io::Result<Vec<_>>>()?;
 

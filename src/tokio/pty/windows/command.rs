@@ -49,7 +49,7 @@ pub(super) fn prepare_command_line(intent: &CommandIntent) -> io::Result<Prepare
 	let program = encode(&intent.program, "PTY program")?;
 	let application_name = WideCString::from_units(program.clone());
 	let mut command_line = Vec::new();
-	append_regular(&mut command_line, &program, true);
+	append_argv0(&mut command_line, &program)?;
 
 	for arg in &intent.args {
 		command_line.push(SPACE);
@@ -79,6 +79,19 @@ pub(super) fn encode(value: &OsStr, field: &'static str) -> io::Result<Vec<u16>>
 		));
 	}
 	Ok(units)
+}
+
+fn append_argv0(command_line: &mut Vec<u16>, program: &[u16]) -> io::Result<()> {
+	if program.contains(&DOUBLE_QUOTE) {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			"PTY program contains a double quote",
+		));
+	}
+	command_line.push(DOUBLE_QUOTE);
+	command_line.extend(program);
+	command_line.push(DOUBLE_QUOTE);
+	Ok(())
 }
 
 fn append_regular(command_line: &mut Vec<u16>, arg: &[u16], force_quotes: bool) {
