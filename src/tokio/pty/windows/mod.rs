@@ -136,3 +136,130 @@ fn creation_policy(_command: &PtyCommand) -> WindowsCreationPolicy {
 		kill_on_drop,
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
+
+	#[cfg(all(feature = "creation-flags", feature = "job-object"))]
+	use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+	use super::*;
+	use crate::tokio::CommandWrapper;
+
+	#[derive(Debug)]
+	struct UnsupportedWrapper;
+
+	impl CommandWrapper for UnsupportedWrapper {}
+
+	fn prepare_without_parent(command: &PtyCommand) -> io::Result<PreparedWindowsCommand> {
+		prepare_with(command, |_| Ok(PreparedEnvironment::Inherit))
+	}
+
+	#[test]
+	fn rejects_unknown_wrappers_before_preparing_the_environment() {
+		let mut command = PtyCommand::new("tool");
+		command.wrap(UnsupportedWrapper);
+
+		let error = prepare_with(&command, |_| {
+			panic!("unsupported wrappers must be rejected before environment preparation")
+		})
+		.unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+		assert!(error.to_string().contains("UnsupportedWrapper"), "{error}");
+	}
+
+	#[test]
+	fn preserves_wtf16_current_directories() {
+		let directory = OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xd800]);
+		let mut command = PtyCommand::new("tool");
+		command.current_dir(PathBuf::from(directory));
+
+		let prepared = prepare_without_parent(&command).unwrap();
+		assert_eq!(
+			prepared.current_dir.unwrap().as_units(),
+			[b'C' as u16, b':' as u16, b'\\' as u16, 0xd800, 0]
+		);
+	}
+
+	#[test]
+	fn rejects_current_directory_nuls_before_preparing_the_environment() {
+		let directory = OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0]);
+		let mut command = PtyCommand::new("tool");
+		command.current_dir(PathBuf::from(directory));
+
+		let error = prepare_with(&command, |_| {
+			panic!("invalid cwd must be rejected before environment preparation")
+		})
+		.unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+		assert_eq!(
+			error.to_string(),
+			"PTY current directory contains an embedded NUL"
+		);
+	}
+
+	#[cfg(all(feature = "creation-flags", feature = "job-object"))]
+	#[test]
+	fn derives_job_policy_in_both_wrapper_orders() {
+		let user_flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+		for reverse in [false, true] {
+			let mut command = PtyCommand::new("tool");
+			if reverse {
+				command.wrap(JobObject).wrap(CreationFlags(user_flags));
+			} else {
+				command.wrap(CreationFlags(user_flags)).wrap(JobObject);
+			}
+
+			let policy = prepare_without_parent(&command).unwrap().creation;
+			assert_eq!(policy.user_flags, user_flags);
+			assert_eq!(policy.spawn_flags, user_flags | CREATE_SUSPENDED);
+			assert!(!policy.explicit_suspension);
+			assert!(policy.has_job_object);
+			assert!(policy.resume_after_assignment);
+			assert!(!policy.kill_on_drop);
+		}
+	}
+
+	#[cfg(all(feature = "creation-flags", feature = "job-object"))]
+	#[test]
+	fn preserves_explicit_suspension_for_job_assignment() {
+		let user_flags = CREATE_NO_WINDOW | CREATE_SUSPENDED;
+		let mut command = PtyCommand::new("tool");
+		command.wrap(CreationFlags(user_flags)).wrap(JobObject);
+
+		let policy = prepare_without_parent(&command).unwrap().creation;
+		assert_eq!(policy.user_flags, user_flags);
+		assert_eq!(policy.spawn_flags, user_flags);
+		assert!(policy.explicit_suspension);
+		assert!(policy.has_job_object);
+		assert!(!policy.resume_after_assignment);
+	}
+
+	#[cfg(feature = "creation-flags")]
+	#[test]
+	fn preserves_creation_flags_without_a_job_object() {
+		use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+		let mut command = PtyCommand::new("tool");
+		command.wrap(CreationFlags(CREATE_NEW_PROCESS_GROUP));
+
+		let policy = prepare_without_parent(&command).unwrap().creation;
+		assert_eq!(policy.user_flags, CREATE_NEW_PROCESS_GROUP);
+		assert_eq!(policy.spawn_flags, CREATE_NEW_PROCESS_GROUP);
+		assert!(!policy.explicit_suspension);
+		assert!(!policy.has_job_object);
+		assert!(!policy.resume_after_assignment);
+	}
+
+	#[cfg(all(feature = "job-object", feature = "kill-on-drop"))]
+	#[test]
+	fn records_kill_on_drop_for_job_policy() {
+		let mut command = PtyCommand::new("tool");
+		command.wrap(JobObject).wrap(KillOnDrop);
+
+		let policy = prepare_without_parent(&command).unwrap().creation;
+		assert!(policy.has_job_object);
+		assert!(policy.kill_on_drop);
+	}
+}
