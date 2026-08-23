@@ -280,3 +280,83 @@ fn is_eof(_error: &io::Error) -> bool {
 fn closed() -> io::Error {
 	io::Error::new(io::ErrorKind::BrokenPipe, "the PTY master is closed")
 }
+
+#[cfg(test)]
+mod tests {
+	use std::{fs::File, os::fd::RawFd, sync::Mutex};
+
+	use nix::errno::Errno;
+
+	use super::*;
+
+	static DESCRIPTOR_TEST: Mutex<()> = Mutex::new(());
+
+	fn null_fd() -> OwnedFd {
+		File::open("/dev/null").unwrap().into()
+	}
+
+	fn assert_open(fd: RawFd) {
+		// SAFETY: the caller retains ownership of a descriptor which must still be open here.
+		assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+	}
+
+	fn assert_closed(fd: RawFd) {
+		// SAFETY: fcntl reports EBADF without dereferencing or taking ownership of a closed descriptor.
+		assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+		assert_eq!(Errno::last(), Errno::EBADF);
+	}
+
+	fn descriptors() -> (OwnedFd, OwnedFd, OwnedFd, [RawFd; 3]) {
+		let stdin = null_fd();
+		let stdout = null_fd();
+		let stderr = null_fd();
+		let raw = [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()];
+		(stdin, stdout, stderr, raw)
+	}
+
+	#[test]
+	fn winsize_preserves_character_and_pixel_dimensions() {
+		let native = winsize(PtySize {
+			rows: 31,
+			columns: 97,
+			pixel_width: 640,
+			pixel_height: 480,
+		});
+		assert_eq!(native.ws_row, 31);
+		assert_eq!(native.ws_col, 97);
+		assert_eq!(native.ws_xpixel, 640);
+		assert_eq!(native.ws_ypixel, 480);
+	}
+
+	#[test]
+	fn slave_stdio_is_dropped_when_the_spawn_operation_returns() {
+		let _lock = DESCRIPTOR_TEST.lock().unwrap();
+		let mut command = tokio::process::Command::new("ignored");
+		let (stdin, stdout, stderr, raw) = descriptors();
+
+		let result = with_slave_stdio(&mut command, stdin, stdout, stderr, |_| {
+			raw.into_iter().for_each(assert_open);
+			42
+		});
+
+		assert_eq!(result, 42);
+		raw.into_iter().for_each(assert_closed);
+	}
+
+	#[test]
+	fn slave_stdio_is_dropped_when_the_spawn_operation_panics() {
+		let _lock = DESCRIPTOR_TEST.lock().unwrap();
+		let mut command = tokio::process::Command::new("ignored");
+		let (stdin, stdout, stderr, raw) = descriptors();
+
+		let panic = catch_unwind(AssertUnwindSafe(|| {
+			with_slave_stdio(&mut command, stdin, stdout, stderr, |_| {
+				raw.into_iter().for_each(assert_open);
+				panic!("spawn operation panic");
+			});
+		}));
+
+		assert!(panic.is_err());
+		raw.into_iter().for_each(assert_closed);
+	}
+}
