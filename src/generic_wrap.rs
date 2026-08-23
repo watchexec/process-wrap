@@ -73,9 +73,10 @@ macro_rules! Wrap {
 			/// called.
 			///
 			/// Only one wrapper of a given type can be applied to a command. If `wrap` is called
-			/// twice with the same type, the existing wrapper will have its `extend` hook called,
-			/// which gives it a chance to absorb the new wrapper. If it does not, the _new_ wrapper
-			/// will be silently discarded.
+			/// twice with the same type, the existing wrapper will have its `extend` hook called
+			/// with the new wrapper. The hook can react through the `CommandWrapper` interface, but
+			/// cannot downcast the new wrapper or inspect its type-specific fields. If the hook does
+			/// nothing, the _new_ wrapper is silently discarded.
 			///
 			/// Returns `&mut self` for chaining.
 			pub fn wrap<W: CommandWrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
@@ -265,15 +266,15 @@ macro_rules! Wrap {
 		pub trait CommandWrapper: ::std::fmt::Debug + Send + Sync {
 			/// Called on a first instance if a second of the same type is added.
 			///
-			/// Only one of a wrapper type can exist within a Wrap at a time. The default behaviour
-			/// is to silently discard any further invocations. However in some cases it might be
-			/// useful to merge the two. This method is called on the instance already stored within
-			/// the Wrap, with the new instance.
+			/// Only one wrapper of a given type can exist within a Wrap at a time. The default
+			/// behaviour is to discard further instances. This hook lets the stored instance react
+			/// to another registration.
 			///
-			/// The `other` argument is guaranteed by process-wrap to be of the same type as `self`,
-			/// so you can downcast it with `.unwrap()` and not panic. Note that it is possible for
-			/// other code to use this trait and not guarantee this, so you should still panic if
-			/// downcasting fails, instead of using unchecked downcasting and unleashing UB.
+			/// process-wrap passes an `other` value with the same concrete type as `self`. However,
+			/// `CommandWrapper` does not expose a downcast operation, so an implementation can
+			/// mutate `self` in response but cannot inspect type-specific fields on `other`. Do not
+			/// use unchecked downcasting based on this invariant: callers outside process-wrap are
+			/// not required to preserve it.
 			///
 			/// Default impl: no-op.
 			fn extend(&mut self, _other: Box<dyn CommandWrapper>) {}

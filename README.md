@@ -111,9 +111,9 @@ CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .spawn()?;
 ```
 
-When both `CreationFlags` and `JobObject` are used together, either:
-- `CreationFlags` must come first, or
-- `CreationFlags` must include `CREATE_SUSPENDED`
+`CreationFlags` and `JobObject` may be registered in either order. `JobObject` preserves every
+requested flag, temporarily adds `CREATE_SUSPENDED` while assigning the process, and resumes it
+after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
 
 ### Process group
 
@@ -183,9 +183,9 @@ CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .spawn()?;
 ```
 
-When both `CreationFlags` and `JobObject` are used together, either:
-- `CreationFlags` must come first, or
-- `CreationFlags` must include `CREATE_SUSPENDED`
+`CreationFlags` and `JobObject` may be registered in either order. `JobObject` preserves every
+requested flag, temporarily adds `CREATE_SUSPENDED` while assigning the process, and resumes it
+after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
 
 ### Kill on drop
 
@@ -223,9 +223,11 @@ That's right, all member methods are optional.
 The trait provides extension or hook points into the lifecycle of a `Command`:
 
 - **`fn extend(&mut self, other: Box<dyn CommandWrapper>)`** is called if `.wrap(YourWrapper)`
-  is done twice. Only one of a wrapper type can exist, so this gives the opportunity to incorporate
-  all or part of the second wrapper instance into the first. By default, this does nothing (ie only
-  the first registered wrapper instance of a type does anything).
+  is done twice. Only one of a wrapper type can exist, so this lets the stored instance react to the
+  second registration. `CommandWrap` passes the same concrete type for `self` and `other`, but
+  `CommandWrapper` exposes no downcast operation, so implementations cannot inspect type-specific
+  fields on `other`. By default, this does nothing (ie only the first registered wrapper instance of
+  a type does anything).
 
 - **`fn pre_spawn(&mut self, command: &mut Command, core: &CommandWrap)`** is called before the
   command is spawned, and gives mutable access to it. It also gives mutable access to the wrapper
