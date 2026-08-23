@@ -10,13 +10,53 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{ChildWrapper, CommandWrap, CommandWrapper};
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
 mod unix;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+)))]
 mod unsupported;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
 use unix as imp;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+)))]
 use unsupported as imp;
 
 /// The character and pixel dimensions of a pseudo-terminal.
@@ -151,18 +191,20 @@ impl CommandIntent {
 	}
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PtyMarker;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(unix)]
 impl CommandWrapper for PtyMarker {}
 
 /// A tracked command builder for pseudo-terminal spawning.
 ///
-/// This API is available with the non-default `pty` crate feature. Linux and macOS provide a native
-/// backend; other targets compile the same API but [`spawn`](Self::spawn) returns
-/// [`io::ErrorKind::Unsupported`] without falling back to pipes.
+/// This API is available with the non-default `pty` crate feature. Linux, Android, macOS, the BSDs,
+/// illumos, and Solaris provide a native Unix backend; other targets compile the same API but
+/// [`spawn`](Self::spawn) returns [`io::ErrorKind::Unsupported`] without falling back to pipes.
+/// Linux and macOS run transport tests in CI; the other Unix backends are cross-compiled there
+/// pending native runners.
 ///
 /// The builder owns the complete portable command intent instead of exposing unrestricted mutable
 /// access to the underlying Tokio command. This lets platform backends preserve arguments,

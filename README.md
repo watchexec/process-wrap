@@ -82,8 +82,10 @@ dbg!(status);
 
 ### or in a pseudo-terminal
 
-The non-default `pty` feature enables Tokio PTY transport on Linux and macOS. It implies `tokio1`.
-Other targets return `std::io::ErrorKind::Unsupported` rather than falling back to ordinary pipes.
+The non-default `pty` feature enables Tokio PTY transport on Linux, Android, macOS, FreeBSD,
+NetBSD, OpenBSD, DragonFly BSD, illumos, and Solaris. It implies `tokio1`. Other targets return
+`std::io::ErrorKind::Unsupported` rather than falling back to ordinary pipes. Linux and macOS run
+transport tests in CI; the other Unix backends are cross-compiled there pending native runners.
 
 ```toml
 [dependencies]

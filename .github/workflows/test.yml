@@ -94,6 +94,52 @@ jobs:
       - run: tests/multiproc_helper.rs 1 1
       - run: cargo test --locked --all-features --all-targets
 
+  portable-unix-pty:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            toolchain: stable
+          - target: x86_64-unknown-freebsd
+            toolchain: stable
+          - target: x86_64-unknown-netbsd
+            toolchain: stable
+          - target: x86_64-unknown-illumos
+            toolchain: stable
+          - target: x86_64-pc-solaris
+            toolchain: stable
+          - target: x86_64-unknown-dragonfly
+            toolchain: nightly
+          - target: x86_64-unknown-openbsd
+            toolchain: nightly
+
+    name: "Check PTY on ${{ matrix.target }}"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update ${{ matrix.toolchain }}
+          rustup default ${{ matrix.toolchain }}
+          if [ "${{ matrix.toolchain }}" = nightly ]; then
+            rustup component add rust-src
+          else
+            rustup target add "${{ matrix.target }}"
+          fi
+
+      - name: Check portable Unix PTY backend
+        run: |
+          if [ "${{ matrix.toolchain }}" = nightly ]; then
+            cargo check --locked -Zbuild-std=std --target "${{ matrix.target }}" --no-default-features --features pty --lib
+          else
+            cargo check --locked --target "${{ matrix.target }}" --no-default-features --features pty --lib
+          fi
+
   rustdoc:
     name: Rustdoc
     runs-on: ubuntu-latest

@@ -30,8 +30,8 @@
 //! This crate provides a composable set of wrappers over `process::Command` (either from std or
 //! from Tokio). It is a more flexible and composable successor to the `command-group` crate. With
 //! the non-default `pty` feature, [`tokio::PtyCommand`] also spawns Tokio processes in native
-//! pseudo-terminals on Linux and macOS while retaining the same child-wrapper and process
-//! group/session supervision APIs.
+//! pseudo-terminals on Linux, Android, macOS, the BSDs, illumos, and Solaris while retaining the same
+//! child-wrapper and process group/session supervision APIs.
 //!
 //! # Usage
 //!

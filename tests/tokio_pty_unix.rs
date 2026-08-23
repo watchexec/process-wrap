@@ -1,4 +1,17 @@
-#![cfg(all(any(target_os = "linux", target_os = "macos"), feature = "pty"))]
+#![cfg(all(
+	feature = "pty",
+	any(
+		target_os = "android",
+		target_os = "dragonfly",
+		target_os = "freebsd",
+		target_os = "illumos",
+		target_os = "linux",
+		target_os = "macos",
+		target_os = "netbsd",
+		target_os = "openbsd",
+		target_os = "solaris"
+	)
+))]
 
 #[cfg(feature = "process-group")]
 use std::any::TypeId;
@@ -228,7 +241,7 @@ async fn direct_child_wait_is_independent_from_descendant_output_eof() -> io::Re
 	command
 		.args([
 			"-c",
-			"(trap '' HUP; printf ready; while [ ! -e \"$1\" ]; do sleep 1; done) &",
+			"trap '' HUP; (printf ready; while [ ! -e \"$1\" ]; do sleep 1; done) &",
 			"pty-test",
 		])
 		.arg(&release);

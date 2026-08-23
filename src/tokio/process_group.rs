@@ -1,4 +1,4 @@
-#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+#[cfg(feature = "pty")]
 use std::io::ErrorKind;
 use std::{
 	future::Future,
@@ -24,7 +24,7 @@ use tracing::instrument;
 
 use crate::ChildExitStatus;
 
-#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+#[cfg(feature = "pty")]
 use super::pty::PtyMarker;
 use super::{ChildWrapper, CommandWrap, CommandWrapper};
 
@@ -47,7 +47,7 @@ use super::{ChildWrapper, CommandWrap, CommandWrapper};
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessGroup {
 	leader: Pid,
-	#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+	#[cfg(feature = "pty")]
 	attach: bool,
 }
 
@@ -56,7 +56,7 @@ impl ProcessGroup {
 	pub fn leader() -> Self {
 		Self {
 			leader: Pid::from_raw(0),
-			#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+			#[cfg(feature = "pty")]
 			attach: false,
 		}
 	}
@@ -65,7 +65,7 @@ impl ProcessGroup {
 	pub fn attach_to(leader: u32) -> Self {
 		Self {
 			leader: Pid::from_raw(leader as i32),
-			#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+			#[cfg(feature = "pty")]
 			attach: true,
 		}
 	}
@@ -100,7 +100,7 @@ impl ProcessGroupChild {
 impl CommandWrapper for ProcessGroup {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
-		#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+		#[cfg(feature = "pty")]
 		if _core.has_wrap::<PtyMarker>() {
 			#[cfg(feature = "process-session")]
 			if _core.has_wrap::<super::ProcessSession>() {

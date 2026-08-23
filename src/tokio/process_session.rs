@@ -1,4 +1,4 @@
-#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+#[cfg(feature = "pty")]
 use std::io::ErrorKind;
 use std::io::{Error, Result};
 
@@ -7,7 +7,7 @@ use tokio::process::Command;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
-#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+#[cfg(feature = "pty")]
 use super::pty::PtyMarker;
 use super::{CommandWrap, CommandWrapper};
 
@@ -33,7 +33,7 @@ pub struct ProcessSession;
 impl CommandWrapper for ProcessSession {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
-		#[cfg(all(feature = "pty", any(target_os = "linux", target_os = "macos")))]
+		#[cfg(feature = "pty")]
 		if _core.has_wrap::<PtyMarker>() {
 			if _core.has_wrap::<super::ProcessGroup>() {
 				return Err(Error::new(

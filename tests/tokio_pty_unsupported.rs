@@ -1,4 +1,17 @@
-#![cfg(all(feature = "pty", not(any(target_os = "linux", target_os = "macos"))))]
+#![cfg(all(
+	feature = "pty",
+	not(any(
+		target_os = "android",
+		target_os = "dragonfly",
+		target_os = "freebsd",
+		target_os = "illumos",
+		target_os = "linux",
+		target_os = "macos",
+		target_os = "netbsd",
+		target_os = "openbsd",
+		target_os = "solaris"
+	))
+))]
 
 use std::io;
 

@@ -1,6 +1,6 @@
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use std::path::Path;
 use std::{
 	io,
@@ -12,19 +12,38 @@ use std::{
 	task::{Context, Poll, ready},
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use nix::pty::ptsname_r;
 use nix::{
-	fcntl::{FcntlArg, OFlag, fcntl, open},
+	fcntl::{FcntlArg, fcntl},
 	libc,
-	pty::{PtyMaster, Winsize, grantpt, posix_openpt, unlockpt},
+	pty::Winsize,
+};
+#[cfg(any(
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
+use nix::{
+	fcntl::{FdFlag, OFlag},
+	pty::openpty,
+};
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+use nix::{
+	fcntl::{OFlag, open},
+	pty::{PtyMaster, grantpt, posix_openpt, unlockpt},
 	sys::stat::Mode,
 };
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+use std::os::fd::IntoRawFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, unix::AsyncFd};
 
 use super::{ChildWrapper, PtyCommand, PtyController, PtyMarker, PtyOptions, PtySize};
 
-type Master = Arc<AsyncFd<PtyMaster>>;
+type Master = Arc<AsyncFd<OwnedFd>>;
 
 #[derive(Debug)]
 pub(super) struct Input {
@@ -98,7 +117,7 @@ impl AsyncRead for Output {
 
 #[derive(Clone, Debug)]
 pub(super) struct Resize {
-	master: Weak<AsyncFd<PtyMaster>>,
+	master: Weak<AsyncFd<OwnedFd>>,
 }
 
 impl Resize {
@@ -176,14 +195,61 @@ fn with_slave_stdio<T>(
 	}
 }
 
-fn open_pty(size: PtySize) -> io::Result<(PtyMaster, OwnedFd)> {
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	let master =
 		posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)?;
 	grantpt(&master)?;
 	unlockpt(&master)?;
 	let slave = open_slave(&master)?;
+	// SAFETY: ownership moves from PtyMaster into exactly one OwnedFd.
+	let master = unsafe { OwnedFd::from_raw_fd(master.into_raw_fd()) };
 	set_size(&master, size)?;
 	Ok((master, slave))
+}
+
+#[cfg(any(
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
+fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
+	let size = winsize(size);
+	let pair = openpty(Some(&size), None)?;
+	set_close_on_exec(&pair.master)?;
+	set_close_on_exec(&pair.slave)?;
+	set_nonblocking(&pair.master)?;
+	Ok((pair.master, pair.slave))
+}
+
+#[cfg(any(
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
+fn set_close_on_exec(fd: &OwnedFd) -> io::Result<()> {
+	fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+	Ok(())
+}
+
+#[cfg(any(
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
+fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+	let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
+	fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+	Ok(())
 }
 
 fn duplicate(fd: &OwnedFd) -> io::Result<OwnedFd> {
@@ -192,11 +258,12 @@ fn duplicate(fd: &OwnedFd) -> io::Result<OwnedFd> {
 	Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
 fn slave_flags() -> OFlag {
 	OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn open_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
 	let name = ptsname_r(master)?;
 	open(Path::new(&name), slave_flags(), Mode::empty()).map_err(io::Error::from)
@@ -206,7 +273,14 @@ fn open_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
 fn open_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
 	let mut name = [0_u8; 128];
 	// SAFETY: name is the 128-byte output buffer encoded by Darwin's TIOCPTYGNAME request.
-	if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCPTYGNAME, name.as_mut_ptr()) } == -1 {
+	if unsafe {
+		libc::ioctl(
+			master.as_raw_fd(),
+			libc::TIOCPTYGNAME.into(),
+			name.as_mut_ptr(),
+		)
+	} == -1
+	{
 		return Err(io::Error::last_os_error());
 	}
 	let name = CStr::from_bytes_until_nul(&name)
@@ -223,7 +297,7 @@ fn winsize(size: PtySize) -> Winsize {
 	}
 }
 
-fn set_size(master: &PtyMaster, size: PtySize) -> io::Result<()> {
+fn set_size(master: &OwnedFd, size: PtySize) -> io::Result<()> {
 	let size = winsize(size);
 	// SAFETY: master is a live PTY descriptor and size points to a valid winsize for the duration of
 	// the ioctl call.
@@ -240,7 +314,7 @@ fn setup_child() -> io::Result<()> {
 		if libc::setsid() == -1 {
 			return Err(io::Error::last_os_error());
 		}
-		if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1 {
+		if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
 			return Err(io::Error::last_os_error());
 		}
 		if libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) == -1 {
@@ -250,7 +324,7 @@ fn setup_child() -> io::Result<()> {
 	Ok(())
 }
 
-fn read(fd: &PtyMaster, buffer: &mut [u8]) -> io::Result<usize> {
+fn read(fd: &OwnedFd, buffer: &mut [u8]) -> io::Result<usize> {
 	// SAFETY: the buffer is writable for its full length and remains live for the call.
 	let read = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
 	if read == -1 {
@@ -259,7 +333,7 @@ fn read(fd: &PtyMaster, buffer: &mut [u8]) -> io::Result<usize> {
 	Ok(read as usize)
 }
 
-fn write(fd: &PtyMaster, buffer: &[u8]) -> io::Result<usize> {
+fn write(fd: &OwnedFd, buffer: &[u8]) -> io::Result<usize> {
 	// SAFETY: the buffer is readable for its full length and remains live for the call.
 	let written = unsafe { libc::write(fd.as_raw_fd(), buffer.as_ptr().cast(), buffer.len()) };
 	if written == -1 {
@@ -268,14 +342,8 @@ fn write(fd: &PtyMaster, buffer: &[u8]) -> io::Result<usize> {
 	Ok(written as usize)
 }
 
-#[cfg(target_os = "linux")]
 fn is_eof(error: &io::Error) -> bool {
 	error.raw_os_error() == Some(libc::EIO)
-}
-
-#[cfg(target_os = "macos")]
-fn is_eof(_error: &io::Error) -> bool {
-	false
 }
 
 fn closed() -> io::Error {
