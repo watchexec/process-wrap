@@ -8,6 +8,7 @@ macro_rules! Wrap {
 		trait ErasedCommandWrapper: ::std::fmt::Debug + Send + Sync {
 			fn as_command_wrapper_mut(&mut self) -> &mut dyn CommandWrapper;
 			fn as_any(&self) -> &dyn ::std::any::Any;
+			fn as_any_mut(&mut self) -> &mut dyn ::std::any::Any;
 		}
 
 		impl<W: CommandWrapper + 'static> ErasedCommandWrapper for W {
@@ -16,6 +17,10 @@ macro_rules! Wrap {
 			}
 
 			fn as_any(&self) -> &dyn ::std::any::Any {
+				self
+			}
+
+			fn as_any_mut(&mut self) -> &mut dyn ::std::any::Any {
 				self
 			}
 		}
@@ -73,9 +78,8 @@ macro_rules! Wrap {
 			/// called.
 			///
 			/// Only one wrapper of a given type can be applied to a command. If `wrap` is called
-			/// twice with the same type, the existing wrapper will have its `extend` hook called
-			/// with the new wrapper. The hook can react through the `CommandWrapper` interface, but
-			/// cannot downcast the new wrapper or inspect its type-specific fields. If the hook does
+			/// twice with the same type, the existing wrapper receives the newly registered wrapper
+			/// through its typed `extend` hook and can merge its configuration. If the hook does
 			/// nothing, the _new_ wrapper is silently discarded.
 			///
 			/// Returns `&mut self` for chaining.
@@ -89,8 +93,10 @@ macro_rules! Wrap {
 					extant
 						.as_mut()
 						.expect("a wrapper cannot be replaced while its hook is active")
-						.as_command_wrapper_mut()
-						.extend(Box::new(wrapper));
+						.as_any_mut()
+						.downcast_mut::<W>()
+						.expect("downcasting is guaranteed to succeed due to wrap()'s internals")
+						.extend(wrapper);
 				}
 
 				self
@@ -238,7 +244,7 @@ macro_rules! Wrap {
 						wrapper
 							.as_any()
 							.downcast_ref()
-							.expect("the wrapper key and concrete type must match")
+							.expect("downcasting is guaranteed to succeed due to wrap()'s internals")
 					})
 			}
 		}
@@ -266,18 +272,20 @@ macro_rules! Wrap {
 		pub trait CommandWrapper: ::std::fmt::Debug + Send + Sync {
 			/// Called on a first instance if a second of the same type is added.
 			///
-			/// Only one wrapper of a given type can exist within a Wrap at a time. The default
-			/// behaviour is to discard further instances. This hook lets the stored instance react
-			/// to another registration.
+			/// Only one wrapper of a given type can exist within a Wrap at a time. By default,
+			/// later registrations are discarded. In some cases it is useful to merge their
+			/// configuration instead. This method is called on the stored wrapper with the newly
+			/// registered wrapper of the same concrete type.
 			///
-			/// process-wrap passes an `other` value with the same concrete type as `self`. However,
-			/// `CommandWrapper` does not expose a downcast operation, so an implementation can
-			/// mutate `self` in response but cannot inspect type-specific fields on `other`. Do not
-			/// use unchecked downcasting based on this invariant: callers outside process-wrap are
-			/// not required to preserve it.
+			/// Because `other` is `Self`, implementations can inspect or move its type-specific
+			/// fields directly without downcasting.
 			///
 			/// Default impl: no-op.
-			fn extend(&mut self, _other: Box<dyn CommandWrapper>) {}
+			fn extend(&mut self, _other: Self)
+			where
+				Self: Sized,
+			{
+			}
 
 			/// Called before the command is spawned, to mutate it as needed.
 			///

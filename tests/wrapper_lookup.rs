@@ -11,8 +11,9 @@ macro_rules! wrapper_lookup_tests {
 			}
 
 			impl CommandWrapper for LookupWrapper {
-				fn extend(&mut self, _other: Box<dyn CommandWrapper>) {
-					self.extensions += 1;
+				fn extend(&mut self, other: Self) {
+					self.value += other.value;
+					self.extensions += other.extensions + 1;
 				}
 			}
 
@@ -55,14 +56,14 @@ macro_rules! wrapper_lookup_tests {
 					})
 					.wrap(LookupWrapper {
 						value: 2,
-						extensions: 0,
+						extensions: 3,
 					});
 
 				let wrapper = command
 					.get_wrap::<LookupWrapper>()
 					.expect("the first wrapper remains registered");
-				assert_eq!(wrapper.value, 1);
-				assert_eq!(wrapper.extensions, 1);
+				assert_eq!(wrapper.value, 3);
+				assert_eq!(wrapper.extensions, 4);
 			}
 
 			#[test]
