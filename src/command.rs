@@ -762,6 +762,20 @@ impl Command<Tokio1> {
 }
 
 #[cfg(all(feature = "tokio1", unix))]
+pub(crate) fn tokio_process_group(command: &mut tokio::process::Command, pgroup: i32) {
+	let set_process_group = move || {
+		// SAFETY: `setpgid` is called in the child with its own PID and does not retain pointers.
+		if unsafe { nix::libc::setpgid(0, pgroup) } == -1 {
+			Err(::std::io::Error::last_os_error())
+		} else {
+			Ok(())
+		}
+	};
+	// SAFETY: the callback only invokes `setpgid`, which is valid between `fork` and `exec`.
+	unsafe { command.pre_exec(set_process_group) };
+}
+
+#[cfg(all(feature = "tokio1", unix))]
 impl Command<Tokio1> {
 	/// Set the child process's user ID and make the command native-only.
 	pub fn uid(&mut self, id: u32) -> &mut Self {
@@ -782,8 +796,11 @@ impl Command<Tokio1> {
 	}
 
 	/// Set the child process's process group and make the command native-only.
+	///
+	/// At the declared Tokio dependency floor this is registered as a `pre_exec` callback. Call this
+	/// before registering callbacks which require the process group to have been set.
 	pub fn process_group(&mut self, pgroup: i32) -> &mut Self {
-		self.native_mut().process_group(pgroup);
+		tokio_process_group(self.native_mut(), pgroup);
 		self
 	}
 
