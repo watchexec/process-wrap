@@ -189,7 +189,7 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 		let mut entry = THREADENTRY32 {
 			dwSize: std::mem::size_of::<THREADENTRY32>()
 				.try_into()
-				.expect("THREADENTRY32 size must fit in a DWORD"),
+				.expect("THREADENTRY32 is guaranteed to fit in a DWORD"),
 			..Default::default()
 		};
 		unsafe { Thread32First(tool_handle, &mut entry) }.map_err(Error::other)?;
