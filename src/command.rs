@@ -96,7 +96,7 @@ impl NativeCommand for std::process::Command {
 	#[cfg(windows)]
 	fn raw_arg(&mut self, arg: &OsStr) {
 		use std::os::windows::process::CommandExt;
-		self.raw_arg(arg);
+		CommandExt::raw_arg(self, arg);
 	}
 
 	fn env(&mut self, key: &OsStr, value: &OsStr) {
