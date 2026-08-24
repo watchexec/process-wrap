@@ -111,9 +111,9 @@ CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .spawn()?;
 ```
 
-When both `CreationFlags` and `JobObject` are used together, either:
-- `CreationFlags` must come first, or
-- `CreationFlags` must include `CREATE_SUSPENDED`
+`CreationFlags` and `JobObject` may be registered in either order. `JobObject` preserves every
+requested flag, temporarily adds `CREATE_SUSPENDED` while assigning the process, and resumes it
+after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
 
 ### Process group
 
@@ -183,9 +183,9 @@ CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .spawn()?;
 ```
 
-When both `CreationFlags` and `JobObject` are used together, either:
-- `CreationFlags` must come first, or
-- `CreationFlags` must include `CREATE_SUSPENDED`
+`CreationFlags` and `JobObject` may be registered in either order. `JobObject` preserves every
+requested flag, temporarily adds `CREATE_SUSPENDED` while assigning the process, and resumes it
+after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
 
 ### Kill on drop
 
