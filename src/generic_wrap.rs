@@ -555,9 +555,12 @@ macro_rules! Wrap {
 			/// provider, it runs the same pre-spawn, capability-level post-spawn, and child-wrapping
 			/// lifecycle as [`spawn`](Self::spawn).
 			///
-			/// On Unix, replacing the native command is supported, but the displaced command must be
-			/// dropped before the spawner returns. Retaining it prevents process-wrap from determining
-			/// whether the callback carrying built-in child setup belongs to the current command.
+			/// On Unix, when wrappers request built-in child setup, a successful spawner must create the
+			/// returned child from the native value before replacing that value. Whenever the spawner
+			/// replaces it, including before returning an error or unwinding, the displaced command must be
+			/// dropped before control leaves the spawner. A replacement is discarded with a tracked attempt
+			/// or retained by a native-only base. Process-wrap installs child setup before invoking the
+			/// spawner and cannot apply it to a replacement which the spawner creates and immediately spawns.
 			pub fn spawn_with(
 				&mut self,
 				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<$child>,
@@ -582,9 +585,12 @@ macro_rules! Wrap {
 			/// This explicit transport cannot be combined with a registered spawn provider. Without a
 			/// provider, all `pre_spawn`, capability-level `post_spawn`, and `wrap_child` hooks run.
 			///
-			/// On Unix, replacing the native command is supported, but the displaced command must be
-			/// dropped before the spawner returns. Retaining it prevents process-wrap from determining
-			/// whether the callback carrying built-in child setup belongs to the current command.
+			/// On Unix, when wrappers request built-in child setup, a successful spawner must create the
+			/// returned child from the native value before replacing that value. Whenever the spawner
+			/// replaces it, including before returning an error or unwinding, the displaced command must be
+			/// dropped before control leaves the spawner. A replacement is discarded with a tracked attempt
+			/// or retained by a native-only base. Process-wrap installs child setup before invoking the
+			/// spawner and cannot apply it to a replacement which the spawner creates and immediately spawns.
 			pub fn spawn_with_child(
 				&mut self,
 				spawner: impl FnOnce(

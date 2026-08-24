@@ -315,9 +315,12 @@ failure. Until `spawn` returns the product, cleanup remains the provider's respo
 A command may register only one provider; conflicts are rejected before any provider callback or
 operating-system allocation. Both providers and wrapper state are reused across repeated spawns.
 `spawn_with` and `spawn_with_child` reject a registered provider instead of silently bypassing it.
-On Unix, an explicit spawner may replace the native command, but must drop the displaced command
-before returning so process-wrap can identify whether its built-in child-setup callback remains on the
-current command.
+On Unix, when wrappers request built-in child setup, a successful explicit spawner must create its
+returned child from the native command before replacing that command. Whenever the spawner replaces
+it, including before returning an error or unwinding, the displaced command must be dropped before
+control leaves the spawner. A replacement is discarded with a tracked attempt or retained by a
+native-only base. Process-wrap installs child setup before invoking the spawner and cannot apply it to
+a replacement which the closure creates and immediately spawns.
 
 Refer to [the API documentation][docs] for the policy getters, platform child capabilities, and the
 specifics of child wrapper traits.

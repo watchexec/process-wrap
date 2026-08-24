@@ -328,6 +328,47 @@ macro_rules! unix_attempt_policy_tests {
 			}
 
 			#[test]
+			fn explicit_replacement_after_spawn_preserves_current_and_future_setup() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for boxed_child in [false, true] {
+					let mut command = CommandWrap::with_new("sh", |command| {
+						command.args(["-c", "sleep 30"]);
+					});
+					let _ = command.native_mut();
+					command.wrap(ProcessGroup::leader());
+
+					let mut child = if boxed_child {
+						command
+							.spawn_with_child(|native| {
+								let child = native.spawn()?;
+								($replace_native)(native);
+								Ok(Box::new(child) as Box<dyn ChildWrapper>)
+							})
+							.unwrap()
+					} else {
+						command
+							.spawn_with(|native| {
+								let child = native.spawn()?;
+								($replace_native)(native);
+								Ok(child)
+							})
+							.unwrap()
+					};
+					let pid = Pid::from_raw(i32::try_from(child_id(child.as_ref())).unwrap());
+					assert_eq!(getpgid(Some(pid)).unwrap(), pid);
+					child.start_kill().unwrap();
+					let _ = wait_for_exit(child.as_mut());
+
+					let mut child = command.spawn().unwrap();
+					let pid = Pid::from_raw(i32::try_from(child_id(child.as_ref())).unwrap());
+					assert_eq!(getpgid(Some(pid)).unwrap(), pid);
+					child.start_kill().unwrap();
+					let _ = wait_for_exit(child.as_mut());
+				}
+			}
+
+			#[test]
 			fn built_in_policy_hooks_keep_the_attempt_portable() {
 				let runtime = runtime();
 				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);

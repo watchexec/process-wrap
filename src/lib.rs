@@ -224,9 +224,12 @@
 //!
 //! A command may register only one provider; conflicts are rejected before callbacks or allocation.
 //! Providers and wrapper state are reusable across repeated spawns. `spawn_with` and
-//! `spawn_with_child` reject a registered provider instead of bypassing it. On Unix, an explicit
-//! spawner may replace the native command, but must drop the displaced command before returning so
-//! process-wrap can identify whether its built-in child-setup callback remains on the current command.
+//! `spawn_with_child` reject a registered provider instead of bypassing it. On Unix, when wrappers
+//! request built-in child setup, a successful explicit spawner must create its returned child before
+//! replacing the native command. Whenever it replaces that command, including before returning an
+//! error or unwinding, the displaced command must be dropped before control leaves the spawner. A
+//! replacement is discarded with a tracked attempt or retained by a native-only base. Process-wrap
+//! cannot apply setup to a replacement which the closure creates and immediately spawns.
 //!
 //! ## An Example Logging Wrapper
 //!
