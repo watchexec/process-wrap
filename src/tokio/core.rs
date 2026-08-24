@@ -115,6 +115,13 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 		None
 	}
 
+	/// Take the PTY controller owned by this exact child layer.
+	#[doc(hidden)]
+	#[cfg(feature = "pty")]
+	fn take_pty_controller_layer(&mut self) -> Option<super::pty::PtyController> {
+		None
+	}
+
 	/// Finalize Windows spawn state owned by this child layer.
 	///
 	/// Process-wrap invokes this internal lifecycle hook after all child wrappers have been installed.
@@ -338,6 +345,30 @@ impl dyn ChildWrapper + '_ {
 
 	fn is_raw_child(&self) -> bool {
 		self.downcast_ref::<Child>().is_some()
+	}
+
+	/// Take the controller installed by a PTY spawn.
+	///
+	/// This traverses arbitrary child-wrapper layers without removing them. The controller can be taken
+	/// only once; subsequent calls and non-PTY children return `None`.
+	#[cfg(feature = "pty")]
+	pub fn take_pty_controller(&mut self) -> Option<super::pty::PtyController> {
+		let mut inner = self;
+		loop {
+			if let Some(controller) = inner.take_pty_controller_layer() {
+				return Some(controller);
+			}
+
+			let inner_type = (&*inner as &dyn Any).type_id();
+			let inner_ptr = std::ptr::from_mut(inner);
+			let next = inner.inner_mut();
+			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
+				&& inner_type == (&*next as &dyn Any).type_id()
+			{
+				return None;
+			}
+			inner = next;
+		}
 	}
 
 	/// Find the first Windows process-handle capability in this wrapper chain.

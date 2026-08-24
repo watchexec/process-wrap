@@ -1460,6 +1460,16 @@ impl<B: Backend> SpawnAttempt<B> {
 		self.native_command_mut()
 	}
 
+	/// Materialize the fresh native command for an alternate provider without applying native
+	/// platform setup or making the portable attempt opaque.
+	///
+	/// The provider must apply every accepted portable policy itself before spawning.
+	#[cfg(feature = "pty")]
+	pub(crate) fn native_for_provider_spawn(&mut self) -> &mut B::NativeCommand {
+		self.materialize_native();
+		self.native_command_mut()
+	}
+
 	pub(crate) fn native_for_explicit_spawn(&mut self) -> &mut B::NativeCommand {
 		self.make_native_only();
 		self.prepare_platform();

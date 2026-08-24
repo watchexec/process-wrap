@@ -45,6 +45,10 @@ pub use process_group::{ProcessGroup, ProcessGroupChild};
 #[cfg_attr(docsrs, doc(cfg(all(unix, feature = "process-session"))))]
 #[doc(inline)]
 pub use process_session::ProcessSession;
+#[cfg(feature = "pty")]
+#[cfg_attr(docsrs, doc(cfg(feature = "pty")))]
+#[doc(inline)]
+pub use pty::{Pty, PtyController, PtyInput, PtyOutput, PtyResize, PtySize};
 #[cfg(all(unix, feature = "reset-sigmask"))]
 #[cfg_attr(docsrs, doc(cfg(all(unix, feature = "reset-sigmask"))))]
 #[doc(inline)]
@@ -61,5 +65,7 @@ mod kill_on_drop;
 mod process_group;
 #[cfg(all(unix, feature = "process-session"))]
 mod process_session;
+#[cfg(feature = "pty")]
+mod pty;
 #[cfg(all(unix, feature = "reset-sigmask"))]
 mod reset_sigmask;
