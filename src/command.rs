@@ -812,3 +812,104 @@ impl Command<Tokio1> {
 		self
 	}
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+	use std::{
+		ffi::{OsStr, OsString},
+		os::windows::ffi::OsStringExt,
+		path::Path,
+		process::Stdio,
+	};
+
+	use super::{CommandArg, CommandIntent, NativeCommand};
+
+	#[derive(Debug, Eq, PartialEq)]
+	enum RecordedArg {
+		Regular(OsString),
+		Raw(OsString),
+	}
+
+	#[derive(Debug)]
+	struct RecordedCommand {
+		program: OsString,
+		args: Vec<RecordedArg>,
+	}
+
+	impl NativeCommand for RecordedCommand {
+		fn new(program: &OsStr) -> Self {
+			Self {
+				program: program.to_owned(),
+				args: Vec::new(),
+			}
+		}
+
+		fn arg(&mut self, arg: &OsStr) {
+			self.args.push(RecordedArg::Regular(arg.to_owned()));
+		}
+
+		fn raw_arg(&mut self, arg: &OsStr) {
+			self.args.push(RecordedArg::Raw(arg.to_owned()));
+		}
+
+		fn env(&mut self, _key: &OsStr, _value: &OsStr) {}
+
+		fn env_remove(&mut self, _key: &OsStr) {}
+
+		fn env_clear(&mut self) {}
+
+		fn current_dir(&mut self, _dir: &Path) {}
+
+		fn stdin(&mut self, _stdio: Stdio) {}
+
+		fn stdout(&mut self, _stdio: Stdio) {}
+
+		fn stderr(&mut self, _stdio: Stdio) {}
+
+		fn get_program(&self) -> &OsStr {
+			&self.program
+		}
+
+		fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
+			Box::new(self.args.iter().map(|arg| match arg {
+				RecordedArg::Regular(value) | RecordedArg::Raw(value) => value.as_os_str(),
+			}))
+		}
+
+		fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+			Box::new(std::iter::empty())
+		}
+
+		fn get_current_dir(&self) -> Option<&Path> {
+			None
+		}
+	}
+
+	#[test]
+	fn materialization_preserves_raw_argument_kinds_and_wtf16() {
+		let raw = OsString::from_wide(&[b' ' as u16, 0xd800, b' ' as u16]);
+		let regular_surrogate = OsString::from_wide(&[0xdfff]);
+		let intent = CommandIntent {
+			program: OsString::from("tool"),
+			args: vec![
+				CommandArg::Regular(OsString::from("regular")),
+				CommandArg::Raw(raw.clone()),
+				CommandArg::Regular(regular_surrogate.clone()),
+			],
+			env_clear: false,
+			env: Vec::new(),
+			current_dir: None,
+		};
+
+		let command = intent.materialize::<RecordedCommand>();
+
+		assert_eq!(
+			command.args,
+			[
+				RecordedArg::Regular(OsString::from("regular")),
+				RecordedArg::Raw(raw),
+				RecordedArg::Regular(regular_surrogate),
+			]
+		);
+	}
+}
