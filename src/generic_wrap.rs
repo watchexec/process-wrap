@@ -138,11 +138,7 @@ macro_rules! Wrap {
 			}
 
 			#[inline]
-			fn spawn_inner(
-				&mut self,
-				command: &mut $command,
-				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<$child>,
-			) -> ::std::io::Result<Box<dyn $childer>> {
+			fn run_pre_spawn(&mut self, command: &mut $command) -> ::std::io::Result<()> {
 				for index in 0..self.wrappers.len() {
 					#[cfg(feature = "tracing")]
 					{
@@ -157,26 +153,14 @@ macro_rules! Wrap {
 					})?;
 				}
 
-				let mut child = spawner(command)?;
-				for index in 0..self.wrappers.len() {
-					#[cfg(feature = "tracing")]
-					{
-						let id = self
-								.wrappers
-								.get_index(index)
-								.expect("wrapper indices cannot disappear during ordered hook traversal").0;
-						::tracing::debug!(?id, "post_spawn");
-					}
-					self.with_wrapper_at(index, |wrapper, core| {
-						wrapper.post_spawn(command, &mut child, core)
-					})?;
-				}
+				Ok(())
+			}
 
-				let mut child = Box::new(
-					#[allow(clippy::redundant_closure_call)]
-					$first_child_wrapper(child),
-				) as Box<dyn $childer>;
-
+			#[inline]
+			fn run_wrap_child(
+				&mut self,
+				mut child: Box<dyn $childer>,
+			) -> ::std::io::Result<Box<dyn $childer>> {
 				for index in 0..self.wrappers.len() {
 					#[cfg(feature = "tracing")]
 					{
@@ -194,6 +178,71 @@ macro_rules! Wrap {
 				Ok(child)
 			}
 
+			#[inline]
+			fn with_command<T>(
+				&mut self,
+				invoke: impl FnOnce(
+					&mut CommandWrap,
+					&mut $command,
+				) -> ::std::io::Result<T>,
+			) -> ::std::io::Result<T> {
+				let mut command = ::std::mem::replace(&mut self.command, <$command>::new(""));
+				let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+					invoke(self, &mut command)
+				}));
+
+				self.command = command;
+
+				match result {
+					Ok(result) => result,
+					Err(payload) => ::std::panic::resume_unwind(payload),
+				}
+			}
+
+			#[inline]
+			fn spawn_inner(
+				&mut self,
+				command: &mut $command,
+				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<$child>,
+			) -> ::std::io::Result<Box<dyn $childer>> {
+				self.run_pre_spawn(command)?;
+
+				let mut child = spawner(command)?;
+				for index in 0..self.wrappers.len() {
+					#[cfg(feature = "tracing")]
+					{
+						let id = self
+								.wrappers
+								.get_index(index)
+								.expect("wrapper indices cannot disappear during ordered hook traversal").0;
+						::tracing::debug!(?id, "post_spawn");
+					}
+					self.with_wrapper_at(index, |wrapper, core| {
+						wrapper.post_spawn(command, &mut child, core)
+					})?;
+				}
+
+				let child = Box::new(
+					#[allow(clippy::redundant_closure_call)]
+					$first_child_wrapper(child),
+				) as Box<dyn $childer>;
+
+				self.run_wrap_child(child)
+			}
+
+			#[inline]
+			fn spawn_with_child_inner(
+				&mut self,
+				command: &mut $command,
+				spawner: impl FnOnce(
+					&mut $command,
+				) -> ::std::io::Result<Box<dyn $childer>>,
+			) -> ::std::io::Result<Box<dyn $childer>> {
+				self.run_pre_spawn(command)?;
+				let child = spawner(command)?;
+				self.run_wrap_child(child)
+			}
+
 			/// Spawn the command, returning a `Child` that can be interacted with.
 			///
 			/// In order, this runs all the `pre_spawn` hooks, then spawns the command, then runs
@@ -204,11 +253,12 @@ macro_rules! Wrap {
 				self.spawn_with(|command| command.spawn())
 			}
 
-			/// Spawn the command using a custom spawner function.
+			/// Spawn the command using a custom native-child spawner function.
 			///
 			/// This is like [`spawn`](Self::spawn), but instead of calling `command.spawn()`
-			/// directly, it calls the provided closure to create the child process. This is
-			/// useful when you need to use a platform-specific or custom spawning mechanism.
+			/// directly, it calls the provided closure to create the native child process. This is
+			/// useful when you need to use a platform-specific spawning mechanism that still returns
+			#[doc = concat!("a [`", stringify!($child), "`].")]
 			///
 			/// The lifecycle is the same as `spawn`: all `pre_spawn` hooks run first, then
 			/// the provided closure is called, then `post_spawn` hooks, then `wrap_child`.
@@ -216,17 +266,26 @@ macro_rules! Wrap {
 				&mut self,
 				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<$child>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
-				let mut command = ::std::mem::replace(&mut self.command, <$command>::new(""));
-				let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-					self.spawn_inner(&mut command, spawner)
-				}));
+				self.with_command(|core, command| core.spawn_inner(command, spawner))
+			}
 
-				self.command = command;
-
-				match result {
-					Ok(result) => result,
-					Err(payload) => ::std::panic::resume_unwind(payload),
-				}
+			/// Spawn the command using a custom boxed-child spawner function.
+			///
+			/// This is the spawning path for custom child implementations which do not return the
+			#[doc = concat!("native [`", stringify!($child), "`] type. The closure must return a boxed [`", stringify!($childer), "`] trait object.")]
+			///
+			/// All `pre_spawn` hooks run first, then the provided closure is called, then
+			/// `wrap_child` hooks are applied. `post_spawn` is intentionally skipped because that
+			#[doc = concat!("hook requires a native [`", stringify!($child), "`]. Use [`spawn_with`](Self::spawn_with) when the spawner returns one.")]
+			pub fn spawn_with_child(
+				&mut self,
+				spawner: impl FnOnce(
+					&mut $command,
+				) -> ::std::io::Result<Box<dyn $childer>>,
+			) -> ::std::io::Result<Box<dyn $childer>> {
+				self.with_command(|core, command| {
+					core.spawn_with_child_inner(command, spawner)
+				})
 			}
 
 			/// Check if a wrapper of a given type is present.
