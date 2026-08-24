@@ -126,10 +126,10 @@
 //!
 //! The trait provides extension or hook points into the lifecycle of a `Command`:
 //!
-//! - **`fn extend(&mut self, other: Box<dyn CommandWrapper>)`** is called if
-//!   `.wrap(YourWrapper)` is done twice. Only one of a wrapper type can exist, so this gives the
-//!   opportunity to incorporate all or part of the second wrapper instance into the first. By
-//!   default, this does nothing (ie only the first registered wrapper instance of a type applies).
+//! - **`fn extend(&mut self, other: Self)`** is called if `.wrap(YourWrapper)` is done twice.
+//!   Only one wrapper of a given type can exist, so this gives the stored instance an opportunity to
+//!   incorporate all or part of the second, concretely typed wrapper. By default, this does nothing
+//!   (that is, only the first registered wrapper instance of a type applies).
 //!
 //! - **`fn pre_spawn(&mut self, command: &mut Command, core: &CommandWrap)`** is called before
 //!   the command is spawned, and gives mutable access to it. It also gives mutable access to the
