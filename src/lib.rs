@@ -498,11 +498,8 @@ mod command;
 pub(crate) mod generic_wrap;
 #[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
 pub(crate) mod unix;
-#[cfg(all(
-	unix,
-	any(feature = "std", feature = "tokio1"),
-	feature = "process-group"
-))]
+#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, any(feature = "std", feature = "tokio1")))))]
 pub use unix::ProcessGroupTarget;
 
 #[cfg(windows)]

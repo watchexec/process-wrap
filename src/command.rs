@@ -1241,32 +1241,27 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// Return the process-group setup requested for this attempt.
 	///
 	/// Alternate spawn providers use this to apply process-group intent without making the attempt
-	/// native-only.
-	#[cfg(all(
-		unix,
-		any(feature = "std", feature = "tokio1"),
-		feature = "process-group"
-	))]
+	/// native-only. This method remains available when the `process-group` wrapper feature is disabled
+	/// and returns `None` in that configuration.
+	#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
 	pub fn process_group_target(&self) -> Option<crate::ProcessGroupTarget> {
 		self.unix_policy.process_group
 	}
 
 	/// Return whether this attempt must create a new process session.
-	#[cfg(all(
-		unix,
-		any(feature = "std", feature = "tokio1"),
-		feature = "process-session"
-	))]
+	///
+	/// This method remains available when the `process-session` wrapper feature is disabled and returns
+	/// `false` in that configuration.
+	#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
 	pub fn creates_process_session(&self) -> bool {
 		self.unix_policy.process_session
 	}
 
 	/// Return whether this attempt must reset the child signal mask.
-	#[cfg(all(
-		unix,
-		any(feature = "std", feature = "tokio1"),
-		feature = "reset-sigmask"
-	))]
+	///
+	/// This method remains available when the `reset-sigmask` wrapper feature is disabled and returns
+	/// `false` in that configuration.
+	#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
 	pub fn resets_sigmask(&self) -> bool {
 		self.unix_policy.reset_sigmask
 	}

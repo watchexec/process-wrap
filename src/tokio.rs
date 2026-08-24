@@ -8,8 +8,16 @@
 //! use process_wrap::tokio::*;
 //! ```
 
+#[cfg(unix)]
+#[cfg_attr(docsrs, doc(cfg(unix)))]
+#[doc(inline)]
+pub use crate::ProcessGroupTarget;
 #[doc(inline)]
 pub use crate::SpawnTransaction;
+#[cfg(windows)]
+#[cfg_attr(docsrs, doc(cfg(windows)))]
+#[doc(inline)]
+pub use crate::WindowsSpawnPolicy;
 #[doc(inline)]
 pub use core::{
 	ChildWrapper, Command, CommandWrap, CommandWrapper, ProviderProduct, SpawnAttempt,

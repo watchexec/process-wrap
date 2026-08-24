@@ -186,6 +186,12 @@ macro_rules! spawn_provider_tests {
 				) -> io::Result<()> {
 					self.assert_callback_visibility(command);
 					assert!(!attempt.is_native_only());
+					#[cfg(unix)]
+					{
+						assert_eq!(attempt.process_group_target(), None);
+						assert!(!attempt.creates_process_session());
+						assert!(!attempt.resets_sigmask());
+					}
 					assert!(attempt.get_envs().any(|(key, value)| {
 						key == OsStr::new("PROCESS_WRAP_PROVIDER_HOOK")
 							&& value == Some(OsStr::new(self.name))
@@ -867,6 +873,15 @@ mod tokio_kill_on_drop_policy {
 		assert_eq!(error.to_string(), "kill-on-drop policy inspected");
 	}
 }
+
+#[cfg(all(unix, feature = "std"))]
+const _: Option<process_wrap::std::ProcessGroupTarget> = None;
+#[cfg(all(unix, feature = "tokio1"))]
+const _: Option<process_wrap::tokio::ProcessGroupTarget> = None;
+#[cfg(all(windows, feature = "std"))]
+const _: Option<process_wrap::std::WindowsSpawnPolicy> = None;
+#[cfg(all(windows, feature = "tokio1"))]
+const _: Option<process_wrap::tokio::WindowsSpawnPolicy> = None;
 
 #[cfg(feature = "std")]
 spawn_provider_tests!(
