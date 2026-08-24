@@ -1427,6 +1427,16 @@ impl<B: Backend> SpawnAttempt<B> {
 		self.native_command_mut()
 	}
 
+	pub(crate) fn native_for_explicit_spawn(&mut self) -> &mut B::NativeCommand {
+		self.materialize_native();
+		self.prepare_platform();
+		#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+		if self.native_only_base {
+			self.platform.unix.require_reinstall();
+		}
+		self.native_command_mut()
+	}
+
 	/// Mutably access the frontend's native command for this spawn attempt.
 	///
 	/// Calling this makes only this attempt native-only. An alternate portable provider rejects that

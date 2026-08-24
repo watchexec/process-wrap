@@ -136,6 +136,16 @@ impl CommandState {
 		self.0.invalidate();
 	}
 
+	/// Require the next native-only attempt to install a fresh dispatcher callback.
+	///
+	/// The currently active callback remains usable by an explicit spawner which has just received the
+	/// native command, but arbitrary mutation may replace and drop it before that spawner returns.
+	pub(crate) fn require_reinstall(&self) {
+		self.0
+			.installed_on_native_only
+			.store(false, Ordering::Release);
+	}
+
 	pub(crate) fn disarm(&self) {
 		self.0.disarm();
 	}

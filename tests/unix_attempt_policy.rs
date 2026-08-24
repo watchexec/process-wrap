@@ -35,7 +35,7 @@ macro_rules! unix_attempt_policy_tests {
 
 			use nix::{
 				sys::signal::{Signal, killpg},
-				unistd::Pid,
+				unistd::{Pid, getpgid},
 			};
 			use $child_wrapper as ChildWrapper;
 			use $command_wrap as CommandWrap;
@@ -177,6 +177,13 @@ macro_rules! unix_attempt_policy_tests {
 				$runtime
 			}
 
+			fn fail<T>(failure: Failure, message: &'static str) -> io::Result<T> {
+				match failure {
+					Failure::Error => Err(io::Error::other(message)),
+					Failure::Panic => panic_any(message),
+				}
+			}
+
 			fn command_with_exit(code: i32) -> CommandWrap {
 				CommandWrap::with_new("sh", |command| {
 					command.args(["-c", &format!("exit {code}")]);
@@ -270,6 +277,52 @@ macro_rules! unix_attempt_policy_tests {
 					for _ in 0..2 {
 						let mut child = command.spawn().unwrap();
 						assert!(wait_for_exit(child.as_mut()).success());
+					}
+				}
+			}
+
+			#[test]
+			fn explicit_native_replacement_forces_dispatcher_reinstallation() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for boxed_child in [false, true] {
+					for failure in [Failure::Error, Failure::Panic] {
+						let mut command = command_with_exit(0);
+						let _ = command.native_mut();
+						command.wrap(ProcessGroup::leader());
+
+						let outcome = catch_unwind(AssertUnwindSafe(|| {
+							if boxed_child {
+								command.spawn_with_child(|native| {
+									($replace_native)(native);
+									fail(failure, "explicit spawner failed")
+								})
+							} else {
+								command.spawn_with(|native| {
+									($replace_native)(native);
+									fail(failure, "explicit spawner failed")
+								})
+							}
+						}));
+						match failure {
+							Failure::Error => assert_eq!(
+								outcome.unwrap().unwrap_err().to_string(),
+								"explicit spawner failed"
+							),
+							Failure::Panic => assert_eq!(
+								*outcome
+									.expect_err("the explicit spawner must panic")
+									.downcast::<&'static str>()
+									.unwrap(),
+								"explicit spawner failed"
+							),
+						}
+
+						let mut child = command.spawn().unwrap();
+						let pid = Pid::from_raw(i32::try_from(child_id(child.as_ref())).unwrap());
+						assert_eq!(getpgid(Some(pid)).unwrap(), pid);
+						child.start_kill().unwrap();
+						let _ = wait_for_exit(child.as_mut());
 					}
 				}
 			}

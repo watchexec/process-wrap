@@ -561,7 +561,7 @@ macro_rules! Wrap {
 				self.reject_explicit_provider()?;
 				self.with_spawn_attempt(|command, attempt| {
 					command.run_pre_spawn(attempt)?;
-					let child = spawner(attempt.native_for_spawn())?;
+					let child = spawner(attempt.native_for_explicit_spawn())?;
 					let child = Box::new(
 						#[allow(clippy::redundant_closure_call)]
 						$first_child_wrapper(child),
@@ -586,7 +586,7 @@ macro_rules! Wrap {
 				self.reject_explicit_provider()?;
 				self.with_spawn_attempt(|command, attempt| {
 					command.run_pre_spawn(attempt)?;
-					let child = spawner(attempt.native_for_spawn())?;
+					let child = spawner(attempt.native_for_explicit_spawn())?;
 					command.finish_spawn(attempt, child)
 				})
 			}
