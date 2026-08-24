@@ -145,13 +145,13 @@
 //!   incorporate all or part of the second, concretely typed wrapper. By default, this does nothing
 //!   (that is, only the first registered wrapper instance of a type applies).
 //!
-//! - **`fn pre_spawn(&mut self, command: &mut tokio::process::Command, core: &Command)`** is called
-//!   before the command is spawned, and gives mutable access to that attempt's native command. It
-//!   also gives mutable access to the wrapper instance, so state can be stored if needed. The `core`
+//! - **`fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, core: &Command)`** is called before the
+//!   command is spawned, and gives mutable access to that spawn attempt's command state. It also
+//!   gives mutable access to the wrapper instance, so state can be stored if needed. The `core`
 //!   reference gives access to data from other wrappers; for example, that's how `CreationFlags` on
 //!   Windows works along with `JobObject`. By default does nothing.
 //!
-//! - **`fn post_spawn(&mut self, command: &mut tokio::process::Command, child: &mut tokio::process::Child, core: &Command)`**
+//! - **`fn post_spawn(&mut self, attempt: &mut SpawnAttempt, child: &mut dyn ChildWrapper, core: &Command)`**
 //!   is called after spawn, and should be used for any necessary cleanups. It is offered for
 //!   completeness but is expected to be less used than `wrap_child()`. By default does nothing.
 //!
@@ -171,8 +171,8 @@
 //! in.
 //!
 //! ```rust
-//! # use process_wrap::std::{CommandWrap, CommandWrapper};
-//! # use std::{fs::File, io, path::PathBuf, process::Command, thread};
+//! # use process_wrap::std::{CommandWrap, CommandWrapper, SpawnAttempt};
+//! # use std::{fs::File, io, path::PathBuf, thread};
 //! #[derive(Debug)]
 //! struct LogFile {
 //!     path: PathBuf,
@@ -185,7 +185,7 @@
 //! }
 //!
 //! impl CommandWrapper for LogFile {
-//!     fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> io::Result<()> {
+//!     fn pre_spawn(&mut self, command: &mut SpawnAttempt, _core: &CommandWrap) -> io::Result<()> {
 //!         let mut logfile = File::create(&self.path)?;
 //!         let (mut rx, tx) = io::pipe()?;
 //!
@@ -193,7 +193,9 @@
 //!          io::copy(&mut rx, &mut logfile).unwrap();
 //!         });
 //!
-//!         command.stdout(tx.try_clone()?).stderr(tx);
+//!         command
+//!             .stdout(tx.try_clone()?.into())
+//!             .stderr(tx.into());
 //!         Ok(())
 //!     }
 //! }
@@ -206,12 +208,14 @@
 //! when calling `.wait()` on the `ChildWrapper`.
 //!
 //! ```rust
-//! # use process_wrap::std::{ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper};
+//! # use process_wrap::std::{
+//! #     ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper, SpawnAttempt,
+//! # };
 //! # use std::{
 //! #     fs::File,
 //! #     io, mem,
 //! #     path::PathBuf,
-//! #     process::{Command, ExitStatus},
+//! #     process::ExitStatus,
 //! #     thread::{self, JoinHandle},
 //! # };
 //! #[derive(Debug)]
@@ -230,7 +234,7 @@
 //! }
 //!
 //! impl CommandWrapper for LogFile {
-//!     fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> io::Result<()> {
+//!     fn pre_spawn(&mut self, command: &mut SpawnAttempt, _core: &CommandWrap) -> io::Result<()> {
 //!         let mut logfile = File::create(&self.path)?;
 //!         let (mut rx, tx) = io::pipe()?;
 //!
@@ -238,7 +242,9 @@
 //!          io::copy(&mut rx, &mut logfile).unwrap();
 //!         }));
 //!
-//!         command.stdout(tx.try_clone()?).stderr(tx);
+//!         command
+//!             .stdout(tx.try_clone()?.into())
+//!             .stderr(tx.into());
 //!         Ok(())
 //!     }
 //!
@@ -302,13 +308,15 @@
 //! Finally, we can test that our new command-wrapper works:
 //!
 //! ```rust
-//! # use process_wrap::std::{ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper};
+//! # use process_wrap::std::{
+//! #     ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper, SpawnAttempt,
+//! # };
 //! # use std::{
 //! #     error::Error,
 //! #     fs::{self, File},
 //! #     io, mem,
 //! #     path::PathBuf,
-//! #     process::{Child, Command, ExitStatus},
+//! #     process::ExitStatus,
 //! #     thread::{self, JoinHandle},
 //! # };
 //! # use tempfile::NamedTempFile;
@@ -328,7 +336,7 @@
 //! # }
 //! #
 //! # impl CommandWrapper for LogFile {
-//! #     fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> io::Result<()> {
+//! #     fn pre_spawn(&mut self, command: &mut SpawnAttempt, _core: &CommandWrap) -> io::Result<()> {
 //! #         let mut logfile = File::create(&self.path)?;
 //! #         let (mut rx, tx) = io::pipe()?;
 //! #
@@ -336,7 +344,9 @@
 //! #          io::copy(&mut rx, &mut logfile).unwrap();
 //! #         }));
 //! #
-//! #         command.stdout(tx.try_clone()?).stderr(tx);
+//! #         command
+//! #             .stdout(tx.try_clone()?.into())
+//! #             .stderr(tx.into());
 //! #         Ok(())
 //! #     }
 //! #
@@ -443,9 +453,9 @@
 mod command;
 pub(crate) mod generic_wrap;
 
-pub use command::Command;
 #[doc(hidden)]
 pub use command::{Backend, Blocking, NativeCommand, Tokio1};
+pub use command::{Command, SpawnAttempt, SpawnTransaction};
 
 #[cfg(feature = "std")]
 pub mod std;

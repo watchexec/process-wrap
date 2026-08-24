@@ -463,6 +463,55 @@ impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
 	}
 }
 
+/// Cleanup and finalization owned by an alternate spawn provider.
+///
+/// A transaction is returned armed after a provider creates a child. Process-wrap calls [`commit`]
+/// only after every post-spawn and child-wrapping hook succeeds. On any later error or panic,
+/// process-wrap calls [`rollback`] and preserves the original failure even if rollback also fails.
+/// Implementations must own their cleanup resources independently of the child wrapper chain.
+///
+/// [`commit`]: SpawnTransaction::commit
+/// [`rollback`]: SpawnTransaction::rollback
+pub trait SpawnTransaction: fmt::Debug + Send + 'static {
+	/// Finalize the successful spawn and disarm rollback resources.
+	fn commit(&mut self) -> std::io::Result<()>;
+
+	/// Undo an uncommitted spawn.
+	fn rollback(&mut self) -> std::io::Result<()>;
+}
+
+enum AttemptState<N> {
+	Tracked(CommandIntent),
+	NativeOnly(N),
+}
+
+impl<N: fmt::Debug> fmt::Debug for AttemptState<N> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Tracked(intent) => f.debug_tuple("Tracked").field(intent).finish(),
+			Self::NativeOnly(command) => f.debug_tuple("NativeOnly").field(command).finish(),
+		}
+	}
+}
+
+/// The command configuration for one spawn attempt.
+///
+/// Each call to a spawn method creates a fresh attempt. Hooks may modify it without changing a
+/// tracked base [`Command`]. Explicit native mutation makes only that attempt native-only, which
+/// alternate portable spawn providers reject rather than reconstructing or partially applying.
+pub struct SpawnAttempt<B: Backend> {
+	state: AttemptState<B::NativeCommand>,
+	backend: PhantomData<fn() -> B>,
+}
+
+impl<B: Backend> fmt::Debug for SpawnAttempt<B> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("SpawnAttempt")
+			.field("state", &self.state)
+			.finish()
+	}
+}
+
 /// A configurable process command with composable wrappers.
 ///
 /// The backend type is normally selected through `process_wrap::std::Command` or
@@ -714,20 +763,38 @@ impl<B: Backend> Command<B> {
 			.expect("the backend always creates its matching wrapper registry")
 	}
 
-	pub(crate) fn with_native<T>(
+	/// Return whether this command contains opaque native-only state.
+	pub fn is_native_only(&self) -> bool {
+		matches!(self.state, CommandState::NativeOnly(_))
+	}
+
+	pub(crate) fn with_spawn_attempt<T>(
 		&mut self,
-		invoke: impl FnOnce(&mut Self, &mut B::NativeCommand) -> std::io::Result<T>,
+		invoke: impl FnOnce(&mut Self, &mut SpawnAttempt<B>) -> std::io::Result<T>,
 	) -> std::io::Result<T> {
 		match &mut self.state {
 			CommandState::Tracked(intent) => {
-				let mut native = intent.materialize::<B::NativeCommand>();
-				invoke(self, &mut native)
+				let mut attempt = SpawnAttempt {
+					state: AttemptState::Tracked(intent.clone()),
+					backend: PhantomData,
+				};
+				invoke(self, &mut attempt)
 			}
 			CommandState::NativeOnly(command) => {
-				let mut native = command.take();
+				let native = command.take();
+				let mut attempt = SpawnAttempt {
+					state: AttemptState::NativeOnly(native),
+					backend: PhantomData,
+				};
 				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-					invoke(self, &mut native)
+					invoke(self, &mut attempt)
 				}));
+				let native = match attempt.state {
+					AttemptState::NativeOnly(native) => native,
+					AttemptState::Tracked(_) => {
+						unreachable!("a native-only spawn attempt cannot become tracked")
+					}
+				};
 				match &mut self.state {
 					CommandState::NativeOnly(command) => command.restore(native),
 					CommandState::Tracked(_) => {
@@ -740,6 +807,285 @@ impl<B: Backend> Command<B> {
 				}
 			}
 		}
+	}
+}
+
+impl<B: Backend> SpawnAttempt<B> {
+	/// Add an argument for this spawn attempt.
+	pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		let arg = arg.as_ref();
+		match &mut self.state {
+			AttemptState::Tracked(intent) => intent.args.push(CommandArg::Regular(arg.to_owned())),
+			AttemptState::NativeOnly(command) => command.arg(arg),
+		}
+		self
+	}
+
+	/// Add multiple arguments for this spawn attempt.
+	pub fn args<I, S>(&mut self, args: I) -> &mut Self
+	where
+		I: IntoIterator<Item = S>,
+		S: AsRef<OsStr>,
+	{
+		for arg in args {
+			self.arg(arg);
+		}
+		self
+	}
+
+	/// Add a raw command-line fragment without quoting or escaping.
+	///
+	/// This method is only available on Windows.
+	#[cfg(windows)]
+	pub fn raw_arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		let arg = arg.as_ref();
+		match &mut self.state {
+			AttemptState::Tracked(intent) => intent.args.push(CommandArg::Raw(arg.to_owned())),
+			AttemptState::NativeOnly(command) => command.raw_arg(arg),
+		}
+		self
+	}
+
+	/// Set an environment variable for this spawn attempt.
+	pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
+		let key = key.as_ref();
+		let value = value.as_ref();
+		match &mut self.state {
+			AttemptState::Tracked(intent) => intent
+				.env
+				.push(EnvChange::Set(key.to_owned(), value.to_owned())),
+			AttemptState::NativeOnly(command) => command.env(key, value),
+		}
+		self
+	}
+
+	/// Set multiple environment variables for this spawn attempt.
+	pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
+	where
+		I: IntoIterator<Item = (K, V)>,
+		K: AsRef<OsStr>,
+		V: AsRef<OsStr>,
+	{
+		for (key, value) in vars {
+			self.env(key, value);
+		}
+		self
+	}
+
+	/// Remove an environment variable for this spawn attempt.
+	pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
+		let key = key.as_ref();
+		match &mut self.state {
+			AttemptState::Tracked(intent) => intent.env_remove(key),
+			AttemptState::NativeOnly(command) => command.env_remove(key),
+		}
+		self
+	}
+
+	/// Clear configured variables and prevent inheritance for this spawn attempt.
+	pub fn env_clear(&mut self) -> &mut Self {
+		match &mut self.state {
+			AttemptState::Tracked(intent) => {
+				intent.env_clear = true;
+				intent.env.clear();
+			}
+			AttemptState::NativeOnly(command) => command.env_clear(),
+		}
+		self
+	}
+
+	/// Set the child process's current directory for this spawn attempt.
+	pub fn current_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
+		let dir = dir.as_ref();
+		match &mut self.state {
+			AttemptState::Tracked(intent) => intent.current_dir = Some(dir.to_owned()),
+			AttemptState::NativeOnly(command) => command.current_dir(dir),
+		}
+		self
+	}
+
+	/// Configure standard input and make this spawn attempt native-only.
+	pub fn stdin(&mut self, stdio: Stdio) -> &mut Self {
+		self.native_mut().stdin(stdio);
+		self
+	}
+
+	/// Configure standard output and make this spawn attempt native-only.
+	pub fn stdout(&mut self, stdio: Stdio) -> &mut Self {
+		self.native_mut().stdout(stdio);
+		self
+	}
+
+	/// Configure standard error and make this spawn attempt native-only.
+	pub fn stderr(&mut self, stdio: Stdio) -> &mut Self {
+		self.native_mut().stderr(stdio);
+		self
+	}
+
+	/// Get the configured program for this spawn attempt.
+	pub fn get_program(&self) -> &OsStr {
+		match &self.state {
+			AttemptState::Tracked(intent) => &intent.program,
+			AttemptState::NativeOnly(command) => command.get_program(),
+		}
+	}
+
+	/// Get the configured arguments for this spawn attempt.
+	pub fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
+		match &self.state {
+			AttemptState::Tracked(intent) => Box::new(intent.args.iter().map(CommandArg::value)),
+			AttemptState::NativeOnly(command) => command.get_args(),
+		}
+	}
+
+	/// Get explicitly configured environment changes for this spawn attempt.
+	pub fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+		match &self.state {
+			AttemptState::Tracked(intent) => Box::new(intent.get_envs()),
+			AttemptState::NativeOnly(command) => command.get_envs(),
+		}
+	}
+
+	/// Get the configured current directory for this spawn attempt.
+	pub fn get_current_dir(&self) -> Option<&Path> {
+		match &self.state {
+			AttemptState::Tracked(intent) => intent.current_dir.as_deref(),
+			AttemptState::NativeOnly(command) => command.get_current_dir(),
+		}
+	}
+
+	/// Mutably access the frontend's native command for this spawn attempt.
+	///
+	/// Calling this makes only this attempt native-only. An alternate portable provider rejects that
+	/// attempt because it cannot recover exact portable intent after arbitrary native mutation.
+	pub fn native_mut(&mut self) -> &mut B::NativeCommand {
+		if let AttemptState::Tracked(intent) = &self.state {
+			let command = intent.materialize::<B::NativeCommand>();
+			self.state = AttemptState::NativeOnly(command);
+		}
+
+		match &mut self.state {
+			AttemptState::NativeOnly(command) => command,
+			AttemptState::Tracked(_) => {
+				unreachable!("tracked spawn attempt was materialized above")
+			}
+		}
+	}
+
+	/// Return whether this spawn attempt contains opaque native-only state.
+	pub fn is_native_only(&self) -> bool {
+		matches!(self.state, AttemptState::NativeOnly(_))
+	}
+}
+
+#[cfg(all(feature = "std", unix))]
+impl SpawnAttempt<Blocking> {
+	/// Set the child process's user ID and make this spawn attempt native-only.
+	pub fn uid(&mut self, id: u32) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::uid(self.native_mut(), id);
+		self
+	}
+
+	/// Set the child process's group ID and make this spawn attempt native-only.
+	pub fn gid(&mut self, id: u32) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::gid(self.native_mut(), id);
+		self
+	}
+
+	/// Set the child process's `argv[0]` and make this spawn attempt native-only.
+	pub fn arg0(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::arg0(self.native_mut(), arg);
+		self
+	}
+
+	/// Set the child process's process group and make this spawn attempt native-only.
+	pub fn process_group(&mut self, pgroup: i32) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::process_group(self.native_mut(), pgroup);
+		self
+	}
+
+	/// Register a callback to run in the child after `fork` and make this attempt native-only.
+	///
+	/// # Safety
+	///
+	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
+	/// operations which are valid in that constrained environment.
+	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
+	where
+		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
+	{
+		use ::std::os::unix::process::CommandExt;
+		// SAFETY: the caller accepts the native `pre_exec` contract documented above.
+		unsafe { CommandExt::pre_exec(self.native_mut(), f) };
+		self
+	}
+}
+
+#[cfg(all(feature = "std", windows))]
+impl SpawnAttempt<Blocking> {
+	/// Set Windows process creation flags and make this spawn attempt native-only.
+	pub fn creation_flags(&mut self, flags: u32) -> &mut Self {
+		use ::std::os::windows::process::CommandExt;
+		CommandExt::creation_flags(self.native_mut(), flags);
+		self
+	}
+}
+
+#[cfg(feature = "tokio1")]
+impl SpawnAttempt<Tokio1> {
+	/// Configure whether dropping the Tokio child kills it and make this attempt native-only.
+	pub fn kill_on_drop(&mut self, kill_on_drop: bool) -> &mut Self {
+		self.native_mut().kill_on_drop(kill_on_drop);
+		self
+	}
+}
+
+#[cfg(all(feature = "tokio1", unix))]
+impl SpawnAttempt<Tokio1> {
+	/// Set the child process's user ID and make this spawn attempt native-only.
+	pub fn uid(&mut self, id: u32) -> &mut Self {
+		self.native_mut().uid(id);
+		self
+	}
+
+	/// Set the child process's group ID and make this spawn attempt native-only.
+	pub fn gid(&mut self, id: u32) -> &mut Self {
+		self.native_mut().gid(id);
+		self
+	}
+
+	/// Set the child process's `argv[0]` and make this spawn attempt native-only.
+	pub fn arg0(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		self.native_mut().arg0(arg);
+		self
+	}
+
+	/// Register a callback to run in the child after `fork` and make this attempt native-only.
+	///
+	/// # Safety
+	///
+	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
+	/// operations which are valid in that constrained environment.
+	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
+	where
+		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
+	{
+		// SAFETY: the caller accepts the native `pre_exec` contract documented above.
+		unsafe { self.native_mut().pre_exec(f) };
+		self
+	}
+}
+
+#[cfg(all(feature = "tokio1", windows))]
+impl SpawnAttempt<Tokio1> {
+	/// Set Windows process creation flags and make this spawn attempt native-only.
+	pub fn creation_flags(&mut self, flags: u32) -> &mut Self {
+		self.native_mut().creation_flags(flags);
+		self
 	}
 }
 

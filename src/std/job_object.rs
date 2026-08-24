@@ -1,10 +1,7 @@
 use std::{
 	io::{Error, ErrorKind, Result},
-	os::windows::{
-		io::{AsRawHandle, BorrowedHandle},
-		process::CommandExt,
-	},
-	process::{Command, ExitStatus},
+	os::windows::io::{AsRawHandle, BorrowedHandle},
+	process::ExitStatus,
 	time::Duration,
 };
 
@@ -24,13 +21,13 @@ use crate::{
 
 #[cfg(feature = "creation-flags")]
 use super::CreationFlags;
-use super::{ChildWrapper, CommandWrap, CommandWrapper};
+use super::{ChildWrapper, CommandWrap, CommandWrapper, SpawnAttempt};
 
 /// Wrapper which creates a job object context for a `Command`.
 ///
 /// This wrapper is only available on Windows.
 ///
-/// It creates a Windows Job Object and associates the [`Command`] to it. This behaves analogously
+/// It creates a Windows Job Object and associates the [`Command`](super::Command) to it. This behaves analogously
 /// to process groups on Unix or even cgroups on Linux, with the ability to restrict resource use.
 /// See [Job Objects](https://docs.microsoft.com/en-us/windows/win32/procthread/job-objects).
 ///
@@ -70,9 +67,9 @@ fn child_process_handle(child: &dyn ChildWrapper) -> Option<BorrowedHandle<'_>> 
 
 impl CommandWrapper for JobObject {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
-	fn pre_spawn(&mut self, command: &mut Command, core: &CommandWrap) -> Result<()> {
+	fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, core: &CommandWrap) -> Result<()> {
 		let policy = job_creation_flags(user_creation_flags(core));
-		command.creation_flags(policy.flags.0);
+		attempt.creation_flags(policy.flags.0);
 		Ok(())
 	}
 

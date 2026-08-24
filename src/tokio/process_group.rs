@@ -16,19 +16,19 @@ use nix::{
 	},
 	unistd::Pid,
 };
-use tokio::{process::Command, task::spawn_blocking};
+use tokio::task::spawn_blocking;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
 use crate::ChildExitStatus;
 
-use super::{ChildWrapper, CommandWrap, CommandWrapper};
+use super::{ChildWrapper, CommandWrap, CommandWrapper, SpawnAttempt};
 
 /// Wrapper which sets the process group of a `Command`.
 ///
 /// This wrapper is only available on Unix.
 ///
-/// It sets the process group of a [`Command`], either to itself as the leader of a new group, or to
+/// It sets the process group of a [`Command`](super::Command), either to itself as the leader of a new group, or to
 /// an existing one by its PGID. See [setpgid(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/setpgid.html).
 ///
 /// Process groups direct signals to all members of the group, and also serve to control job
@@ -84,8 +84,8 @@ impl ProcessGroupChild {
 
 impl CommandWrapper for ProcessGroup {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
-	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
-		crate::command::tokio_process_group(command, self.leader.as_raw());
+	fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, _core: &CommandWrap) -> Result<()> {
+		crate::command::tokio_process_group(attempt.native_mut(), self.leader.as_raw());
 		Ok(())
 	}
 

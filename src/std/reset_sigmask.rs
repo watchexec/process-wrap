@@ -1,10 +1,10 @@
-use std::{io::Result, os::unix::process::CommandExt, process::Command};
+use std::io::Result;
 
 use nix::sys::signal::{SigSet, SigmaskHow, sigprocmask};
 #[cfg(feature = "tracing")]
 use tracing::trace;
 
-use super::{CommandWrap, CommandWrapper};
+use super::{CommandWrap, CommandWrapper, SpawnAttempt};
 
 /// Wrapper which resets the process signal mask.
 ///
@@ -14,9 +14,9 @@ use super::{CommandWrap, CommandWrapper};
 pub struct ResetSigmask;
 
 impl CommandWrapper for ResetSigmask {
-	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
+	fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, _core: &CommandWrap) -> Result<()> {
 		unsafe {
-			command.pre_exec(|| {
+			attempt.pre_exec(|| {
 				let mut oldset = SigSet::empty();
 				let newset = SigSet::all();
 

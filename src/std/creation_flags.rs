@@ -1,8 +1,8 @@
-use std::{io::Result, os::windows::process::CommandExt, process::Command};
+use std::io::Result;
 
 use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
-use super::{CommandWrap, CommandWrapper};
+use super::{CommandWrap, CommandWrapper, SpawnAttempt};
 
 #[cfg(feature = "job-object")]
 use super::JobObject;
@@ -23,7 +23,7 @@ use crate::windows::job_creation_flags;
 pub struct CreationFlags(pub PROCESS_CREATION_FLAGS);
 
 impl CommandWrapper for CreationFlags {
-	fn pre_spawn(&mut self, command: &mut Command, core: &CommandWrap) -> Result<()> {
+	fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, core: &CommandWrap) -> Result<()> {
 		#[cfg(feature = "job-object")]
 		let flags = if core.has_wrap::<JobObject>() {
 			job_creation_flags(self.0).flags
@@ -36,7 +36,7 @@ impl CommandWrapper for CreationFlags {
 			self.0
 		};
 
-		command.creation_flags(flags.0);
+		attempt.creation_flags(flags.0);
 		Ok(())
 	}
 }

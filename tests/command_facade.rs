@@ -2,17 +2,13 @@
 mod std_frontend {
 	use std::{ffi::OsStr, io};
 
-	use process_wrap::std::{Command, CommandWrap, CommandWrapper};
+	use process_wrap::std::{Command, CommandWrap, CommandWrapper, SpawnAttempt};
 
 	#[derive(Debug)]
 	struct AttemptArgument;
 
 	impl CommandWrapper for AttemptArgument {
-		fn pre_spawn(
-			&mut self,
-			command: &mut std::process::Command,
-			_core: &CommandWrap,
-		) -> io::Result<()> {
+		fn pre_spawn(&mut self, command: &mut SpawnAttempt, _core: &CommandWrap) -> io::Result<()> {
 			command.arg("attempt");
 			Ok(())
 		}
@@ -22,11 +18,7 @@ mod std_frontend {
 	struct InspectFacade;
 
 	impl CommandWrapper for InspectFacade {
-		fn pre_spawn(
-			&mut self,
-			_command: &mut std::process::Command,
-			core: &CommandWrap,
-		) -> io::Result<()> {
+		fn pre_spawn(&mut self, _command: &mut SpawnAttempt, core: &CommandWrap) -> io::Result<()> {
 			assert_eq!(core.command().get_program(), OsStr::new("tool"));
 			assert_eq!(
 				core.command().get_args().collect::<Vec<_>>(),
@@ -233,17 +225,13 @@ mod std_frontend {
 mod tokio_frontend {
 	use std::{ffi::OsStr, io};
 
-	use process_wrap::tokio::{Command, CommandWrap, CommandWrapper};
+	use process_wrap::tokio::{Command, CommandWrap, CommandWrapper, SpawnAttempt};
 
 	#[derive(Debug)]
 	struct AttemptArgument;
 
 	impl CommandWrapper for AttemptArgument {
-		fn pre_spawn(
-			&mut self,
-			command: &mut tokio::process::Command,
-			_core: &CommandWrap,
-		) -> io::Result<()> {
+		fn pre_spawn(&mut self, command: &mut SpawnAttempt, _core: &CommandWrap) -> io::Result<()> {
 			command.arg("attempt");
 			Ok(())
 		}
@@ -253,11 +241,7 @@ mod tokio_frontend {
 	struct InspectFacade;
 
 	impl CommandWrapper for InspectFacade {
-		fn pre_spawn(
-			&mut self,
-			_command: &mut tokio::process::Command,
-			core: &CommandWrap,
-		) -> io::Result<()> {
+		fn pre_spawn(&mut self, _command: &mut SpawnAttempt, core: &CommandWrap) -> io::Result<()> {
 			assert_eq!(core.command().get_program(), OsStr::new("tool"));
 			assert_eq!(
 				core.command().get_args().collect::<Vec<_>>(),

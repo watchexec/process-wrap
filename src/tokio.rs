@@ -9,7 +9,12 @@
 //! ```
 
 #[doc(inline)]
-pub use core::{ChildWrapper, Command, CommandWrap, CommandWrapper};
+pub use crate::SpawnTransaction;
+#[doc(inline)]
+pub use core::{
+	ChildWrapper, Command, CommandWrap, CommandWrapper, ProviderProduct, SpawnAttempt,
+	SpawnProvider,
+};
 #[cfg(all(windows, feature = "creation-flags"))]
 #[doc(inline)]
 pub use creation_flags::CreationFlags;
