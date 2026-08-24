@@ -266,7 +266,10 @@ The trait provides extension or hook points into the lifecycle of a `Command`:
   is called before spawning. It can record portable configuration on this attempt and inspect peer
   wrappers through `command`. For tracked commands those mutations apply to one attempt; native-only
   commands retain native mutations. Calling `attempt.native_mut()` or its `stdin`/`stdout`/`stderr`
-  methods makes a tracked attempt incompatible with a portable provider.
+  methods makes a tracked attempt incompatible with a portable provider. On Unix, recurring native
+  escapes from a reusable native-only command can retain inactive child-setup callbacks because the
+  native API does not expose callback insertion or command ownership; prefer portable attempt methods
+  for recurring configuration.
 
 - **`fn post_spawn(&mut self, attempt: &mut SpawnAttempt, child: &mut dyn ChildWrapper, command: &Command) -> io::Result<()>`**
   is called after any transport has created its child. The child may be a terminal custom/provider

@@ -674,7 +674,9 @@ macro_rules! Wrap {
 			/// tracked attempt opaque. A registered portable provider rejects it after all pre-spawn hooks
 			/// and before `validate_attempt` or operating-system allocation. Portable policy setters remain
 			/// representable; a transport may apply their policy only after every hook has run and in the
-			/// order required by the platform.
+			/// order required by the platform. On Unix, recurring native escapes from a native-only base can
+			/// retain inactive dispatcher callbacks because the native API does not expose callback insertion
+			/// or command ownership; use portable attempt methods for recurring configuration.
 			///
 			/// The `command` reference provides read-only access to peer wrappers and persistent base
 			/// configuration. The active wrapper remains registered but is temporarily unavailable through

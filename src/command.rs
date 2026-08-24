@@ -990,6 +990,11 @@ impl<B: Backend> Command<B> {
 	/// recover exact portable intent after arbitrary native mutation. On Unix, process-wrap reinstalls
 	/// any built-in child setup when it next spawns the command, so replacing the native value does not
 	/// discard that setup.
+	///
+	/// On Unix, every mutable native escape must conservatively invalidate process-wrap's installed
+	/// child-setup callback because the native API does not reveal whether a callback was added or the
+	/// command was moved out. Repeated escapes from the same native-only command can therefore retain
+	/// inactive callbacks; use the tracked facade methods and wrappers for reusable configuration.
 	pub fn native_mut(&mut self) -> &mut B::NativeCommand {
 		if let CommandState::Tracked(intent) = &self.state {
 			let command = intent.materialize::<B::NativeCommand>();
@@ -1467,6 +1472,11 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// attempt because it cannot recover exact portable intent after arbitrary native mutation. On
 	/// Unix, built-in child setup is installed after all pre-spawn hooks have run, so replacing the
 	/// native value here does not discard that setup.
+	///
+	/// Each Unix native escape conservatively invalidates any dispatcher callback retained from an
+	/// earlier attempt because process-wrap cannot observe native callback insertion or ownership
+	/// changes. A wrapper which does this on every reuse of a native-only command can therefore leave
+	/// inactive callbacks attached; prefer portable attempt methods for recurring configuration.
 	pub fn native_mut(&mut self) -> &mut B::NativeCommand {
 		self.make_native_only();
 		self.invalidate_platform();
