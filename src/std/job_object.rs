@@ -57,19 +57,10 @@ fn terminate_child(child: &mut dyn ChildWrapper) {
 	}
 }
 
-fn child_process_handle(child: &dyn ChildWrapper) -> Option<BorrowedHandle<'_>> {
-	child.process_handle().or_else(|| {
-		child
-			.try_inner_child()
-			.and_then(|child| child.process_handle())
-	})
-}
-
 impl CommandWrapper for JobObject {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
-	fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, core: &CommandWrap) -> Result<()> {
-		let policy = job_creation_flags(user_creation_flags(core));
-		attempt.creation_flags(policy.flags.0);
+	fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, _core: &CommandWrap) -> Result<()> {
+		attempt.set_job_object();
 		Ok(())
 	}
 
@@ -89,7 +80,7 @@ impl CommandWrapper for JobObject {
 
 		// Prefer the explicit capability, while preserving composition with transparent wrappers
 		// written before `process_handle` was added.
-		let handle = match child_process_handle(inner.as_ref()) {
+		let handle = match inner.as_ref().try_process_handle() {
 			Some(handle) => HANDLE(handle.as_raw_handle()),
 			None => {
 				terminate_child(&mut *inner);
@@ -109,7 +100,11 @@ impl CommandWrapper for JobObject {
 		};
 
 		if policy.resume_after_assignment {
-			if let Err(error) = resume_threads(handle) {
+			let resumed = inner
+				.as_mut()
+				.try_resume_after_job_assignment()
+				.unwrap_or_else(|| resume_threads(handle));
+			if let Err(error) = resumed {
 				let _ = terminate_job(job_port.job, 1);
 				terminate_child(&mut *inner);
 				return Err(error);
@@ -156,7 +151,7 @@ impl ChildWrapper for JobObjectChild {
 		self.inner
 	}
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
-		child_process_handle(self.inner.as_ref())
+		self.inner.try_process_handle()
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]

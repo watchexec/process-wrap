@@ -9,6 +9,9 @@ use std::{
 	process::Stdio,
 };
 
+#[cfg(windows)]
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle};
+
 /// Blocking standard-library process frontend.
 #[doc(hidden)]
 #[derive(Debug)]
@@ -79,6 +82,15 @@ pub trait NativeCommand: fmt::Debug + Sized + 'static {
 	where
 		F: FnMut() -> std::io::Result<()> + Send + Sync + 'static;
 
+	/// Configure whether dropping a child kills it, where the frontend supports that policy.
+	fn configure_kill_on_drop(&mut self, kill_on_drop: bool) {
+		debug_assert!(!kill_on_drop, "only Tokio commands support kill-on-drop");
+	}
+
+	/// Set Windows process creation flags.
+	#[cfg(windows)]
+	fn creation_flags(&mut self, flags: u32);
+
 	/// Get the program.
 	fn get_program(&self) -> &OsStr;
 
@@ -144,6 +156,12 @@ impl NativeCommand for std::process::Command {
 		use std::os::unix::process::CommandExt;
 		// SAFETY: the caller accepts the native `pre_exec` contract.
 		unsafe { CommandExt::pre_exec(self, callback) };
+	}
+
+	#[cfg(windows)]
+	fn creation_flags(&mut self, flags: u32) {
+		use std::os::windows::process::CommandExt;
+		CommandExt::creation_flags(self, flags);
 	}
 
 	fn get_program(&self) -> &OsStr {
@@ -213,6 +231,15 @@ impl NativeCommand for tokio::process::Command {
 	{
 		// SAFETY: the caller accepts the native `pre_exec` contract.
 		unsafe { self.pre_exec(callback) };
+	}
+
+	fn configure_kill_on_drop(&mut self, kill_on_drop: bool) {
+		self.kill_on_drop(kill_on_drop);
+	}
+
+	#[cfg(windows)]
+	fn creation_flags(&mut self, flags: u32) {
+		self.creation_flags(flags);
 	}
 
 	fn get_program(&self) -> &OsStr {
@@ -505,6 +532,163 @@ pub trait SpawnTransaction: fmt::Debug + Send + 'static {
 	fn rollback(&mut self) -> std::io::Result<()>;
 }
 
+#[cfg(windows)]
+const CREATE_SUSPENDED_FLAG: u32 = 0x0000_0004;
+
+/// Portable Windows process-creation policy for one spawn attempt.
+///
+/// Alternate providers use this policy to preserve creation flags and compose with `JobObject` and
+/// Tokio `KillOnDrop` without inspecting an opaque native command.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WindowsSpawnPolicy {
+	user_creation_flags: u32,
+	spawn_creation_flags: u32,
+	has_creation_flags: bool,
+	has_job_object: bool,
+	kill_on_drop: bool,
+}
+
+#[cfg(windows)]
+impl WindowsSpawnPolicy {
+	/// Return the flags explicitly requested through `CreationFlags`.
+	pub fn user_creation_flags(self) -> u32 {
+		self.user_creation_flags
+	}
+
+	/// Return the complete flags the transport must use when creating the process.
+	///
+	/// This includes process-wrap's temporary `CREATE_SUSPENDED` flag when a job object must be
+	/// assigned before the process starts running.
+	pub fn spawn_creation_flags(self) -> u32 {
+		self.spawn_creation_flags
+	}
+
+	/// Return whether `CreationFlags` configured this attempt.
+	pub fn has_creation_flags(self) -> bool {
+		self.has_creation_flags
+	}
+
+	/// Return whether this attempt must assign the child to a job object.
+	pub fn has_job_object(self) -> bool {
+		self.has_job_object
+	}
+
+	/// Return whether the caller explicitly requested `CREATE_SUSPENDED`.
+	pub fn is_explicitly_suspended(self) -> bool {
+		self.user_creation_flags & CREATE_SUSPENDED_FLAG != 0
+	}
+
+	/// Return whether process-wrap added temporary suspension for job-object assignment.
+	pub fn is_temporarily_suspended(self) -> bool {
+		self.has_job_object && !self.is_explicitly_suspended()
+	}
+
+	/// Return whether the child starts suspended for either reason.
+	pub fn starts_suspended(self) -> bool {
+		self.spawn_creation_flags & CREATE_SUSPENDED_FLAG != 0
+	}
+
+	/// Return whether dropping the direct Tokio child must terminate it.
+	pub fn kills_on_drop(self) -> bool {
+		self.kill_on_drop
+	}
+
+	#[cfg(feature = "creation-flags")]
+	fn set_creation_flags(&mut self, flags: u32) {
+		self.user_creation_flags = flags;
+		self.has_creation_flags = true;
+		self.recompute_spawn_flags();
+	}
+
+	#[cfg(feature = "job-object")]
+	fn set_job_object(&mut self) {
+		self.has_job_object = true;
+		self.recompute_spawn_flags();
+	}
+
+	#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
+	fn set_kill_on_drop(&mut self, kill_on_drop: bool) {
+		self.kill_on_drop = kill_on_drop;
+	}
+
+	#[cfg(any(feature = "creation-flags", feature = "job-object"))]
+	fn recompute_spawn_flags(&mut self) {
+		self.spawn_creation_flags = self.user_creation_flags;
+		if self.has_job_object {
+			self.spawn_creation_flags |= CREATE_SUSPENDED_FLAG;
+		}
+	}
+
+	fn applies_creation_flags(self) -> bool {
+		self.has_creation_flags || self.has_job_object
+	}
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+	fn TerminateProcess(process: *mut std::ffi::c_void, exit_code: u32) -> i32;
+	fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+}
+
+#[cfg(windows)]
+const WAIT_FAILED: u32 = u32::MAX;
+#[cfg(windows)]
+const WAIT_INFINITE: u32 = u32::MAX;
+
+#[cfg(windows)]
+pub(crate) fn terminate_process_and_wait(process: BorrowedHandle<'_>) -> std::io::Result<()> {
+	let raw = process.as_raw_handle();
+	// SAFETY: `raw` is a live process handle for both calls and remains borrowed until they finish.
+	let terminate_error = if unsafe { TerminateProcess(raw, 1) } == 0 {
+		Some(std::io::Error::last_os_error())
+	} else {
+		None
+	};
+	// SAFETY: the process handle remains live for the duration of this call.
+	let wait_error = if unsafe { WaitForSingleObject(raw, WAIT_INFINITE) } == WAIT_FAILED {
+		Some(std::io::Error::last_os_error())
+	} else {
+		None
+	};
+
+	match (terminate_error, wait_error) {
+		(None, None) => Ok(()),
+		(Some(error), _) | (None, Some(error)) => Err(error),
+	}
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct WindowsSpawnCleanup {
+	process: OwnedHandle,
+	armed: bool,
+}
+
+#[cfg(windows)]
+impl WindowsSpawnCleanup {
+	pub(crate) fn new(process: BorrowedHandle<'_>) -> std::io::Result<Self> {
+		Ok(Self {
+			process: process.try_clone_to_owned()?,
+			armed: true,
+		})
+	}
+
+	pub(crate) fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+#[cfg(windows)]
+impl Drop for WindowsSpawnCleanup {
+	fn drop(&mut self) {
+		if self.armed {
+			let _ = terminate_process_and_wait(self.process.as_handle());
+		}
+	}
+}
+
 enum AttemptState<N> {
 	Tracked(CommandIntent),
 	NativeOnly(N),
@@ -536,6 +720,9 @@ pub struct SpawnAttempt<B: Backend> {
 	platform: PlatformCommandState,
 	#[cfg_attr(not(unix), allow(dead_code))]
 	native_only_base: bool,
+	kill_on_drop: Option<bool>,
+	#[cfg(windows)]
+	windows_policy: WindowsSpawnPolicy,
 	#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
 	unix_policy: crate::unix::SpawnPolicy,
 	backend: PhantomData<fn() -> B>,
@@ -824,6 +1011,9 @@ impl<B: Backend> Command<B> {
 					state: AttemptState::Tracked(intent.clone()),
 					platform,
 					native_only_base: false,
+					kill_on_drop: None,
+					#[cfg(windows)]
+					windows_policy: WindowsSpawnPolicy::default(),
 					#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
 					unix_policy: crate::unix::SpawnPolicy::default(),
 					backend: PhantomData,
@@ -843,6 +1033,9 @@ impl<B: Backend> Command<B> {
 					state: AttemptState::NativeOnly(native),
 					platform,
 					native_only_base: true,
+					kill_on_drop: None,
+					#[cfg(windows)]
+					windows_policy: WindowsSpawnPolicy::default(),
 					#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
 					unix_policy: crate::unix::SpawnPolicy::default(),
 					backend: PhantomData,
@@ -1016,6 +1209,42 @@ impl<B: Backend> SpawnAttempt<B> {
 		}
 	}
 
+	/// Return whether dropping the direct child must terminate it.
+	///
+	/// This is currently a Tokio policy. Alternate Tokio providers use it to preserve the behavior of
+	/// the `KillOnDrop` wrapper without requiring a native Tokio command.
+	pub fn kills_on_drop(&self) -> bool {
+		self.kill_on_drop.unwrap_or(false)
+	}
+
+	/// Return the portable Windows creation policy for this attempt.
+	#[cfg(windows)]
+	pub fn windows_spawn_policy(&self) -> WindowsSpawnPolicy {
+		self.windows_policy
+	}
+
+	#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
+	pub(crate) fn set_kill_on_drop(&mut self, kill_on_drop: bool) {
+		self.kill_on_drop = Some(kill_on_drop);
+		#[cfg(windows)]
+		self.windows_policy.set_kill_on_drop(kill_on_drop);
+	}
+
+	#[cfg(all(windows, feature = "creation-flags"))]
+	pub(crate) fn set_windows_creation_flags(&mut self, flags: u32) {
+		self.windows_policy.set_creation_flags(flags);
+	}
+
+	#[cfg(all(windows, feature = "job-object"))]
+	pub(crate) fn set_job_object(&mut self) {
+		self.windows_policy.set_job_object();
+	}
+
+	#[cfg(windows)]
+	pub(crate) fn starts_suspended(&self) -> bool {
+		self.windows_policy.starts_suspended()
+	}
+
 	/// Return the process-group setup requested for this attempt.
 	///
 	/// Alternate spawn providers use this to apply process-group intent without making the attempt
@@ -1080,6 +1309,25 @@ impl<B: Backend> SpawnAttempt<B> {
 	}
 
 	fn prepare_platform(&mut self) {
+		let kill_on_drop = self.kill_on_drop;
+		#[cfg(windows)]
+		let windows_policy = self.windows_policy;
+		{
+			let command = match &mut self.state {
+				AttemptState::NativeOnly(command) => command,
+				AttemptState::Tracked(_) => {
+					unreachable!("the attempt is materialized before platform setup")
+				}
+			};
+			if let Some(kill_on_drop) = kill_on_drop {
+				command.configure_kill_on_drop(kill_on_drop);
+			}
+			#[cfg(windows)]
+			if windows_policy.applies_creation_flags() {
+				command.creation_flags(windows_policy.spawn_creation_flags());
+			}
+		}
+
 		#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
 		{
 			let policy = self.unix_policy;
@@ -1422,6 +1670,8 @@ mod windows_tests {
 		fn stdout(&mut self, _stdio: Stdio) {}
 
 		fn stderr(&mut self, _stdio: Stdio) {}
+
+		fn creation_flags(&mut self, _flags: u32) {}
 
 		fn get_program(&self) -> &OsStr {
 			&self.program

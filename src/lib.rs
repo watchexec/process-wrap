@@ -461,6 +461,8 @@ pub(crate) mod unix;
 ))]
 pub use unix::ProcessGroupTarget;
 
+#[cfg(windows)]
+pub use command::WindowsSpawnPolicy;
 #[doc(hidden)]
 pub use command::{Backend, Blocking, NativeCommand, Tokio1};
 pub use command::{Command, SpawnAttempt, SpawnTransaction};

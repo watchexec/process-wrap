@@ -314,8 +314,39 @@ macro_rules! Wrap {
 				attempt: &mut SpawnAttempt,
 				mut child: Box<dyn $childer>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
-				self.run_post_spawn(attempt, child.as_mut())?;
-				self.run_wrap_child(child)
+				#[cfg(windows)]
+				let mut cleanup = if attempt.starts_suspended() {
+					let handle = match child.as_ref().try_process_handle() {
+						Some(handle) => handle,
+						None => {
+							let _ = child.start_kill();
+							return Err(::std::io::Error::new(
+								::std::io::ErrorKind::Unsupported,
+								"child wrapper does not expose a Windows process handle",
+							));
+						}
+					};
+					match crate::command::WindowsSpawnCleanup::new(handle) {
+						Ok(cleanup) => Some(cleanup),
+						Err(error) => {
+							let _ = crate::command::terminate_process_and_wait(handle);
+							return Err(error);
+						}
+					}
+				} else {
+					None
+				};
+
+				let result = self
+					.run_post_spawn(attempt, child.as_mut())
+					.and_then(|()| self.run_wrap_child(child));
+				#[cfg(windows)]
+				if result.is_ok() {
+					if let Some(cleanup) = cleanup.as_mut() {
+						cleanup.disarm();
+					}
+				}
+				result
 			}
 
 			fn rollback_transaction(transaction: Box<dyn crate::SpawnTransaction>) {

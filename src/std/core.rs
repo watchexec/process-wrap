@@ -100,6 +100,16 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 		None
 	}
 
+	/// Resume the exact thread which process-wrap temporarily suspended for job-object assignment.
+	///
+	/// This method is only available on Windows. A provider child which retains its primary thread
+	/// handle should return `Some(result)` after attempting one exact resume. Other children retain the
+	/// default `None`, which lets `JobObject` use its process-wide compatibility fallback.
+	#[cfg(windows)]
+	fn resume_after_job_assignment(&mut self) -> Option<Result<()>> {
+		None
+	}
+
 	/// Obtain a clone if possible.
 	///
 	/// Some implementations may make it possible to clone the implementing structure, even though
@@ -296,6 +306,50 @@ impl dyn ChildWrapper + '_ {
 
 	fn is_raw_child(&self) -> bool {
 		self.downcast_ref::<Child>().is_some()
+	}
+
+	/// Find the first Windows process-handle capability in this wrapper chain.
+	///
+	/// Unlike [`ChildWrapper::process_handle`], this traverses legacy transparent layers which do not
+	/// explicitly delegate the capability. It returns `None` at a self-terminal custom child.
+	#[cfg(windows)]
+	pub fn try_process_handle(&self) -> Option<BorrowedHandle<'_>> {
+		let mut inner = self;
+		loop {
+			if let Some(handle) = inner.process_handle() {
+				return Some(handle);
+			}
+
+			let next = inner.inner();
+			if same_child(inner, next) {
+				return None;
+			}
+			inner = next;
+		}
+	}
+
+	/// Try the first exact post-assignment resume capability in this wrapper chain.
+	///
+	/// Returns `None` when no layer owns an exact primary-thread resume operation, allowing callers to
+	/// use a compatibility fallback.
+	#[cfg(windows)]
+	pub fn try_resume_after_job_assignment(&mut self) -> Option<Result<()>> {
+		let mut inner = self;
+		loop {
+			if let Some(result) = inner.resume_after_job_assignment() {
+				return Some(result);
+			}
+
+			let inner_type = (&*inner as &dyn Any).type_id();
+			let inner_ptr = std::ptr::from_mut(inner);
+			let next = inner.inner_mut();
+			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
+				&& inner_type == (&*next as &dyn Any).type_id()
+			{
+				return None;
+			}
+			inner = next;
+		}
 	}
 
 	/// Try to obtain a reference to the underlying native [`Child`].

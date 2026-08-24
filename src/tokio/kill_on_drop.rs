@@ -12,7 +12,7 @@ pub struct KillOnDrop;
 
 impl CommandWrapper for KillOnDrop {
 	fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, _core: &CommandWrap) -> Result<()> {
-		attempt.kill_on_drop(true);
+		attempt.set_kill_on_drop(true);
 		Ok(())
 	}
 }
