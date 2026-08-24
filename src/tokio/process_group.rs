@@ -256,19 +256,17 @@ impl ChildWrapper for ProcessGroupChild {
 			};
 		}
 
-		let (drained, reaped) =
-			match Self::wait_imp(self.direct_pid, self.pgid, WaitPidFlag::WNOHANG)? {
-				ControlFlow::Break(status) => (true, status),
-				ControlFlow::Continue(status) => (false, status),
+		if matches!(self.exit_status, ChildExitStatus::Running) {
+			let Some(status) = self.inner.try_wait()? else {
+				return Ok(None);
 			};
-		if let Some(status) = reaped {
 			self.exit_status = ChildExitStatus::Exited(status);
 		}
-		if matches!(self.exit_status, ChildExitStatus::Running) {
-			if let Some(status) = self.inner.try_wait()? {
-				self.exit_status = ChildExitStatus::Exited(status);
-			}
-		}
+
+		let drained = match Self::wait_imp(self.direct_pid, self.pgid, WaitPidFlag::WNOHANG)? {
+			ControlFlow::Break(_) => true,
+			ControlFlow::Continue(_) => false,
+		};
 		self.group_drained = drained;
 
 		if !self.group_drained {
@@ -276,7 +274,9 @@ impl ChildWrapper for ProcessGroupChild {
 		}
 		match self.exit_status {
 			ChildExitStatus::Exited(status) => Ok(Some(status)),
-			ChildExitStatus::Running => Ok(None),
+			ChildExitStatus::Running => {
+				unreachable!("the direct child exited before group draining")
+			}
 		}
 	}
 
