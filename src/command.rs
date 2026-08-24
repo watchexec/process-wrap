@@ -594,25 +594,25 @@ impl WindowsSpawnPolicy {
 		self.kill_on_drop
 	}
 
-	#[cfg(feature = "creation-flags")]
+	#[cfg(any(feature = "creation-flags", test))]
 	fn set_creation_flags(&mut self, flags: u32) {
 		self.user_creation_flags = flags;
 		self.has_creation_flags = true;
 		self.recompute_spawn_flags();
 	}
 
-	#[cfg(feature = "job-object")]
+	#[cfg(any(feature = "job-object", test))]
 	fn set_job_object(&mut self) {
 		self.has_job_object = true;
 		self.recompute_spawn_flags();
 	}
 
-	#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
+	#[cfg(any(all(feature = "tokio1", feature = "kill-on-drop"), test))]
 	fn set_kill_on_drop(&mut self, kill_on_drop: bool) {
 		self.kill_on_drop = kill_on_drop;
 	}
 
-	#[cfg(any(feature = "creation-flags", feature = "job-object"))]
+	#[cfg(any(feature = "creation-flags", feature = "job-object", test))]
 	fn recompute_spawn_flags(&mut self) {
 		self.spawn_creation_flags = self.user_creation_flags;
 		if self.has_job_object {
@@ -1627,7 +1627,9 @@ mod windows_tests {
 		process::Stdio,
 	};
 
-	use super::{CommandArg, CommandIntent, NativeCommand};
+	use super::{
+		CREATE_SUSPENDED_FLAG, CommandArg, CommandIntent, NativeCommand, WindowsSpawnPolicy,
+	};
 
 	#[derive(Debug, Eq, PartialEq)]
 	enum RecordedArg {
@@ -1718,5 +1720,51 @@ mod windows_tests {
 				RecordedArg::Regular(regular_surrogate),
 			]
 		);
+	}
+
+	#[test]
+	fn windows_policy_preserves_flags_without_a_job() {
+		let flags = 0x0000_0200 | 0x0800_0000;
+		let mut policy = WindowsSpawnPolicy::default();
+		policy.set_creation_flags(flags);
+
+		assert!(policy.has_creation_flags());
+		assert_eq!(policy.user_creation_flags(), flags);
+		assert_eq!(policy.spawn_creation_flags(), flags);
+		assert!(!policy.has_job_object());
+		assert!(!policy.is_explicitly_suspended());
+		assert!(!policy.is_temporarily_suspended());
+		assert!(!policy.starts_suspended());
+	}
+
+	#[test]
+	fn windows_policy_adds_only_temporary_job_suspension() {
+		let flags = 0x0000_0200 | 0x0800_0000;
+		let mut policy = WindowsSpawnPolicy::default();
+		policy.set_job_object();
+		policy.set_creation_flags(flags);
+
+		assert_eq!(policy.user_creation_flags(), flags);
+		assert_eq!(policy.spawn_creation_flags(), flags | CREATE_SUSPENDED_FLAG);
+		assert!(policy.has_job_object());
+		assert!(!policy.is_explicitly_suspended());
+		assert!(policy.is_temporarily_suspended());
+		assert!(policy.starts_suspended());
+	}
+
+	#[test]
+	fn windows_policy_preserves_explicit_suspension_and_kill_on_drop() {
+		let flags = 0x0800_0000 | CREATE_SUSPENDED_FLAG;
+		let mut policy = WindowsSpawnPolicy::default();
+		policy.set_creation_flags(flags);
+		policy.set_job_object();
+		policy.set_kill_on_drop(true);
+
+		assert_eq!(policy.user_creation_flags(), flags);
+		assert_eq!(policy.spawn_creation_flags(), flags);
+		assert!(policy.is_explicitly_suspended());
+		assert!(!policy.is_temporarily_suspended());
+		assert!(policy.starts_suspended());
+		assert!(policy.kills_on_drop());
 	}
 }

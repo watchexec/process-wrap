@@ -820,6 +820,54 @@ macro_rules! spawn_provider_tests {
 	};
 }
 
+#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
+mod tokio_kill_on_drop_policy {
+	use std::io;
+
+	use process_wrap::tokio::{
+		Command, CommandWrapper, KillOnDrop, ProviderProduct, SpawnAttempt, SpawnProvider,
+	};
+
+	#[derive(Debug)]
+	struct InspectProvider;
+
+	impl SpawnProvider for InspectProvider {
+		fn validate_attempt(&self, attempt: &SpawnAttempt, _command: &Command) -> io::Result<()> {
+			assert!(!attempt.is_native_only());
+			assert!(attempt.kills_on_drop());
+			Err(io::Error::other("kill-on-drop policy inspected"))
+		}
+
+		fn spawn(
+			&self,
+			_attempt: &mut SpawnAttempt,
+			_command: &Command,
+		) -> io::Result<ProviderProduct> {
+			unreachable!("attempt validation stops before provider allocation")
+		}
+	}
+
+	#[derive(Debug)]
+	struct Provider(InspectProvider);
+
+	impl CommandWrapper for Provider {
+		fn spawn_provider(&self) -> Option<&dyn SpawnProvider> {
+			Some(&self.0)
+		}
+	}
+
+	#[test]
+	fn kill_on_drop_remains_portable_for_tokio_providers() {
+		let mut command = Command::new("provider-owned-program");
+		command.wrap(KillOnDrop).wrap(Provider(InspectProvider));
+
+		let error = command
+			.spawn()
+			.expect_err("policy inspection must stop before provider allocation");
+		assert_eq!(error.to_string(), "kill-on-drop policy inspected");
+	}
+}
+
 #[cfg(feature = "std")]
 spawn_provider_tests!(
 	std_frontend,
