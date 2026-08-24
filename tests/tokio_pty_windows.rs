@@ -24,9 +24,9 @@ use tokio::{
 use windows::Win32::{
 	Foundation::HANDLE,
 	System::Console::{
-		ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, GetConsoleMode,
-		GetConsoleScreenBufferInfo, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
-		STD_OUTPUT_HANDLE, SetConsoleMode,
+		ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+		ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle,
+		STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
 	},
 };
 
@@ -139,6 +139,7 @@ fn conpty_child_helper() -> io::Result<()> {
 			// SAFETY: stdin_handle is the live console input handle and console_mode is writable.
 			unsafe { GetConsoleMode(stdin_handle, &mut console_mode) }.map_err(io::Error::other)?;
 			console_mode &= !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
+			console_mode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
 			// SAFETY: stdin_handle remains live and console_mode is a valid combination of input flags.
 			unsafe { SetConsoleMode(stdin_handle, console_mode) }.map_err(io::Error::other)?;
 			print!("PW-READY");
