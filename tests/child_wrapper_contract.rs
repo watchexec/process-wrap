@@ -4,7 +4,6 @@
 mod std_frontend {
 	use std::{
 		any::TypeId,
-		panic::{AssertUnwindSafe, catch_unwind},
 		process::{Child, Command},
 		sync::{
 			Arc,
@@ -273,16 +272,6 @@ mod std_frontend {
 		child.type_id() == TypeId::of::<T>()
 	}
 
-	fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
-		if let Some(message) = payload.downcast_ref::<&str>() {
-			(*message).to_owned()
-		} else if let Some(message) = payload.downcast_ref::<String>() {
-			message.clone()
-		} else {
-			"non-string panic".to_owned()
-		}
-	}
-
 	#[test]
 	fn native_child_try_accessors_traverse_layers() {
 		let mut child = layered_native();
@@ -319,16 +308,6 @@ mod std_frontend {
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().expect("reap consuming-test child");
 		assert_eq!(into_inner_calls.load(Ordering::SeqCst), 2);
-	}
-
-	#[test]
-	fn legacy_native_accessors_still_traverse_layers() {
-		let mut child = layered_native();
-		let id = child.inner_child().id();
-		assert_eq!(unsafe { child.inner_child_mut() }.id(), id);
-		let mut child = unsafe { child.into_inner_child() };
-		assert_eq!(child.id(), id);
-		child.wait().expect("reap legacy-accessor child");
 	}
 
 	#[test]
@@ -372,26 +351,6 @@ mod std_frontend {
 		assert_eq!(calls.into_inner.load(Ordering::SeqCst), 0);
 		drop(child);
 		assert_eq!(calls.drops.load(Ordering::SeqCst), 1);
-	}
-
-	#[test]
-	fn legacy_accessors_panic_for_non_native_leaves() {
-		let (child, _) = leaf();
-		let panic = catch_unwind(AssertUnwindSafe(|| child.inner_child()))
-			.expect_err("immutable accessor must panic");
-		assert!(panic_text(panic).contains("std::process::Child"));
-
-		let (mut child, _) = leaf();
-		let panic = catch_unwind(AssertUnwindSafe(|| unsafe {
-			let _ = child.inner_child_mut();
-		}))
-		.expect_err("mutable accessor must panic");
-		assert!(panic_text(panic).contains("std::process::Child"));
-
-		let (child, _) = leaf();
-		let panic = catch_unwind(AssertUnwindSafe(|| unsafe { child.into_inner_child() }))
-			.expect_err("consuming accessor must panic");
-		assert!(panic_text(panic).contains("std::process::Child"));
 	}
 
 	#[test]
@@ -443,7 +402,6 @@ mod std_frontend {
 mod tokio_frontend {
 	use std::{
 		any::TypeId,
-		panic::{AssertUnwindSafe, catch_unwind},
 		sync::{
 			Arc,
 			atomic::{AtomicUsize, Ordering},
@@ -712,16 +670,6 @@ mod tokio_frontend {
 		child.type_id() == TypeId::of::<T>()
 	}
 
-	fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
-		if let Some(message) = payload.downcast_ref::<&str>() {
-			(*message).to_owned()
-		} else if let Some(message) = payload.downcast_ref::<String>() {
-			message.clone()
-		} else {
-			"non-string panic".to_owned()
-		}
-	}
-
 	#[tokio::test]
 	async fn native_child_try_accessors_traverse_layers() {
 		let mut child = layered_native();
@@ -758,16 +706,6 @@ mod tokio_frontend {
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().await.expect("reap consuming-test child");
 		assert_eq!(into_inner_calls.load(Ordering::SeqCst), 2);
-	}
-
-	#[tokio::test]
-	async fn legacy_native_accessors_still_traverse_layers() {
-		let mut child = layered_native();
-		let id = child.inner_child().id();
-		assert_eq!(unsafe { child.inner_child_mut() }.id(), id);
-		let mut child = unsafe { child.into_inner_child() };
-		assert_eq!(child.id(), id);
-		child.wait().await.expect("reap legacy-accessor child");
 	}
 
 	#[tokio::test]
@@ -811,26 +749,6 @@ mod tokio_frontend {
 		assert_eq!(calls.into_inner.load(Ordering::SeqCst), 0);
 		drop(child);
 		assert_eq!(calls.drops.load(Ordering::SeqCst), 1);
-	}
-
-	#[tokio::test]
-	async fn legacy_accessors_panic_for_non_native_leaves() {
-		let (child, _) = leaf();
-		let panic = catch_unwind(AssertUnwindSafe(|| child.inner_child()))
-			.expect_err("immutable accessor must panic");
-		assert!(panic_text(panic).contains("tokio::process::Child"));
-
-		let (mut child, _) = leaf();
-		let panic = catch_unwind(AssertUnwindSafe(|| unsafe {
-			let _ = child.inner_child_mut();
-		}))
-		.expect_err("mutable accessor must panic");
-		assert!(panic_text(panic).contains("tokio::process::Child"));
-
-		let (child, _) = leaf();
-		let panic = catch_unwind(AssertUnwindSafe(|| unsafe { child.into_inner_child() }))
-			.expect_err("consuming accessor must panic");
-		assert!(panic_text(panic).contains("tokio::process::Child"));
 	}
 
 	#[tokio::test]
