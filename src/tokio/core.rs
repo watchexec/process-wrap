@@ -27,10 +27,13 @@ crate::generic_wrap::Wrap!(Command, Child, ChildWrapper, |child| child);
 /// This trait exposes most of the functionality of the underlying [`Child`]. It is implemented for
 /// [`Child`] and by wrappers.
 ///
-/// The required methods are `inner`, `inner_mut`, and `into_inner`. Each non-terminal wrapper must
-/// use them to expose its direct lower layer. A terminal non-native child returns itself from all
-/// three methods. Wrapper chains must otherwise be acyclic and terminate in either a native
-/// [`Child`] or a self-returning non-native child.
+/// The required methods are `inner`, `inner_mut`, and `into_inner`. Together they expose each lower
+/// layer, allowing wrappers to be unwrapped and the native [`Child`] to be used directly when
+/// necessary.
+///
+/// Each non-terminal wrapper must use them to expose its direct lower layer. A terminal non-native
+/// child returns itself from all three methods. Wrapper chains must otherwise be acyclic and
+/// terminate in either a native [`Child`] or a self-returning non-native child.
 ///
 /// The `try_inner_child`, `try_inner_child_mut`, and `try_into_inner_child` convenience methods on
 /// the trait object traverse these layers when access to a native [`Child`] is required.
