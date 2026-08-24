@@ -7,8 +7,9 @@ fn nowrap() -> Result<()> {
 			command.stdin(Stdio::piped()).stdout(Stdio::piped());
 		})
 		.spawn()?
-		.into_inner_child()
-	};
+		.try_into_inner_child()
+	}
+	.map_err(|_| std::io::Error::other("spawned wrapper chain did not end in a native child"))?;
 
 	if let Some(mut din) = child.stdin.take() {
 		din.write_all(b"hello")?;
@@ -32,8 +33,9 @@ fn process_group() -> Result<()> {
 		})
 		.wrap(ProcessGroup::leader())
 		.spawn()?
-		.into_inner_child()
-	};
+		.try_into_inner_child()
+	}
+	.map_err(|_| std::io::Error::other("spawned wrapper chain did not end in a native child"))?;
 
 	if let Some(mut din) = child.stdin.take() {
 		din.write_all(b"hello")?;
@@ -57,8 +59,9 @@ fn process_session() -> Result<()> {
 		})
 		.wrap(ProcessSession)
 		.spawn()?
-		.into_inner_child()
-	};
+		.try_into_inner_child()
+	}
+	.map_err(|_| std::io::Error::other("spawned wrapper chain did not end in a native child"))?;
 
 	if let Some(mut din) = child.stdin.take() {
 		din.write_all(b"hello")?;

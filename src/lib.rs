@@ -261,6 +261,13 @@
 //!         self.inner
 //!     }
 //!
+//!     #[cfg(windows)]
+//!     fn process_handle(
+//!         &self,
+//!     ) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+//!         self.inner.process_handle()
+//!     }
+//!
 //!     fn wait(&mut self) -> io::Result<ExitStatus> {
 //!         let exit_status = self.inner.wait();
 //!
@@ -395,6 +402,13 @@
 //! #
 //! #     fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
 //! #         self.inner
+//! #     }
+//! #
+//! #     #[cfg(windows)]
+//! #     fn process_handle(
+//! #         &self,
+//! #     ) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+//! #         self.inner.process_handle()
 //! #     }
 //! #
 //! #     fn wait(&mut self) -> io::Result<ExitStatus> {

@@ -161,13 +161,13 @@ impl ProcessGroupChild {
 
 impl ChildWrapper for ProcessGroupChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		self.inner.inner()
+		self.inner.as_ref()
 	}
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		self.inner.inner_mut()
+		self.inner.as_mut()
 	}
 	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-		self.inner.into_inner()
+		self.inner
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]

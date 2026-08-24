@@ -1,6 +1,9 @@
 use std::{
-	io::Result,
-	os::windows::{io::AsRawHandle, process::CommandExt},
+	io::{Error, ErrorKind, Result},
+	os::windows::{
+		io::{AsRawHandle, BorrowedHandle},
+		process::CommandExt,
+	},
 	process::{Command, ExitStatus},
 	time::Duration,
 };
@@ -57,6 +60,14 @@ fn terminate_child(child: &mut dyn ChildWrapper) {
 	}
 }
 
+fn child_process_handle(child: &dyn ChildWrapper) -> Option<BorrowedHandle<'_>> {
+	child.process_handle().or_else(|| {
+		child
+			.try_inner_child()
+			.and_then(|child| child.process_handle())
+	})
+}
+
 impl CommandWrapper for JobObject {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, core: &CommandWrap) -> Result<()> {
@@ -79,7 +90,18 @@ impl CommandWrapper for JobObject {
 			"options from other wrappers"
 		);
 
-		let handle = HANDLE(inner.inner_child().as_raw_handle() as _);
+		// Prefer the explicit capability, while preserving composition with transparent wrappers
+		// written before `process_handle` was added.
+		let handle = match child_process_handle(inner.as_ref()) {
+			Some(handle) => HANDLE(handle.as_raw_handle()),
+			None => {
+				terminate_child(&mut *inner);
+				return Err(Error::new(
+					ErrorKind::Unsupported,
+					"child wrapper does not expose a Windows process handle",
+				));
+			}
+		};
 
 		let job_port = match make_job_object(handle, false) {
 			Ok(job_port) => job_port,
@@ -122,10 +144,10 @@ impl JobObjectChild {
 
 impl ChildWrapper for JobObjectChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		self.inner.inner()
+		self.inner.as_ref()
 	}
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		self.inner.inner_mut()
+		self.inner.as_mut()
 	}
 	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
 		// manually drop the completion port
@@ -134,7 +156,10 @@ impl ChildWrapper for JobObjectChild {
 		// we leave the job handle unclosed, otherwise the Child is useless
 		// (as closing it will terminate the job)
 
-		self.inner.into_inner()
+		self.inner
+	}
+	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
+		child_process_handle(self.inner.as_ref())
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
