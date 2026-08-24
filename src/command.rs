@@ -367,18 +367,98 @@ impl CommandIntent {
 	}
 }
 
+#[derive(Debug)]
+struct NativeCommandView {
+	program: OsString,
+	args: Vec<OsString>,
+	env: Vec<(OsString, Option<OsString>)>,
+	current_dir: Option<PathBuf>,
+}
+
+impl NativeCommandView {
+	fn capture<N: NativeCommand>(command: &N) -> Self {
+		Self {
+			program: command.get_program().to_owned(),
+			args: command.get_args().map(OsStr::to_owned).collect(),
+			env: command
+				.get_envs()
+				.map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+				.collect(),
+			current_dir: command.get_current_dir().map(Path::to_owned),
+		}
+	}
+
+	fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
+		Box::new(self.args.iter().map(OsString::as_os_str))
+	}
+
+	fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+		Box::new(
+			self.env
+				.iter()
+				.map(|(key, value)| (key.as_os_str(), value.as_deref())),
+		)
+	}
+}
+
+struct NativeOnlyCommand<N> {
+	command: Option<N>,
+	view: NativeCommandView,
+}
+
+impl<N: NativeCommand> NativeOnlyCommand<N> {
+	fn new(command: N) -> Self {
+		Self {
+			view: NativeCommandView::capture(&command),
+			command: Some(command),
+		}
+	}
+
+	fn command_mut(&mut self) -> &mut N {
+		self.command
+			.as_mut()
+			.expect("native command access cannot occur while a spawn lifecycle is active")
+	}
+
+	fn take(&mut self) -> N {
+		let command = self
+			.command
+			.take()
+			.expect("a native-only command is present when its spawn lifecycle begins");
+		self.view = NativeCommandView::capture(&command);
+		command
+	}
+
+	fn restore(&mut self, command: N) {
+		debug_assert!(self.command.is_none());
+		self.command = Some(command);
+	}
+
+	fn into_command(self) -> N {
+		self.command
+			.expect("a command cannot be consumed while its spawn lifecycle is active")
+	}
+}
+
+impl<N: fmt::Debug> fmt::Debug for NativeOnlyCommand<N> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("NativeOnly")
+			.field("command", &self.command)
+			.field("view", &self.view)
+			.finish()
+	}
+}
+
 enum CommandState<N> {
 	Tracked(CommandIntent),
-	NativeOnly(N),
-	Transitioning,
+	NativeOnly(NativeOnlyCommand<N>),
 }
 
 impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Tracked(intent) => f.debug_tuple("Tracked").field(intent).finish(),
-			Self::NativeOnly(command) => f.debug_tuple("NativeOnly").field(command).finish(),
-			Self::Transitioning => f.write_str("Transitioning"),
+			Self::NativeOnly(command) => command.fmt(f),
 		}
 	}
 }
@@ -440,10 +520,7 @@ impl<B: Backend> Command<B> {
 		let arg = arg.as_ref();
 		match &mut self.state {
 			CommandState::Tracked(intent) => intent.args.push(CommandArg::Regular(arg.to_owned())),
-			CommandState::NativeOnly(command) => command.arg(arg),
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
-			}
+			CommandState::NativeOnly(command) => command.command_mut().arg(arg),
 		}
 		self
 	}
@@ -468,10 +545,7 @@ impl<B: Backend> Command<B> {
 		let arg = arg.as_ref();
 		match &mut self.state {
 			CommandState::Tracked(intent) => intent.args.push(CommandArg::Raw(arg.to_owned())),
-			CommandState::NativeOnly(command) => command.raw_arg(arg),
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
-			}
+			CommandState::NativeOnly(command) => command.command_mut().raw_arg(arg),
 		}
 		self
 	}
@@ -484,10 +558,7 @@ impl<B: Backend> Command<B> {
 			CommandState::Tracked(intent) => intent
 				.env
 				.push(EnvChange::Set(key.to_owned(), value.to_owned())),
-			CommandState::NativeOnly(command) => command.env(key, value),
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
-			}
+			CommandState::NativeOnly(command) => command.command_mut().env(key, value),
 		}
 		self
 	}
@@ -510,10 +581,7 @@ impl<B: Backend> Command<B> {
 		let key = key.as_ref();
 		match &mut self.state {
 			CommandState::Tracked(intent) => intent.env_remove(key),
-			CommandState::NativeOnly(command) => command.env_remove(key),
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
-			}
+			CommandState::NativeOnly(command) => command.command_mut().env_remove(key),
 		}
 		self
 	}
@@ -525,10 +593,7 @@ impl<B: Backend> Command<B> {
 				intent.env_clear = true;
 				intent.env.clear();
 			}
-			CommandState::NativeOnly(command) => command.env_clear(),
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
-			}
+			CommandState::NativeOnly(command) => command.command_mut().env_clear(),
 		}
 		self
 	}
@@ -538,10 +603,7 @@ impl<B: Backend> Command<B> {
 		let dir = dir.as_ref();
 		match &mut self.state {
 			CommandState::Tracked(intent) => intent.current_dir = Some(dir.to_owned()),
-			CommandState::NativeOnly(command) => command.current_dir(dir),
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
-			}
+			CommandState::NativeOnly(command) => command.command_mut().current_dir(dir),
 		}
 		self
 	}
@@ -568,10 +630,10 @@ impl<B: Backend> Command<B> {
 	pub fn get_program(&self) -> &OsStr {
 		match &self.state {
 			CommandState::Tracked(intent) => &intent.program,
-			CommandState::NativeOnly(command) => command.get_program(),
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
-			}
+			CommandState::NativeOnly(command) => match &command.command {
+				Some(command) => command.get_program(),
+				None => &command.view.program,
+			},
 		}
 	}
 
@@ -579,10 +641,10 @@ impl<B: Backend> Command<B> {
 	pub fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
 		match &self.state {
 			CommandState::Tracked(intent) => Box::new(intent.args.iter().map(CommandArg::value)),
-			CommandState::NativeOnly(command) => command.get_args(),
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
-			}
+			CommandState::NativeOnly(command) => match &command.command {
+				Some(command) => command.get_args(),
+				None => command.view.get_args(),
+			},
 		}
 	}
 
@@ -590,10 +652,10 @@ impl<B: Backend> Command<B> {
 	pub fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
 		match &self.state {
 			CommandState::Tracked(intent) => Box::new(intent.get_envs()),
-			CommandState::NativeOnly(command) => command.get_envs(),
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
-			}
+			CommandState::NativeOnly(command) => match &command.command {
+				Some(command) => command.get_envs(),
+				None => command.view.get_envs(),
+			},
 		}
 	}
 
@@ -601,10 +663,10 @@ impl<B: Backend> Command<B> {
 	pub fn get_current_dir(&self) -> Option<&Path> {
 		match &self.state {
 			CommandState::Tracked(intent) => intent.current_dir.as_deref(),
-			CommandState::NativeOnly(command) => command.get_current_dir(),
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
-			}
+			CommandState::NativeOnly(command) => match &command.command {
+				Some(command) => command.get_current_dir(),
+				None => command.view.current_dir.as_deref(),
+			},
 		}
 	}
 
@@ -613,22 +675,14 @@ impl<B: Backend> Command<B> {
 	/// Calling this permanently makes the command native-only. Alternate portable transports cannot
 	/// recover exact portable intent after arbitrary native mutation.
 	pub fn native_mut(&mut self) -> &mut B::NativeCommand {
-		if matches!(self.state, CommandState::Tracked(_)) {
-			let state = std::mem::replace(&mut self.state, CommandState::Transitioning);
-			self.state = match state {
-				CommandState::Tracked(intent) => {
-					CommandState::NativeOnly(intent.materialize::<B::NativeCommand>())
-				}
-				_ => unreachable!("tracked command state was checked before transition"),
-			};
+		if let CommandState::Tracked(intent) = &self.state {
+			let command = intent.materialize::<B::NativeCommand>();
+			self.state = CommandState::NativeOnly(NativeOnlyCommand::new(command));
 		}
 
 		match &mut self.state {
-			CommandState::NativeOnly(command) => command,
+			CommandState::NativeOnly(command) => command.command_mut(),
 			CommandState::Tracked(_) => unreachable!("tracked command was materialized above"),
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
-			}
 		}
 	}
 
@@ -636,16 +690,13 @@ impl<B: Backend> Command<B> {
 	pub fn into_native(self) -> B::NativeCommand {
 		match self.state {
 			CommandState::Tracked(intent) => intent.materialize::<B::NativeCommand>(),
-			CommandState::NativeOnly(command) => command,
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
-			}
+			CommandState::NativeOnly(command) => command.into_command(),
 		}
 	}
 
 	pub(crate) fn from_native(command: B::NativeCommand) -> Self {
 		Self {
-			state: CommandState::NativeOnly(command),
+			state: CommandState::NativeOnly(NativeOnlyCommand::new(command)),
 			wrappers: B::new_registry(),
 			backend: PhantomData,
 		}
@@ -667,28 +718,26 @@ impl<B: Backend> Command<B> {
 		&mut self,
 		invoke: impl FnOnce(&mut Self, &mut B::NativeCommand) -> std::io::Result<T>,
 	) -> std::io::Result<T> {
-		match &self.state {
+		match &mut self.state {
 			CommandState::Tracked(intent) => {
 				let mut native = intent.materialize::<B::NativeCommand>();
 				invoke(self, &mut native)
 			}
-			CommandState::NativeOnly(_) => {
-				let state = std::mem::replace(&mut self.state, CommandState::Transitioning);
-				let mut native = match state {
-					CommandState::NativeOnly(native) => native,
-					_ => unreachable!("native-only command state was checked before transition"),
-				};
+			CommandState::NativeOnly(command) => {
+				let mut native = command.take();
 				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
 					invoke(self, &mut native)
 				}));
-				self.state = CommandState::NativeOnly(native);
+				match &mut self.state {
+					CommandState::NativeOnly(command) => command.restore(native),
+					CommandState::Tracked(_) => {
+						unreachable!("a spawn lifecycle cannot replace native-only command state")
+					}
+				}
 				match result {
 					Ok(result) => result,
 					Err(payload) => std::panic::resume_unwind(payload),
 				}
-			}
-			CommandState::Transitioning => {
-				unreachable!("command state is restored before returning")
 			}
 		}
 	}

@@ -19,6 +19,24 @@ mod std_frontend {
 	}
 
 	#[derive(Debug)]
+	struct InspectFacade;
+
+	impl CommandWrapper for InspectFacade {
+		fn pre_spawn(
+			&mut self,
+			_command: &mut std::process::Command,
+			core: &CommandWrap,
+		) -> io::Result<()> {
+			assert_eq!(core.command().get_program(), OsStr::new("tool"));
+			assert_eq!(
+				core.command().get_args().collect::<Vec<_>>(),
+				[OsStr::new("native")]
+			);
+			Ok(())
+		}
+	}
+
+	#[derive(Debug)]
 	struct Marker;
 
 	impl CommandWrapper for Marker {}
@@ -72,6 +90,19 @@ mod std_frontend {
 		}
 
 		assert_eq!(command.get_args().collect::<Vec<_>>(), [OsStr::new("base")]);
+	}
+
+	#[test]
+	fn native_only_facade_remains_readable_during_hooks() {
+		let mut native = std::process::Command::new("tool");
+		native.arg("native");
+		let mut command = Command::from(native);
+		command.wrap(InspectFacade);
+
+		let error = command
+			.spawn_with(|_| Err(io::Error::other("expected test error")))
+			.unwrap_err();
+		assert_eq!(error.to_string(), "expected test error");
 	}
 
 	#[test]
@@ -219,6 +250,24 @@ mod tokio_frontend {
 	}
 
 	#[derive(Debug)]
+	struct InspectFacade;
+
+	impl CommandWrapper for InspectFacade {
+		fn pre_spawn(
+			&mut self,
+			_command: &mut tokio::process::Command,
+			core: &CommandWrap,
+		) -> io::Result<()> {
+			assert_eq!(core.command().get_program(), OsStr::new("tool"));
+			assert_eq!(
+				core.command().get_args().collect::<Vec<_>>(),
+				[OsStr::new("native")]
+			);
+			Ok(())
+		}
+	}
+
+	#[derive(Debug)]
 	struct Marker;
 
 	impl CommandWrapper for Marker {}
@@ -272,6 +321,19 @@ mod tokio_frontend {
 		}
 
 		assert_eq!(command.get_args().collect::<Vec<_>>(), [OsStr::new("base")]);
+	}
+
+	#[test]
+	fn native_only_facade_remains_readable_during_hooks() {
+		let mut native = tokio::process::Command::new("tool");
+		native.arg("native");
+		let mut command = Command::from(native);
+		command.wrap(InspectFacade);
+
+		let error = command
+			.spawn_with(|_| Err(io::Error::other("expected test error")))
+			.unwrap_err();
+		assert_eq!(error.to_string(), "expected test error");
 	}
 
 	#[test]
