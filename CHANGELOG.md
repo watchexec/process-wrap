@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [10.0.0](https://github.com/watchexec/process-wrap/compare/v9.1.0..v10.0.0) - 2026-08-24
+
+
+- **Bugfix:** Correct wrapper downcasting - ([ed642af](https://github.com/watchexec/process-wrap/commit/ed642af2bbc6ffbc3c7c2822cd6a98203baebe7c))
+- **Bugfix:** Keep wrapper registry live during hooks - ([ad93dd5](https://github.com/watchexec/process-wrap/commit/ad93dd5f94d65b940f0451940f8da0da226ebaf3))
+- **Bugfix:**  [**⚠️ breaking ⚠️**] Make stored wrapper operations type-safe (#37) - ([ee6bc07](https://github.com/watchexec/process-wrap/commit/ee6bc07e480e5560afff2175089fc408b6881b43))
+- **Bugfix:** Preserve live wrapper composition (#38) - ([44fa448](https://github.com/watchexec/process-wrap/commit/44fa4481c5ee6cae10ddae5b3322891d3d21b07c))
+- **Bugfix:** Expose direct process-group children - ([8e1ed59](https://github.com/watchexec/process-wrap/commit/8e1ed59b6557a4965911d4fbc50d2979537c412b))
+- **Documentation:** Describe typed wrapper extension - ([d766a6e](https://github.com/watchexec/process-wrap/commit/d766a6e836f49a46bf61c214ceaec5e545c0e39c))
+- **Documentation:** Explain order-independent job composition - ([8fc6e1f](https://github.com/watchexec/process-wrap/commit/8fc6e1f447cc026239b5ce0ed50968f808b5a6eb))
+- **Documentation:** Describe typed wrapper extension - ([08ca811](https://github.com/watchexec/process-wrap/commit/08ca811180d929d5b68e12b39fd00a332817fa0c))
+- **Documentation:** Correct extension and release-link guidance - ([3d1f62e](https://github.com/watchexec/process-wrap/commit/3d1f62e6fd5d02d904030c67c6d459ec6fe063fe))
+- **Documentation:** Restore child-layer motivation - ([5793f06](https://github.com/watchexec/process-wrap/commit/5793f0680ea1bb080c9c5ffefd742342d23035da))
+- **Feature:**  [**⚠️ breaking ⚠️**] Make wrapper extension typed - ([a3fcaf2](https://github.com/watchexec/process-wrap/commit/a3fcaf26fb85ad3dfb5f8f2d5ae5ac1a10dc1edb))
+- **Feature:** Add native child traversal capabilities - ([a1b8dbf](https://github.com/watchexec/process-wrap/commit/a1b8dbfadc77b22500069410338f98af5d390019))
+- **Feature:** Replace panicking accessors with fallible ones (#40) - ([9f1f844](https://github.com/watchexec/process-wrap/commit/9f1f844dc3e0eab16e4bb0d28e460e4810d04627))
+- **Feature:** Add boxed-child spawning - ([c9e536d](https://github.com/watchexec/process-wrap/commit/c9e536da3db4e6d615d1397cd2acefd134165136))
+- **Feature:** Add spawn_with_child (#41) - ([2f4fb3d](https://github.com/watchexec/process-wrap/commit/2f4fb3d636c7b24a1fef56adf3f768be79d0892d))
+- **Refactor:** State assertion failures clearly - ([ae6b10c](https://github.com/watchexec/process-wrap/commit/ae6b10ce99c84129da974605420816d19dcf048b))
+- **Refactor:**  [**⚠️ breaking ⚠️**] Remove panicking child accessors - ([28b6a7d](https://github.com/watchexec/process-wrap/commit/28b6a7dd855d372cd6a84b3583abb66aad9c2206))
+- **Test:** Cover concrete wrapper lookup - ([f353846](https://github.com/watchexec/process-wrap/commit/f3538468f5fa6b4eba2d2f0671ca1eb4bbcf2e8e))
+- **Test:** Gate wrappers by their required features - ([5542e7b](https://github.com/watchexec/process-wrap/commit/5542e7b31e9ebdae5c643f01e2714c72b8a7c76c))
+- **Test:** Cover child wrapper capabilities - ([5382944](https://github.com/watchexec/process-wrap/commit/538294475ff751e7921dfeddab6f46aec75a2846))
+- **Test:** Cover boxed-child spawning lifecycles - ([b65bcdc](https://github.com/watchexec/process-wrap/commit/b65bcdcfb3acbb977cb00078e86632a917aad6b4))
+
+### Windows
+
+- **Bugfix:** Preserve creation flags with job objects - ([be83bbb](https://github.com/watchexec/process-wrap/commit/be83bbb2bfb79816d85acc12329a4f33130fafd7))
+- **Feature:** Assign jobs through child process handles - ([800e17f](https://github.com/watchexec/process-wrap/commit/800e17fb5e1dab833c1d68821bf71dfb84b606f8))
+- **Test:** Poll for process exit - ([1e7f3ff](https://github.com/watchexec/process-wrap/commit/1e7f3ffeeaee41bfeea980a0aae1f62e33aa8f7e))
+- **Test:** Avoid PowerShell process lifetime flake - ([ec41a70](https://github.com/watchexec/process-wrap/commit/ec41a70abd0a3a0e7ae30747f0af6345b0aaa112))
+- **Test:** Make descendant readiness deterministic - ([49b4bca](https://github.com/watchexec/process-wrap/commit/49b4bcab1dcc7ce3cd52e9d393496add36b69e74))
+- **Test:** Invoke descendant helpers by filter - ([d92beb7](https://github.com/watchexec/process-wrap/commit/d92beb7d86bf06f42fe18dceccab152c273caa30))
+
+---
 ## [9.1.0](https://github.com/watchexec/process-wrap/compare/v9.0.3..9.1.0) - 2026-03-08
 
 
