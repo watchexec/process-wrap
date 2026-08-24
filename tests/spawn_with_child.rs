@@ -145,6 +145,25 @@ macro_rules! spawn_with_child_tests {
 			}
 
 			#[derive(Debug)]
+			struct InspectCompletedAttempt {
+				portable: bool,
+			}
+
+			impl CommandWrapper for InspectCompletedAttempt {
+				fn post_spawn(
+					&mut self,
+					attempt: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
+					_core: &CommandWrap,
+				) -> io::Result<()> {
+					assert_eq!(!attempt.is_native_only(), self.portable);
+					assert_eq!(attempt.get_portable_args().is_some(), self.portable);
+					assert_eq!(attempt.inherits_environment().is_some(), self.portable);
+					Ok(())
+				}
+			}
+
+			#[derive(Debug)]
 			struct CustomLeaf;
 
 			impl ChildWrapper for CustomLeaf {
@@ -320,6 +339,17 @@ macro_rules! spawn_with_child_tests {
 			}
 
 			#[test]
+			fn ordinary_spawn_keeps_portable_state_for_post_spawn_hooks() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let mut command = command();
+				command.wrap(InspectCompletedAttempt { portable: true });
+
+				let child = command.spawn().expect("spawn native child");
+				wait_for_exit(child);
+			}
+
+			#[test]
 			fn boxed_child_runs_the_complete_wrapper_lifecycle() {
 				let runtime = runtime();
 				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
@@ -361,7 +391,8 @@ macro_rules! spawn_with_child_tests {
 				let mut command = command();
 				command
 					.wrap(First(Arc::clone(&events)))
-					.wrap(Second(Arc::clone(&events)));
+					.wrap(Second(Arc::clone(&events)))
+					.wrap(InspectCompletedAttempt { portable: false });
 
 				let child = command
 					.spawn_with(|command| {

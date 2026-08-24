@@ -698,14 +698,21 @@ impl Drop for WindowsSpawnCleanup {
 }
 
 enum AttemptState<N> {
-	Tracked(CommandIntent),
+	Tracked {
+		intent: CommandIntent,
+		native: Option<N>,
+	},
 	NativeOnly(N),
 }
 
 impl<N: fmt::Debug> fmt::Debug for AttemptState<N> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::Tracked(intent) => f.debug_tuple("Tracked").field(intent).finish(),
+			Self::Tracked { intent, native } => f
+				.debug_struct("Tracked")
+				.field("intent", intent)
+				.field("native", native)
+				.finish(),
 			Self::NativeOnly(command) => f.debug_tuple("NativeOnly").field(command).finish(),
 		}
 	}
@@ -1040,7 +1047,10 @@ impl<B: Backend> Command<B> {
 		match &mut self.state {
 			CommandState::Tracked(intent) => {
 				let mut attempt = SpawnAttempt {
-					state: AttemptState::Tracked(intent.clone()),
+					state: AttemptState::Tracked {
+						intent: intent.clone(),
+						native: None,
+					},
 					platform,
 					native_only_base: false,
 					kill_on_drop: None,
@@ -1078,7 +1088,7 @@ impl<B: Backend> Command<B> {
 				attempt.disarm_platform();
 				let native = match attempt.state {
 					AttemptState::NativeOnly(native) => native,
-					AttemptState::Tracked(_) => {
+					AttemptState::Tracked { .. } => {
 						unreachable!("a native-only spawn attempt cannot become tracked")
 					}
 				};
@@ -1102,7 +1112,9 @@ impl<B: Backend> SpawnAttempt<B> {
 	pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
 		let arg = arg.as_ref();
 		match &mut self.state {
-			AttemptState::Tracked(intent) => intent.args.push(CommandArg::Regular(arg.to_owned())),
+			AttemptState::Tracked { intent, .. } => {
+				intent.args.push(CommandArg::Regular(arg.to_owned()))
+			}
 			AttemptState::NativeOnly(command) => command.arg(arg),
 		}
 		self
@@ -1127,7 +1139,9 @@ impl<B: Backend> SpawnAttempt<B> {
 	pub fn raw_arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
 		let arg = arg.as_ref();
 		match &mut self.state {
-			AttemptState::Tracked(intent) => intent.args.push(CommandArg::Raw(arg.to_owned())),
+			AttemptState::Tracked { intent, .. } => {
+				intent.args.push(CommandArg::Raw(arg.to_owned()))
+			}
 			AttemptState::NativeOnly(command) => command.raw_arg(arg),
 		}
 		self
@@ -1138,7 +1152,7 @@ impl<B: Backend> SpawnAttempt<B> {
 		let key = key.as_ref();
 		let value = value.as_ref();
 		match &mut self.state {
-			AttemptState::Tracked(intent) => intent
+			AttemptState::Tracked { intent, .. } => intent
 				.env
 				.push(EnvChange::Set(key.to_owned(), value.to_owned())),
 			AttemptState::NativeOnly(command) => command.env(key, value),
@@ -1163,7 +1177,7 @@ impl<B: Backend> SpawnAttempt<B> {
 	pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
 		let key = key.as_ref();
 		match &mut self.state {
-			AttemptState::Tracked(intent) => intent.env_remove(key),
+			AttemptState::Tracked { intent, .. } => intent.env_remove(key),
 			AttemptState::NativeOnly(command) => command.env_remove(key),
 		}
 		self
@@ -1172,7 +1186,7 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// Clear configured variables and prevent inheritance for this spawn attempt.
 	pub fn env_clear(&mut self) -> &mut Self {
 		match &mut self.state {
-			AttemptState::Tracked(intent) => {
+			AttemptState::Tracked { intent, .. } => {
 				intent.env_clear = true;
 				intent.env.clear();
 			}
@@ -1185,7 +1199,7 @@ impl<B: Backend> SpawnAttempt<B> {
 	pub fn current_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
 		let dir = dir.as_ref();
 		match &mut self.state {
-			AttemptState::Tracked(intent) => intent.current_dir = Some(dir.to_owned()),
+			AttemptState::Tracked { intent, .. } => intent.current_dir = Some(dir.to_owned()),
 			AttemptState::NativeOnly(command) => command.current_dir(dir),
 		}
 		self
@@ -1212,7 +1226,7 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// Get the configured program for this spawn attempt.
 	pub fn get_program(&self) -> &OsStr {
 		match &self.state {
-			AttemptState::Tracked(intent) => &intent.program,
+			AttemptState::Tracked { intent, .. } => &intent.program,
 			AttemptState::NativeOnly(command) => command.get_program(),
 		}
 	}
@@ -1220,7 +1234,9 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// Get the configured arguments for this spawn attempt.
 	pub fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
 		match &self.state {
-			AttemptState::Tracked(intent) => Box::new(intent.args.iter().map(CommandArg::value)),
+			AttemptState::Tracked { intent, .. } => {
+				Box::new(intent.args.iter().map(CommandArg::value))
+			}
 			AttemptState::NativeOnly(command) => command.get_args(),
 		}
 	}
@@ -1232,7 +1248,7 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// `validate_attempt` callback, so providers receive `Some` there.
 	pub fn get_portable_args(&self) -> Option<&[CommandArg]> {
 		match &self.state {
-			AttemptState::Tracked(intent) => Some(&intent.args),
+			AttemptState::Tracked { intent, .. } => Some(&intent.args),
 			AttemptState::NativeOnly(_) => None,
 		}
 	}
@@ -1240,7 +1256,7 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// Get explicitly configured environment changes for this spawn attempt.
 	pub fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
 		match &self.state {
-			AttemptState::Tracked(intent) => Box::new(intent.get_envs()),
+			AttemptState::Tracked { intent, .. } => Box::new(intent.get_envs()),
 			AttemptState::NativeOnly(command) => command.get_envs(),
 		}
 	}
@@ -1252,7 +1268,7 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// callback, so providers receive `Some` there.
 	pub fn inherits_environment(&self) -> Option<bool> {
 		match &self.state {
-			AttemptState::Tracked(intent) => Some(!intent.env_clear),
+			AttemptState::Tracked { intent, .. } => Some(!intent.env_clear),
 			AttemptState::NativeOnly(_) => None,
 		}
 	}
@@ -1260,7 +1276,7 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// Get the configured current directory for this spawn attempt.
 	pub fn get_current_dir(&self) -> Option<&Path> {
 		match &self.state {
-			AttemptState::Tracked(intent) => intent.current_dir.as_deref(),
+			AttemptState::Tracked { intent, .. } => intent.current_dir.as_deref(),
 			AttemptState::NativeOnly(command) => command.get_current_dir(),
 		}
 	}
@@ -1366,9 +1382,9 @@ impl<B: Backend> SpawnAttempt<B> {
 		{
 			let command = match &mut self.state {
 				AttemptState::NativeOnly(command) => command,
-				AttemptState::Tracked(_) => {
-					unreachable!("the attempt is materialized before platform setup")
-				}
+				AttemptState::Tracked { native, .. } => native
+					.as_mut()
+					.expect("the attempt is materialized before platform setup"),
 			};
 			if let Some(kill_on_drop) = kill_on_drop {
 				command.configure_kill_on_drop(kill_on_drop);
@@ -1385,9 +1401,9 @@ impl<B: Backend> SpawnAttempt<B> {
 			let native_only_base = self.native_only_base;
 			let command = match &mut self.state {
 				AttemptState::NativeOnly(command) => command,
-				AttemptState::Tracked(_) => {
-					unreachable!("the attempt is materialized before platform setup")
-				}
+				AttemptState::Tracked { native, .. } => native
+					.as_mut()
+					.expect("the attempt is materialized before platform setup"),
 			};
 			self.platform
 				.unix
@@ -1401,18 +1417,30 @@ impl<B: Backend> SpawnAttempt<B> {
 	}
 
 	fn materialize_native(&mut self) {
-		if let AttemptState::Tracked(intent) = &self.state {
-			let command = intent.materialize::<B::NativeCommand>();
-			self.state = AttemptState::NativeOnly(command);
+		if let AttemptState::Tracked { intent, native } = &mut self.state {
+			if native.is_none() {
+				*native = Some(intent.materialize::<B::NativeCommand>());
+			}
 		}
+	}
+
+	fn make_native_only(&mut self) {
+		self.materialize_native();
+		let native = match &mut self.state {
+			AttemptState::Tracked { native, .. } => native
+				.take()
+				.expect("the tracked attempt was materialized above"),
+			AttemptState::NativeOnly(_) => return,
+		};
+		self.state = AttemptState::NativeOnly(native);
 	}
 
 	fn native_command_mut(&mut self) -> &mut B::NativeCommand {
 		match &mut self.state {
+			AttemptState::Tracked { native, .. } => native
+				.as_mut()
+				.expect("the tracked attempt was materialized before native access"),
 			AttemptState::NativeOnly(command) => command,
-			AttemptState::Tracked(_) => {
-				unreachable!("tracked spawn attempt was materialized above")
-			}
 		}
 	}
 
@@ -1427,6 +1455,12 @@ impl<B: Backend> SpawnAttempt<B> {
 		self.native_command_mut()
 	}
 
+	pub(crate) fn native_for_explicit_spawn(&mut self) -> &mut B::NativeCommand {
+		self.make_native_only();
+		self.prepare_platform();
+		self.native_command_mut()
+	}
+
 	/// Mutably access the frontend's native command for this spawn attempt.
 	///
 	/// Calling this makes only this attempt native-only. An alternate portable provider rejects that
@@ -1434,7 +1468,7 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// Unix, built-in child setup is installed after all pre-spawn hooks have run, so replacing the
 	/// native value here does not discard that setup.
 	pub fn native_mut(&mut self) -> &mut B::NativeCommand {
-		self.materialize_native();
+		self.make_native_only();
 		self.invalidate_platform();
 		self.native_command_mut()
 	}

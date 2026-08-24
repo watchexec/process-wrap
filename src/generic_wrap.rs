@@ -554,14 +554,14 @@ macro_rules! Wrap {
 			/// This explicit transport cannot be combined with a registered spawn provider. Without a
 			/// provider, it runs the same pre-spawn, capability-level post-spawn, and child-wrapping
 			/// lifecycle as [`spawn`](Self::spawn).
-			pub fn spawn_with(
+			///			pub fn spawn_with(
 				&mut self,
 				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<$child>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
 				self.reject_explicit_provider()?;
 				self.with_spawn_attempt(|command, attempt| {
 					command.run_pre_spawn(attempt)?;
-					let child = spawner(attempt.native_for_spawn())?;
+					let child = spawner(attempt.native_for_explicit_spawn())?;
 					let child = Box::new(
 						#[allow(clippy::redundant_closure_call)]
 						$first_child_wrapper(child),
@@ -577,7 +577,7 @@ macro_rules! Wrap {
 			///
 			/// This explicit transport cannot be combined with a registered spawn provider. Without a
 			/// provider, all `pre_spawn`, capability-level `post_spawn`, and `wrap_child` hooks run.
-			pub fn spawn_with_child(
+			///			pub fn spawn_with_child(
 				&mut self,
 				spawner: impl FnOnce(
 					&mut $command,
@@ -586,7 +586,7 @@ macro_rules! Wrap {
 				self.reject_explicit_provider()?;
 				self.with_spawn_attempt(|command, attempt| {
 					command.run_pre_spawn(attempt)?;
-					let child = spawner(attempt.native_for_spawn())?;
+					let child = spawner(attempt.native_for_explicit_spawn())?;
 					command.finish_spawn(attempt, child)
 				})
 			}
