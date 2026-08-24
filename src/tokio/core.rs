@@ -282,8 +282,6 @@ impl ChildWrapper for Child {
 	}
 }
 
-const INNER_CHILD_INVARIANT: &str = "ChildWrapper chain did not terminate in tokio::process::Child";
-
 fn same_child(left: &dyn ChildWrapper, right: &dyn ChildWrapper) -> bool {
 	std::ptr::addr_eq(left, right) && left.type_id() == right.type_id()
 }
@@ -370,49 +368,6 @@ impl dyn ChildWrapper + '_ {
 				return Err(inner);
 			}
 			inner = inner.into_inner();
-		}
-	}
-
-	/// Obtain a reference to the underlying native [`Child`].
-	///
-	/// # Panics
-	///
-	/// Panics if the wrapper chain terminates in a non-native child.
-	#[track_caller]
-	pub fn inner_child(&self) -> &Child {
-		self.try_inner_child().expect(INNER_CHILD_INVARIANT)
-	}
-
-	/// Obtain a mutable reference to the underlying native [`Child`].
-	///
-	/// # Panics
-	///
-	/// Panics if the wrapper chain terminates in a non-native child.
-	///
-	/// # Safety
-	///
-	/// The caller must ensure that using the returned mutable child does not violate invariants
-	/// maintained by any wrapper in the chain.
-	#[track_caller]
-	pub unsafe fn inner_child_mut(&mut self) -> &mut Child {
-		unsafe { self.try_inner_child_mut() }.expect(INNER_CHILD_INVARIANT)
-	}
-
-	/// Consume the wrapper chain and obtain the underlying native [`Child`].
-	///
-	/// # Panics
-	///
-	/// Panics if the wrapper chain terminates in a non-native child.
-	///
-	/// # Safety
-	///
-	/// The caller must ensure that removing every traversed wrapper does not violate wrapper
-	/// invariants or bypass required cleanup.
-	#[track_caller]
-	pub unsafe fn into_inner_child(self: Box<Self>) -> Child {
-		match unsafe { self.try_into_inner_child() } {
-			Ok(child) => child,
-			Err(_) => panic!("{INNER_CHILD_INVARIANT}"),
 		}
 	}
 }
