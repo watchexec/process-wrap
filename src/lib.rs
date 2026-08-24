@@ -452,6 +452,14 @@
 
 mod command;
 pub(crate) mod generic_wrap;
+#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+pub(crate) mod unix;
+#[cfg(all(
+	unix,
+	any(feature = "std", feature = "tokio1"),
+	feature = "process-group"
+))]
+pub use unix::ProcessGroupTarget;
 
 #[doc(hidden)]
 pub use command::{Backend, Blocking, NativeCommand, Tokio1};
@@ -472,7 +480,7 @@ mod windows;
 
 /// Internal memoization of the exit status of a child process.
 #[allow(dead_code)] // easier than listing exactly which featuresets use it
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum ChildExitStatus {
 	Running,
 	Exited(::std::process::ExitStatus),

@@ -413,7 +413,7 @@ macro_rules! Wrap {
 
 				self.with_spawn_attempt(|command, attempt| {
 					command.run_pre_spawn(attempt)?;
-					let child = attempt.native_mut().spawn()?;
+					let child = attempt.native_for_spawn().spawn()?;
 					let child = Box::new(
 						#[allow(clippy::redundant_closure_call)]
 						$first_child_wrapper(child),
@@ -434,7 +434,7 @@ macro_rules! Wrap {
 				self.reject_explicit_provider()?;
 				self.with_spawn_attempt(|command, attempt| {
 					command.run_pre_spawn(attempt)?;
-					let child = spawner(attempt.native_mut())?;
+					let child = spawner(attempt.native_for_spawn())?;
 					let child = Box::new(
 						#[allow(clippy::redundant_closure_call)]
 						$first_child_wrapper(child),
@@ -459,7 +459,7 @@ macro_rules! Wrap {
 				self.reject_explicit_provider()?;
 				self.with_spawn_attempt(|command, attempt| {
 					command.run_pre_spawn(attempt)?;
-					let child = spawner(attempt.native_mut())?;
+					let child = spawner(attempt.native_for_spawn())?;
 					command.finish_spawn(attempt, child)
 				})
 			}
@@ -532,7 +532,9 @@ macro_rules! Wrap {
 			/// Called before the command is spawned, to mutate this attempt as needed.
 			///
 			/// Attempt mutations apply to one spawn. The `command` reference provides read-only access to
-			/// peer wrappers and persistent base configuration.
+			/// peer wrappers and persistent base configuration. Hooks run in registration order, but a
+			/// transport may apply the portable policy they record only after every hook has run and in
+			/// the order required by the platform.
 			///
 			/// Default implementation: no-op.
 			fn pre_spawn(

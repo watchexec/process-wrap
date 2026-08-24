@@ -73,6 +73,12 @@ pub trait NativeCommand: fmt::Debug + Sized + 'static {
 	/// Configure standard error.
 	fn stderr(&mut self, stdio: Stdio);
 
+	/// Register a callback to run in the child after `fork`.
+	#[cfg(unix)]
+	unsafe fn pre_exec<F>(&mut self, callback: F)
+	where
+		F: FnMut() -> std::io::Result<()> + Send + Sync + 'static;
+
 	/// Get the program.
 	fn get_program(&self) -> &OsStr;
 
@@ -128,6 +134,16 @@ impl NativeCommand for std::process::Command {
 
 	fn stderr(&mut self, stdio: Stdio) {
 		self.stderr(stdio);
+	}
+
+	#[cfg(unix)]
+	unsafe fn pre_exec<F>(&mut self, callback: F)
+	where
+		F: FnMut() -> std::io::Result<()> + Send + Sync + 'static,
+	{
+		use std::os::unix::process::CommandExt;
+		// SAFETY: the caller accepts the native `pre_exec` contract.
+		unsafe { CommandExt::pre_exec(self, callback) };
 	}
 
 	fn get_program(&self) -> &OsStr {
@@ -188,6 +204,15 @@ impl NativeCommand for tokio::process::Command {
 
 	fn stderr(&mut self, stdio: Stdio) {
 		self.stderr(stdio);
+	}
+
+	#[cfg(unix)]
+	unsafe fn pre_exec<F>(&mut self, callback: F)
+	where
+		F: FnMut() -> std::io::Result<()> + Send + Sync + 'static,
+	{
+		// SAFETY: the caller accepts the native `pre_exec` contract.
+		unsafe { self.pre_exec(callback) };
 	}
 
 	fn get_program(&self) -> &OsStr {
@@ -494,6 +519,12 @@ impl<N: fmt::Debug> fmt::Debug for AttemptState<N> {
 	}
 }
 
+#[derive(Clone, Debug, Default)]
+struct PlatformCommandState {
+	#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+	unix: crate::unix::CommandState,
+}
+
 /// The command configuration for one spawn attempt.
 ///
 /// Each call to a spawn method creates a fresh attempt. Hooks may modify it without changing a
@@ -501,6 +532,12 @@ impl<N: fmt::Debug> fmt::Debug for AttemptState<N> {
 /// alternate portable spawn providers reject rather than reconstructing or partially applying.
 pub struct SpawnAttempt<B: Backend> {
 	state: AttemptState<B::NativeCommand>,
+	#[cfg_attr(not(unix), allow(dead_code))]
+	platform: PlatformCommandState,
+	#[cfg_attr(not(unix), allow(dead_code))]
+	native_only_base: bool,
+	#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+	unix_policy: crate::unix::SpawnPolicy,
 	backend: PhantomData<fn() -> B>,
 }
 
@@ -520,6 +557,7 @@ impl<B: Backend> fmt::Debug for SpawnAttempt<B> {
 pub struct Command<B: Backend> {
 	state: CommandState<B::NativeCommand>,
 	wrappers: Box<dyn Any + Send + Sync>,
+	platform: PlatformCommandState,
 	backend: PhantomData<fn() -> B>,
 }
 
@@ -537,6 +575,7 @@ impl<B: Backend> Command<B> {
 		Self {
 			state: CommandState::Tracked(CommandIntent::new(program)),
 			wrappers: B::new_registry(),
+			platform: PlatformCommandState::default(),
 			backend: PhantomData,
 		}
 	}
@@ -722,12 +761,17 @@ impl<B: Backend> Command<B> {
 	/// Mutably access the frontend's native command.
 	///
 	/// Calling this permanently makes the command native-only. Alternate portable transports cannot
-	/// recover exact portable intent after arbitrary native mutation.
+	/// recover exact portable intent after arbitrary native mutation. On Unix, process-wrap reinstalls
+	/// any built-in child setup when it next spawns the command, so replacing the native value does not
+	/// discard that setup.
 	pub fn native_mut(&mut self) -> &mut B::NativeCommand {
 		if let CommandState::Tracked(intent) = &self.state {
 			let command = intent.materialize::<B::NativeCommand>();
 			self.state = CommandState::NativeOnly(NativeOnlyCommand::new(command));
 		}
+
+		#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+		self.platform.unix.invalidate();
 
 		match &mut self.state {
 			CommandState::NativeOnly(command) => command.command_mut(),
@@ -747,6 +791,7 @@ impl<B: Backend> Command<B> {
 		Self {
 			state: CommandState::NativeOnly(NativeOnlyCommand::new(command)),
 			wrappers: B::new_registry(),
+			platform: PlatformCommandState::default(),
 			backend: PhantomData,
 		}
 	}
@@ -772,23 +817,40 @@ impl<B: Backend> Command<B> {
 		&mut self,
 		invoke: impl FnOnce(&mut Self, &mut SpawnAttempt<B>) -> std::io::Result<T>,
 	) -> std::io::Result<T> {
+		let platform = self.platform.clone();
 		match &mut self.state {
 			CommandState::Tracked(intent) => {
 				let mut attempt = SpawnAttempt {
 					state: AttemptState::Tracked(intent.clone()),
-					backend: PhantomData,
-				};
-				invoke(self, &mut attempt)
-			}
-			CommandState::NativeOnly(command) => {
-				let native = command.take();
-				let mut attempt = SpawnAttempt {
-					state: AttemptState::NativeOnly(native),
+					platform,
+					native_only_base: false,
+					#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+					unix_policy: crate::unix::SpawnPolicy::default(),
 					backend: PhantomData,
 				};
 				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
 					invoke(self, &mut attempt)
 				}));
+				attempt.disarm_platform();
+				match result {
+					Ok(result) => result,
+					Err(payload) => std::panic::resume_unwind(payload),
+				}
+			}
+			CommandState::NativeOnly(command) => {
+				let native = command.take();
+				let mut attempt = SpawnAttempt {
+					state: AttemptState::NativeOnly(native),
+					platform,
+					native_only_base: true,
+					#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+					unix_policy: crate::unix::SpawnPolicy::default(),
+					backend: PhantomData,
+				};
+				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+					invoke(self, &mut attempt)
+				}));
+				attempt.disarm_platform();
 				let native = match attempt.state {
 					AttemptState::NativeOnly(native) => native,
 					AttemptState::Tracked(_) => {
@@ -954,22 +1016,128 @@ impl<B: Backend> SpawnAttempt<B> {
 		}
 	}
 
-	/// Mutably access the frontend's native command for this spawn attempt.
+	/// Return the process-group setup requested for this attempt.
 	///
-	/// Calling this makes only this attempt native-only. An alternate portable provider rejects that
-	/// attempt because it cannot recover exact portable intent after arbitrary native mutation.
-	pub fn native_mut(&mut self) -> &mut B::NativeCommand {
+	/// Alternate spawn providers use this to apply process-group intent without making the attempt
+	/// native-only.
+	#[cfg(all(
+		unix,
+		any(feature = "std", feature = "tokio1"),
+		feature = "process-group"
+	))]
+	pub fn process_group_target(&self) -> Option<crate::ProcessGroupTarget> {
+		self.unix_policy.process_group
+	}
+
+	/// Return whether this attempt must create a new process session.
+	#[cfg(all(
+		unix,
+		any(feature = "std", feature = "tokio1"),
+		feature = "process-session"
+	))]
+	pub fn creates_process_session(&self) -> bool {
+		self.unix_policy.process_session
+	}
+
+	/// Return whether this attempt must reset the child signal mask.
+	#[cfg(all(
+		unix,
+		any(feature = "std", feature = "tokio1"),
+		feature = "reset-sigmask"
+	))]
+	pub fn resets_sigmask(&self) -> bool {
+		self.unix_policy.reset_sigmask
+	}
+
+	#[cfg(all(
+		unix,
+		any(feature = "std", feature = "tokio1"),
+		feature = "process-group"
+	))]
+	pub(crate) fn set_process_group(
+		&mut self,
+		target: crate::unix::ProcessGroupTarget,
+	) -> std::io::Result<()> {
+		self.unix_policy.set_process_group(target)
+	}
+
+	#[cfg(all(
+		unix,
+		any(feature = "std", feature = "tokio1"),
+		feature = "process-session"
+	))]
+	pub(crate) fn set_process_session(&mut self) -> std::io::Result<()> {
+		self.unix_policy.set_process_session()
+	}
+
+	#[cfg(all(
+		unix,
+		any(feature = "std", feature = "tokio1"),
+		feature = "reset-sigmask"
+	))]
+	pub(crate) fn set_reset_sigmask(&mut self) {
+		self.unix_policy.reset_sigmask = true;
+	}
+
+	fn prepare_platform(&mut self) {
+		#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+		{
+			let policy = self.unix_policy;
+			let native_only_base = self.native_only_base;
+			let command = match &mut self.state {
+				AttemptState::NativeOnly(command) => command,
+				AttemptState::Tracked(_) => {
+					unreachable!("the attempt is materialized before platform setup")
+				}
+			};
+			self.platform
+				.unix
+				.prepare(command, native_only_base, policy);
+		}
+	}
+
+	fn disarm_platform(&mut self) {
+		#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+		self.platform.unix.disarm();
+	}
+
+	fn materialize_native(&mut self) {
 		if let AttemptState::Tracked(intent) = &self.state {
 			let command = intent.materialize::<B::NativeCommand>();
 			self.state = AttemptState::NativeOnly(command);
 		}
+	}
 
+	fn native_command_mut(&mut self) -> &mut B::NativeCommand {
 		match &mut self.state {
 			AttemptState::NativeOnly(command) => command,
 			AttemptState::Tracked(_) => {
 				unreachable!("tracked spawn attempt was materialized above")
 			}
 		}
+	}
+
+	fn invalidate_platform(&mut self) {
+		#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+		self.platform.unix.invalidate();
+	}
+
+	pub(crate) fn native_for_spawn(&mut self) -> &mut B::NativeCommand {
+		self.materialize_native();
+		self.prepare_platform();
+		self.native_command_mut()
+	}
+
+	/// Mutably access the frontend's native command for this spawn attempt.
+	///
+	/// Calling this makes only this attempt native-only. An alternate portable provider rejects that
+	/// attempt because it cannot recover exact portable intent after arbitrary native mutation. On
+	/// Unix, built-in child setup is installed after all pre-spawn hooks have run, so replacing the
+	/// native value here does not discard that setup.
+	pub fn native_mut(&mut self) -> &mut B::NativeCommand {
+		self.materialize_native();
+		self.invalidate_platform();
+		self.native_command_mut()
 	}
 
 	/// Return whether this spawn attempt contains opaque native-only state.
@@ -1154,20 +1322,6 @@ impl Command<Tokio1> {
 		self.native_mut().kill_on_drop(kill_on_drop);
 		self
 	}
-}
-
-#[cfg(all(feature = "tokio1", feature = "process-group", unix))]
-pub(crate) fn tokio_process_group(command: &mut tokio::process::Command, pgroup: i32) {
-	let set_process_group = move || {
-		// SAFETY: `setpgid` is called in the child with its own PID and does not retain pointers.
-		if unsafe { nix::libc::setpgid(0, pgroup) } == -1 {
-			Err(::std::io::Error::last_os_error())
-		} else {
-			Ok(())
-		}
-	};
-	// SAFETY: the callback only invokes `setpgid`, which is valid between `fork` and `exec`.
-	unsafe { command.pre_exec(set_process_group) };
 }
 
 #[cfg(all(feature = "tokio1", unix))]

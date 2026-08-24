@@ -1,6 +1,6 @@
-use std::io::{Error, Result};
+use std::io::Result;
 
-use nix::unistd::{Pid, setsid};
+use nix::unistd::Pid;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -24,11 +24,7 @@ pub struct ProcessSession;
 impl CommandWrapper for ProcessSession {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, _core: &CommandWrap) -> Result<()> {
-		unsafe {
-			attempt.pre_exec(move || setsid().map_err(Error::from).map(|_| ()));
-		}
-
-		Ok(())
+		attempt.set_process_session()
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
@@ -37,7 +33,7 @@ impl CommandWrapper for ProcessSession {
 		inner: Box<dyn super::core::ChildWrapper>,
 		_core: &CommandWrap,
 	) -> Result<Box<dyn super::core::ChildWrapper>> {
-		let pgid = Pid::from_raw(
+		let direct_pid = Pid::from_raw(
 			i32::try_from(
 				inner
 					.id()
@@ -46,6 +42,8 @@ impl CommandWrapper for ProcessSession {
 			.expect("Command PID > i32::MAX"),
 		);
 
-		Ok(Box::new(super::ProcessGroupChild::new(inner, pgid)))
+		Ok(Box::new(super::ProcessGroupChild::new(
+			inner, direct_pid, direct_pid,
+		)))
 	}
 }
