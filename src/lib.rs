@@ -103,7 +103,8 @@
 //!
 //! Internally the `JobObject` wrapper always sets the `CREATE_SUSPENDED` flag, but as it is able to
 //! access the `CreationFlags` value it will either resume the process after setting up, or leave it
-//! suspended if `CREATE_SUSPENDED` was explicitly set.
+//! suspended if `CREATE_SUSPENDED` was explicitly set. `CreationFlags` and `JobObject` may be
+//! registered in either order.
 //!
 //! # Extension
 //!
