@@ -36,10 +36,10 @@
 //!
 //! # Usage
 //!
-//! The core API is [`Command`](std::Command) and [`Command`](tokio::Command). Both are aliases for
-//! one backend-typed command family: construction and configuration are shared, while spawning and
-//! child behavior use the selected frontend. `CommandWrap` remains an alias in both modules for
-//! compatibility.
+//! The core APIs are `process_wrap::std::Command` and `process_wrap::tokio::Command`. Both are
+//! aliases for one backend-typed command family: construction and configuration are shared, while
+//! spawning and child behavior use the selected frontend. `CommandWrap` remains an alias in both
+//! modules for compatibility.
 //!
 //! ```rust
 //! use process_wrap::std::*;
@@ -119,8 +119,8 @@
 //! separate because their spawn and child APIs differ. Re-use shared policy code when implementing
 //! both frontends.
 //!
-//! At minimum, you must implement [`CommandWrapper`](crate::std::CommandWrapper) and/or
-//! [`CommandWrapper`](crate::tokio::CommandWrapper). These provide the same functionality
+//! At minimum, you must implement `process_wrap::std::CommandWrapper` and/or
+//! `process_wrap::tokio::CommandWrapper`. These provide the same functionality
 //! (and indeed internally are generated using a common macro), but differ in the exact types used.
 //! Here's the most basic impl (shown for Tokio):
 //!

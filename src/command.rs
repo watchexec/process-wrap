@@ -286,9 +286,9 @@ impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
 
 /// A configurable process command with composable wrappers.
 ///
-/// The backend type is normally selected through [`crate::std::Command`] or
-/// [`crate::tokio::Command`]. Command construction and configuration are shared; spawning and child
-/// behavior remain specific to the selected frontend.
+/// The backend type is normally selected through `process_wrap::std::Command` or
+/// `process_wrap::tokio::Command`. Command construction and configuration are shared; spawning and
+/// child behavior remain specific to the selected frontend.
 pub struct Command<B: Backend> {
 	state: CommandState<B::NativeCommand>,
 	wrappers: Box<dyn Any + Send + Sync>,
