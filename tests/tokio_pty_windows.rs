@@ -146,9 +146,12 @@ fn conpty_child_helper() -> io::Result<()> {
 			io::stdout().flush()?;
 			let mut bytes = [0; 4];
 			io::stdin().read_exact(&mut bytes)?;
-			io::stdout().write_all(b"PW-BYTES:")?;
-			io::stdout().write_all(&bytes)?;
-			io::stdout().flush()?;
+			let mut stdout = io::stdout();
+			stdout.write_all(b"PW-BYTES:")?;
+			for byte in bytes {
+				write!(stdout, "{byte:02x}")?;
+			}
+			stdout.flush()?;
 		}
 		"size" => {
 			print_size(stdout_handle)?;
@@ -289,12 +292,11 @@ async fn passes_bidirectional_terminal_bytes() -> io::Result<()> {
 			.await?
 			.success()
 	);
-	let mut expected = b"PW-BYTES:".to_vec();
-	expected.extend(controls);
+	let expected = b"PW-BYTES:411b4243";
 	assert!(
 		bytes
 			.windows(expected.len())
-			.any(|window| window == expected.as_slice()),
+			.any(|window| window == expected),
 		"{:?}",
 		bytes
 	);
