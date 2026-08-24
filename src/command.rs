@@ -1,3 +1,5 @@
+#![cfg_attr(not(any(feature = "std", feature = "tokio1")), allow(dead_code))]
+
 use std::{
 	any::Any,
 	ffi::{OsStr, OsString},
