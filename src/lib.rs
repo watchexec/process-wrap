@@ -472,7 +472,12 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
+mod command;
 pub(crate) mod generic_wrap;
+
+pub use command::Command;
+#[doc(hidden)]
+pub use command::{Backend, Blocking, NativeCommand, Tokio1};
 
 #[cfg(feature = "std")]
 pub mod std;

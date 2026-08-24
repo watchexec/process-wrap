@@ -17,10 +17,12 @@ use nix::{
 };
 use tokio::{
 	io::{AsyncRead, AsyncReadExt},
-	process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+	process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as NativeCommand},
 };
 
-crate::generic_wrap::Wrap!(Command, Child, ChildWrapper, |child| child);
+crate::generic_wrap::Wrap!(crate::Tokio1, NativeCommand, Child, ChildWrapper, |child| {
+	child
+});
 
 /// Wrapper for `tokio::process::Child`.
 ///

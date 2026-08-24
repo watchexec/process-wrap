@@ -1,7 +1,9 @@
 use std::{
 	any::Any,
 	io::{Read, Result},
-	process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output},
+	process::{
+		Child, ChildStderr, ChildStdin, ChildStdout, Command as NativeCommand, ExitStatus, Output,
+	},
 };
 
 #[cfg(windows)]
@@ -13,7 +15,13 @@ use nix::{
 	unistd::Pid,
 };
 
-crate::generic_wrap::Wrap!(Command, Child, ChildWrapper, |child| child);
+crate::generic_wrap::Wrap!(
+	crate::Blocking,
+	NativeCommand,
+	Child,
+	ChildWrapper,
+	|child| child
+);
 
 /// Wrapper for `std::process::Child`.
 ///
