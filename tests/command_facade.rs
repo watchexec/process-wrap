@@ -430,7 +430,7 @@ mod tokio_frontend {
 	#[test]
 	fn unix_native_methods_remain_available() {
 		let mut command = Command::new("tool");
-		command.uid(0).gid(0).arg0("argv-zero").process_group(0);
+		command.uid(0).gid(0).arg0("argv-zero");
 		// SAFETY: the test callback performs no operations in the child.
 		unsafe { command.pre_exec(|| Ok(())) };
 

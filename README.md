@@ -118,13 +118,15 @@ callbacks, or arbitrary native handles and will reject that state. Use `into_nat
 of the lifecycle belongs to the native API.
 
 The facade keeps native stable configuration methods where their behavior can be preserved, including
-Unix identity/process setup, Windows creation flags, and Tokio kill-on-drop. These platform-specific
-operations make the command native-only. The standard library's supplementary-groups setter remains
-unstable and is not mirrored by the facade. An immutable Tokio `as_std()` cannot borrow a native
-command which has not yet been materialized; use `command.native_mut().as_std()` when that view is
-required. Tokio 1.38.2 does not expose mutable access to its inner standard command, so configure a
-`std::process::Command` first and convert it into Tokio and then process-wrap when that escape is
-needed.
+Unix identity setup, the standard frontend's process-group setter, Windows creation flags, and Tokio
+kill-on-drop. These platform-specific operations make the command native-only. The standard library's
+supplementary-groups setter remains unstable and is not mirrored by the facade. Tokio's process-group
+setter is also omitted at the declared Tokio floor because it cannot exactly replace process-group
+state already stored in a native-only Tokio command. Use the `ProcessGroup` wrapper for tracked Tokio
+commands, or configure a `std::process::Command` before converting it into Tokio and then process-wrap.
+An immutable Tokio `as_std()` requires the explicit `command.native_mut().as_std()` transition. Tokio
+1.38.2 does not expose mutable access to its inner standard command, so use the same conversion path
+when that escape is needed.
 
 ## Wrappers
 

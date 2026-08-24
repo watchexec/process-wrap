@@ -844,15 +844,6 @@ impl Command<Tokio1> {
 		self
 	}
 
-	/// Set the child process's process group and make the command native-only.
-	///
-	/// At the declared Tokio dependency floor this is registered as a `pre_exec` callback. Call this
-	/// before registering callbacks which require the process group to have been set.
-	pub fn process_group(&mut self, pgroup: i32) -> &mut Self {
-		tokio_process_group(self.native_mut(), pgroup);
-		self
-	}
-
 	/// Register a callback to run in the child after `fork` and make the command native-only.
 	///
 	/// # Safety
