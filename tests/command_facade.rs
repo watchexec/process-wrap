@@ -124,6 +124,15 @@ mod std_frontend {
 			.env_remove("PROCESS_WRAP_ABSENT")
 			.current_dir(&cwd);
 
+		let tracked_env = command.get_envs().collect::<Vec<_>>();
+		assert_eq!(
+			tracked_env,
+			[(
+				OsStr::new("PROCESS_WRAP_PRESENT"),
+				Some(OsStr::new("after-clear"))
+			)]
+		);
+
 		command
 			.spawn_with(|native| {
 				let env = native.get_envs().collect::<Vec<_>>();
@@ -145,6 +154,17 @@ mod std_frontend {
 			.unwrap_err();
 	}
 
+	#[cfg(unix)]
+	#[test]
+	fn unix_native_methods_remain_available() {
+		let mut command = Command::new("tool");
+		command.uid(0).gid(0).arg0("argv-zero").process_group(0);
+		// SAFETY: the test callback performs no operations in the child.
+		unsafe { command.pre_exec(|| Ok(())) };
+
+		assert_eq!(command.native_mut().get_program(), OsStr::new("tool"));
+	}
+
 	#[cfg(windows)]
 	#[test]
 	fn tracked_raw_arguments_preserve_order() {
@@ -158,6 +178,22 @@ mod std_frontend {
 				OsStr::new(" raw "),
 				OsStr::new("regular-2")
 			]
+		);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_native_methods_and_environment_keys_remain_available() {
+		let mut command = Command::new("tool");
+		command.creation_flags(0);
+
+		let mut environment = Command::new("tool");
+		environment
+			.env("Process_Wrap_Case", "first")
+			.env("PROCESS_WRAP_CASE", "second");
+		assert_eq!(
+			environment.get_envs().collect::<Vec<_>>(),
+			[(OsStr::new("PROCESS_WRAP_CASE"), Some(OsStr::new("second")))]
 		);
 	}
 }
@@ -288,6 +324,15 @@ mod tokio_frontend {
 			.env_remove("PROCESS_WRAP_ABSENT")
 			.current_dir(&cwd);
 
+		let tracked_env = command.get_envs().collect::<Vec<_>>();
+		assert_eq!(
+			tracked_env,
+			[(
+				OsStr::new("PROCESS_WRAP_PRESENT"),
+				Some(OsStr::new("after-clear"))
+			)]
+		);
+
 		command
 			.spawn_with(|native| {
 				let env = native.as_std().get_envs().collect::<Vec<_>>();
@@ -309,6 +354,30 @@ mod tokio_frontend {
 			.unwrap_err();
 	}
 
+	#[test]
+	fn tokio_native_methods_remain_available() {
+		let mut command = Command::new("tool");
+		command.kill_on_drop(false);
+		assert_eq!(
+			command.native_mut().as_std().get_program(),
+			OsStr::new("tool")
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn unix_native_methods_remain_available() {
+		let mut command = Command::new("tool");
+		command.uid(0).gid(0).arg0("argv-zero").process_group(0);
+		// SAFETY: the test callback performs no operations in the child.
+		unsafe { command.pre_exec(|| Ok(())) };
+
+		assert_eq!(
+			command.native_mut().as_std().get_program(),
+			OsStr::new("tool")
+		);
+	}
+
 	#[cfg(windows)]
 	#[test]
 	fn tracked_raw_arguments_preserve_order() {
@@ -322,6 +391,22 @@ mod tokio_frontend {
 				OsStr::new(" raw "),
 				OsStr::new("regular-2")
 			]
+		);
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn windows_native_methods_and_environment_keys_remain_available() {
+		let mut command = Command::new("tool");
+		command.creation_flags(0);
+
+		let mut environment = Command::new("tool");
+		environment
+			.env("Process_Wrap_Case", "first")
+			.env("PROCESS_WRAP_CASE", "second");
+		assert_eq!(
+			environment.get_envs().collect::<Vec<_>>(),
+			[(OsStr::new("PROCESS_WRAP_CASE"), Some(OsStr::new("second")))]
 		);
 	}
 }

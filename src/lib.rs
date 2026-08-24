@@ -62,7 +62,13 @@
 //! Existing native commands can still be converted with `Command::from`. They retain exact native
 //! behavior but are native-only: alternate portable transports cannot reconstruct arbitrary native
 //! state. `native_mut()` is the explicit mutable escape hatch, and `into_native()` consumes the
-//! process-wrap command when the rest of its lifecycle belongs to the native API.
+//! process-wrap command when the rest of its lifecycle belongs to the native API. Stable native
+//! configuration methods remain on the facade where their behavior can be preserved and make the
+//! command native-only. The standard library's supplementary-groups setter remains unstable and is
+//! not mirrored by the facade. An immutable Tokio `as_std()` view therefore requires the explicit
+//! `native_mut().as_std()` transition. Tokio 1.38.2 has no mutable inner-std accessor; configure a
+//! `std::process::Command` before converting it into Tokio and process-wrap when that escape is
+//! required.
 //!
 //! If targetting a single platform, then a fluent style is possible:
 //!

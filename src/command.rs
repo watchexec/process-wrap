@@ -79,6 +79,9 @@ pub trait NativeCommand: fmt::Debug + Sized + 'static {
 	/// Get the arguments.
 	fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_>;
 
+	/// Get explicitly configured environment changes.
+	fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_>;
+
 	/// Get the current directory.
 	fn get_current_dir(&self) -> Option<&Path>;
 }
@@ -133,6 +136,10 @@ impl NativeCommand for std::process::Command {
 
 	fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
 		Box::new(self.get_args())
+	}
+
+	fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+		Box::new(self.get_envs())
 	}
 
 	fn get_current_dir(&self) -> Option<&Path> {
@@ -191,6 +198,10 @@ impl NativeCommand for tokio::process::Command {
 		Box::new(self.as_std().get_args())
 	}
 
+	fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+		Box::new(self.as_std().get_envs())
+	}
+
 	fn get_current_dir(&self) -> Option<&Path> {
 		self.as_std().get_current_dir()
 	}
@@ -219,6 +230,79 @@ pub(crate) enum EnvChange {
 	Remove(OsString),
 }
 
+impl EnvChange {
+	fn key(&self) -> &OsStr {
+		match self {
+			Self::Set(key, _) | Self::Remove(key) => key,
+		}
+	}
+
+	fn value(&self) -> Option<&OsStr> {
+		match self {
+			Self::Set(_, value) => Some(value),
+			Self::Remove(_) => None,
+		}
+	}
+}
+
+#[cfg(not(windows))]
+fn env_keys_equal(left: &OsStr, right: &OsStr) -> bool {
+	left == right
+}
+
+#[cfg(windows)]
+fn env_keys_equal(left: &OsStr, right: &OsStr) -> bool {
+	use std::os::windows::ffi::OsStrExt;
+
+	#[link(name = "kernel32")]
+	unsafe extern "system" {
+		#[link_name = "CompareStringOrdinal"]
+		fn compare_string_ordinal(
+			string1: *const u16,
+			count1: i32,
+			string2: *const u16,
+			count2: i32,
+			ignore_case: i32,
+		) -> i32;
+	}
+
+	let left = left.encode_wide().collect::<Vec<_>>();
+	let right = right.encode_wide().collect::<Vec<_>>();
+	let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
+	else {
+		return false;
+	};
+
+	// SAFETY: both pointers remain valid for their explicit lengths during the call. The API does not
+	// require NUL termination when lengths are supplied.
+	unsafe { compare_string_ordinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == 2 }
+}
+
+struct EnvChanges<'a> {
+	changes: &'a [EnvChange],
+	index: usize,
+}
+
+impl<'a> Iterator for EnvChanges<'a> {
+	type Item = (&'a OsStr, Option<&'a OsStr>);
+
+	fn next(&mut self) -> Option<Self::Item> {
+		while let Some(change) = self.changes.get(self.index) {
+			self.index += 1;
+			if self.changes[self.index..]
+				.iter()
+				.any(|later| env_keys_equal(change.key(), later.key()))
+			{
+				continue;
+			}
+
+			return Some((change.key(), change.value()));
+		}
+
+		None
+	}
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CommandIntent {
 	pub(crate) program: OsString,
@@ -236,6 +320,21 @@ impl CommandIntent {
 			env_clear: false,
 			env: Vec::new(),
 			current_dir: None,
+		}
+	}
+
+	fn env_remove(&mut self, key: &OsStr) {
+		if self.env_clear {
+			self.env.retain(|change| !env_keys_equal(change.key(), key));
+		} else {
+			self.env.push(EnvChange::Remove(key.to_owned()));
+		}
+	}
+
+	fn get_envs(&self) -> EnvChanges<'_> {
+		EnvChanges {
+			changes: &self.env,
+			index: 0,
 		}
 	}
 
@@ -410,7 +509,7 @@ impl<B: Backend> Command<B> {
 	pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
 		let key = key.as_ref();
 		match &mut self.state {
-			CommandState::Tracked(intent) => intent.env.push(EnvChange::Remove(key.to_owned())),
+			CommandState::Tracked(intent) => intent.env_remove(key),
 			CommandState::NativeOnly(command) => command.env_remove(key),
 			CommandState::Transitioning => {
 				unreachable!("command state is restored before returning")
@@ -481,6 +580,17 @@ impl<B: Backend> Command<B> {
 		match &self.state {
 			CommandState::Tracked(intent) => Box::new(intent.args.iter().map(CommandArg::value)),
 			CommandState::NativeOnly(command) => command.get_args(),
+			CommandState::Transitioning => {
+				unreachable!("command state is restored before returning")
+			}
+		}
+	}
+
+	/// Get explicitly configured environment changes.
+	pub fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+		match &self.state {
+			CommandState::Tracked(intent) => Box::new(intent.get_envs()),
+			CommandState::NativeOnly(command) => command.get_envs(),
 			CommandState::Transitioning => {
 				unreachable!("command state is restored before returning")
 			}
@@ -581,5 +691,124 @@ impl<B: Backend> Command<B> {
 				unreachable!("command state is restored before returning")
 			}
 		}
+	}
+}
+
+#[cfg(all(feature = "std", unix))]
+impl Command<Blocking> {
+	/// Set the child process's user ID and make the command native-only.
+	pub fn uid(&mut self, id: u32) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::uid(self.native_mut(), id);
+		self
+	}
+
+	/// Set the child process's group ID and make the command native-only.
+	pub fn gid(&mut self, id: u32) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::gid(self.native_mut(), id);
+		self
+	}
+
+	/// Set the child process's `argv[0]` and make the command native-only.
+	pub fn arg0(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::arg0(self.native_mut(), arg);
+		self
+	}
+
+	/// Set the child process's process group and make the command native-only.
+	pub fn process_group(&mut self, pgroup: i32) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::process_group(self.native_mut(), pgroup);
+		self
+	}
+
+	/// Register a callback to run in the child after `fork` and make the command native-only.
+	///
+	/// # Safety
+	///
+	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
+	/// operations which are valid in that constrained environment. In particular, allocating or
+	/// acquiring locks can be unsound when another thread held the corresponding state across `fork`.
+	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
+	where
+		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
+	{
+		use ::std::os::unix::process::CommandExt;
+		// SAFETY: the caller accepts the native `pre_exec` contract documented above.
+		unsafe { CommandExt::pre_exec(self.native_mut(), f) };
+		self
+	}
+}
+
+#[cfg(all(feature = "std", windows))]
+impl Command<Blocking> {
+	/// Set Windows process creation flags and make the command native-only.
+	pub fn creation_flags(&mut self, flags: u32) -> &mut Self {
+		use ::std::os::windows::process::CommandExt;
+		CommandExt::creation_flags(self.native_mut(), flags);
+		self
+	}
+}
+
+#[cfg(feature = "tokio1")]
+impl Command<Tokio1> {
+	/// Configure whether dropping the Tokio child kills it and make the command native-only.
+	pub fn kill_on_drop(&mut self, kill_on_drop: bool) -> &mut Self {
+		self.native_mut().kill_on_drop(kill_on_drop);
+		self
+	}
+}
+
+#[cfg(all(feature = "tokio1", unix))]
+impl Command<Tokio1> {
+	/// Set the child process's user ID and make the command native-only.
+	pub fn uid(&mut self, id: u32) -> &mut Self {
+		self.native_mut().uid(id);
+		self
+	}
+
+	/// Set the child process's group ID and make the command native-only.
+	pub fn gid(&mut self, id: u32) -> &mut Self {
+		self.native_mut().gid(id);
+		self
+	}
+
+	/// Set the child process's `argv[0]` and make the command native-only.
+	pub fn arg0(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		self.native_mut().arg0(arg);
+		self
+	}
+
+	/// Set the child process's process group and make the command native-only.
+	pub fn process_group(&mut self, pgroup: i32) -> &mut Self {
+		self.native_mut().process_group(pgroup);
+		self
+	}
+
+	/// Register a callback to run in the child after `fork` and make the command native-only.
+	///
+	/// # Safety
+	///
+	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
+	/// operations which are valid in that constrained environment. In particular, allocating or
+	/// acquiring locks can be unsound when another thread held the corresponding state across `fork`.
+	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
+	where
+		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
+	{
+		// SAFETY: the caller accepts the native `pre_exec` contract documented above.
+		unsafe { self.native_mut().pre_exec(f) };
+		self
+	}
+}
+
+#[cfg(all(feature = "tokio1", windows))]
+impl Command<Tokio1> {
+	/// Set Windows process creation flags and make the command native-only.
+	pub fn creation_flags(&mut self, flags: u32) -> &mut Self {
+		self.native_mut().creation_flags(flags);
+		self
 	}
 }

@@ -117,6 +117,15 @@ portable transports cannot recover raw argument tags, environment-clear history,
 callbacks, or arbitrary native handles and will reject that state. Use `into_native()` when the rest
 of the lifecycle belongs to the native API.
 
+The facade keeps native stable configuration methods where their behavior can be preserved, including
+Unix identity/process setup, Windows creation flags, and Tokio kill-on-drop. These platform-specific
+operations make the command native-only. The standard library's supplementary-groups setter remains
+unstable and is not mirrored by the facade. An immutable Tokio `as_std()` cannot borrow a native
+command which has not yet been materialized; use `command.native_mut().as_std()` when that view is
+required. Tokio 1.38.2 does not expose mutable access to its inner standard command, so configure a
+`std::process::Command` first and convert it into Tokio and then process-wrap when that escape is
+needed.
+
 ## Wrappers
 
 ### Job object
