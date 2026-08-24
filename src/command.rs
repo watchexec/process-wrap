@@ -810,7 +810,7 @@ impl Command<Tokio1> {
 	}
 }
 
-#[cfg(all(feature = "tokio1", unix))]
+#[cfg(all(feature = "tokio1", feature = "process-group", unix))]
 pub(crate) fn tokio_process_group(command: &mut tokio::process::Command, pgroup: i32) {
 	let set_process_group = move || {
 		// SAFETY: `setpgid` is called in the child with its own PID and does not retain pointers.
