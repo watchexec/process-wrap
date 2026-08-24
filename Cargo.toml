@@ -46,10 +46,10 @@ default = ["creation-flags", "job-object", "kill-on-drop", "process-group", "pro
 ## Enable internal tracing logs
 tracing = ["dep:tracing"]
 
-## Frontend: StdCommandWrap
+## Frontend: std::Command
 std = ["dep:nix"]
 
-## Frontend: TokioCommandWrap
+## Frontend: tokio::Command
 tokio1 = ["dep:nix", "dep:futures", "dep:tokio"]
 
 ## Wrapper: Creation Flags

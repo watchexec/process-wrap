@@ -56,6 +56,11 @@ macro_rules! Wrap {
 		pub type SpawnAttempt = crate::command::SpawnAttempt<$backend>;
 
 		/// A child and armed cleanup transaction returned by a [`SpawnProvider`].
+		///
+		/// The child must implement the complete contract for this frontend's `ChildWrapper`, including
+		/// any platform capabilities required by registered wrappers. The transaction must be fresh,
+		/// armed, independently owned from the child chain, and able to undo this specific spawn until
+		/// process-wrap commits it.
 		#[derive(Debug)]
 		pub struct ProviderProduct {
 			child: Box<dyn $childer>,
@@ -64,6 +69,10 @@ macro_rules! Wrap {
 
 		impl ProviderProduct {
 			/// Create a provider product from its child and armed cleanup transaction.
+			///
+			/// Construct this only after the child has been created successfully. The transaction must own
+			/// everything needed to terminate and reap that child and release provider resources if a later
+			/// hook, child wrapper, or transaction commit fails or panics.
 			pub fn new(
 				child: Box<dyn $childer>,
 				transaction: Box<dyn crate::SpawnTransaction>,
@@ -80,24 +89,40 @@ macro_rules! Wrap {
 
 		/// An alternate transport for spawning this frontend's child contract.
 		///
-		/// Providers are exposed by command wrappers through
-		/// [`CommandWrapper::spawn_provider`]. Only one provider may be registered on a command. A
-		/// provider must return an independently owned, armed cleanup transaction with every child it
-		/// successfully creates.
+		/// Providers are exposed by command wrappers through [`CommandWrapper::spawn_provider`]. A
+		/// command may register only one provider. The same provider and wrapper instances are reused
+		/// across repeated spawn attempts, so callbacks take `&self` and must not consume persistent
+		/// configuration.
+		///
+		/// Process-wrap invokes provider callbacks in this order: `check_available`, native-only base
+		/// rejection, `validate_command`, every `pre_spawn` hook in registration order, native-only
+		/// attempt rejection, `validate_attempt`, and `spawn`. After `spawn` returns a product, every
+		/// `post_spawn` and child-wrapping hook runs in registration order before process-wrap commits the
+		/// product's transaction. `spawn_with` and `spawn_with_child` reject a registered provider instead
+		/// of bypassing it.
 		pub trait SpawnProvider: ::std::fmt::Debug + Send + Sync + 'static {
 			/// Check whether this provider is available on the current platform and runtime.
 			///
-			/// This runs before command validation so an unsupported provider retains error precedence.
+			/// This runs before command validation or native-only rejection so an unsupported provider
+			/// retains error precedence. It must not allocate per-spawn operating-system resources.
 			fn check_available(&self) -> ::std::io::Result<()> {
 				Ok(())
 			}
 
 			/// Validate immutable command and wrapper configuration before hooks run.
+			///
+			/// This must not allocate per-spawn operating-system resources. The provider-owning wrapper is
+			/// registered but temporarily unavailable through `Command::get_wrap` during this callback;
+			/// peer wrappers remain available.
 			fn validate_command(&self, _command: &Command) -> ::std::io::Result<()> {
 				Ok(())
 			}
 
-			/// Validate the completed portable attempt before allocating operating-system resources.
+			/// Validate the completed portable attempt before operating-system allocation.
+			///
+			/// Providers should inspect the attempt's arguments, environment, directory, and portable policy
+			/// getters here and reject any policy they cannot preserve. Process-wrap has already rejected an
+			/// opaque attempt before this callback.
 			fn validate_attempt(
 				&self,
 				_attempt: &SpawnAttempt,
@@ -106,7 +131,11 @@ macro_rules! Wrap {
 				Ok(())
 			}
 
-			/// Spawn a child and return it with an armed cleanup transaction.
+			/// Spawn a child and return it with a fresh armed cleanup transaction.
+			///
+			/// The provider must honor every portable setting accepted by `validate_attempt`. Until this
+			/// method returns a `ProviderProduct`, it remains responsible for cleaning up resources and any
+			/// child it creates if it returns an error or panics.
 			fn spawn(
 				&self,
 				attempt: &mut SpawnAttempt,
@@ -629,10 +658,19 @@ macro_rules! Wrap {
 
 			/// Called before the command is spawned, to mutate this attempt as needed.
 			///
-			/// Attempt mutations apply to one spawn. The `command` reference provides read-only access to
-			/// peer wrappers and persistent base configuration. Hooks run in registration order, but a
-			/// transport may apply the portable policy they record only after every hook has run and in
-			/// the order required by the platform.
+			/// Hooks run in registration order and stop at the first error or panic. Mutations to an attempt
+			/// copied from a tracked command apply to that spawn only. A native-only base instead retains
+			/// native mutations when process-wrap restores it after the lifecycle.
+			///
+			/// Calling `SpawnAttempt::native_mut`, directly or through `stdin`, `stdout`, or `stderr`, makes a
+			/// tracked attempt opaque. A registered portable provider rejects it after all pre-spawn hooks
+			/// and before `validate_attempt` or operating-system allocation. Portable policy setters remain
+			/// representable; a transport may apply their policy only after every hook has run and in the
+			/// order required by the platform.
+			///
+			/// The `command` reference provides read-only access to peer wrappers and persistent base
+			/// configuration. The active wrapper remains registered but is temporarily unavailable through
+			/// `Command::get_wrap`.
 			///
 			/// Default implementation: no-op.
 			fn pre_spawn(
@@ -660,8 +698,13 @@ macro_rules! Wrap {
 
 			/// Called after any transport spawns a child, but before the child is wrapped.
 			///
-			/// The child is exposed through the frontend's object-safe capability trait, so this hook
-			/// also runs for custom and provider children which have no native child value.
+			/// Hooks run in registration order and stop at the first error or panic. The child is exposed
+			/// through the frontend's object-safe capability trait, so it may be a terminal custom or
+			/// provider child with no native child value. The transport has already created it: changing
+			/// command settings on `attempt` here cannot configure that child.
+			///
+			/// On the provider path, an error or panic triggers best-effort transaction rollback. Native
+			/// transports do not promise equivalent child cleanup on every platform.
 			///
 			/// Default implementation: no-op.
 			fn post_spawn(
@@ -675,10 +718,11 @@ macro_rules! Wrap {
 
 			/// Called to wrap a child into this command wrapper's child wrapper.
 			///
-			/// If the wrapper needs to override the methods on the child, it should create an instance
-			/// of its own type implementing `ChildWrapper` and return it here. Child wraps are ordered:
-			/// `.wrap(Foo).wrap(Bar)` produces a different layer order from
-			/// `.wrap(Bar).wrap(Foo)`.
+			/// If the wrapper needs to override methods on the child, it should create an instance of its
+			/// own type implementing `ChildWrapper` and return it here. Wrappers run in registration order
+			/// and stop at the first error or panic, so `.wrap(Foo).wrap(Bar)` produces an outer
+			/// `Bar(Foo(child))` layer. On the provider path, an error or panic triggers best-effort
+			/// transaction rollback.
 			///
 			/// Default implementation: no-op (returns the child unchanged).
 			fn wrap_child(
@@ -706,6 +750,13 @@ macro_rules! Wrap {
 			}
 
 			/// Expose an alternate spawn provider implemented by this wrapper.
+			///
+			/// If this returns `Some` during provider selection, it must continue returning `Some` for every
+			/// callback in that spawn lifecycle. The returned provider must refer to the same persistent
+			/// provider state. Only one registered wrapper may expose a provider.
+			///
+			/// During a provider callback, this owning wrapper remains registered but is temporarily
+			/// unavailable through `Command::get_wrap`; peer wrappers remain available.
 			///
 			/// Default implementation: no provider.
 			fn spawn_provider(&self) -> Option<&dyn SpawnProvider> {

@@ -111,12 +111,11 @@
 //!
 //! # KillOnDrop and CreationFlags
 //!
-//! The options set on an underlying `Command` are not queryable from library or user code. In most
-//! cases this is not an issue; however on Windows, the `JobObject` wrapper needs to know the value
-//! of `.kill_on_drop()` and any `.creation_flags()` set. The `KillOnDrop` and `CreationFlags` are
-//! "shims" that _should_ be used instead of the aforementioned methods on `Command`. They will
-//! internally set the values on the `Command` and also store them in the wrapper, so that wrappers
-//! are able to access them.
+//! Calling native `.kill_on_drop()` or `.creation_flags()` makes a command native-only: those
+//! settings cannot be queried or reconstructed by wrappers and alternate transports. `JobObject`
+//! and spawn providers nevertheless need those policies in order to compose correctly. The
+//! `KillOnDrop` and `CreationFlags` wrappers therefore record portable policy on each spawn attempt
+//! and _should_ be used instead of the native-only methods when composition is required.
 //!
 //! In practice:
 //!
@@ -177,23 +176,55 @@
 //!   incorporate all or part of the second, concretely typed wrapper. By default, this does nothing
 //!   (that is, only the first registered wrapper instance of a type applies).
 //!
-//! - **`fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, core: &Command)`** is called before the
-//!   command is spawned, and gives mutable access to that spawn attempt's command state. It also
-//!   gives mutable access to the wrapper instance, so state can be stored if needed. The `core`
-//!   reference gives access to data from other wrappers; for example, that's how `CreationFlags` on
-//!   Windows works along with `JobObject`. By default does nothing.
+//! - **`fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, command: &Command)`** is called before
+//!   spawning. It can record portable policy for this attempt and inspect peer wrappers through
+//!   `command`. Mutations copied from a tracked command apply to one attempt; native-only commands
+//!   retain native mutations. Calling `attempt.native_mut()` or `stdin`/`stdout`/`stderr` makes a
+//!   tracked attempt incompatible with a portable provider. By default does nothing.
 //!
-//! - **`fn post_spawn(&mut self, attempt: &mut SpawnAttempt, child: &mut dyn ChildWrapper, core: &Command)`**
-//!   is called after spawn, and should be used for any necessary cleanups. It is offered for
-//!   completeness but is expected to be less used than `wrap_child()`. By default does nothing.
+//! - **`fn post_spawn(&mut self, attempt: &mut SpawnAttempt, child: &mut dyn ChildWrapper, command: &Command)`**
+//!   is called after any transport creates its child. The child may be a terminal custom/provider
+//!   child with no native value. Changing command settings on `attempt` here cannot configure the
+//!   already-created child. By default does nothing.
 //!
-//! - **`fn wrap_child(&mut self, child: Box<dyn ChildWrapper>, core: &Command)`** is
-//!   called after all `post_spawn()`s have run. If your wrapper needs to override the methods on
-//!   Child, then it should create an instance of its own type implementing `ChildWrapper` and
-//!   return it here. Child wraps are _in order_: you may end up with a `Foo(Bar(Child))` or a
-//!   `Bar(Foo(Child))` depending on if `.wrap(Foo).wrap(Bar)` or `.wrap(Bar).wrap(Foo)` was called.
-//!   If your functionality is order-dependent, make sure to specify so in your documentation! By
-//!   default does nothing: no wrapping is performed and the input `child` is returned as-is.
+//! - **`fn wrap_child(&mut self, child: Box<dyn ChildWrapper>, command: &Command)`** is called after
+//!   all `post_spawn()` hooks. If your wrapper needs to override child methods, create and return its
+//!   own `ChildWrapper` layer. Child wraps run in registration order, so
+//!   `.wrap(Foo).wrap(Bar)` produces an outer `Bar(Foo(child))`. By default returns the input child.
+//!
+//! - **`fn spawn_provider(&self) -> Option<&dyn SpawnProvider>`** exposes an alternate transport owned
+//!   by this wrapper. A provider exposed during selection must remain available throughout the spawn
+//!   lifecycle, and only one registered wrapper may expose one. By default returns `None`.
+//!
+//! Pre-spawn, post-spawn, and child-wrapping hooks all run in registration order and stop at the first
+//! error or panic. The active wrapper remains registered but is temporarily unavailable through
+//! `get_wrap`; peer wrappers remain visible.
+//!
+//! ## Spawn providers
+//!
+//! A spawn provider replaces process creation while retaining the complete wrapper lifecycle, making
+//! custom transports such as PTYs composable with other wrappers. The provider path runs:
+//!
+//! 1. `check_available`
+//! 2. native-only base rejection
+//! 3. `validate_command`
+//! 4. every `pre_spawn` hook
+//! 5. native-only attempt rejection
+//! 6. `validate_attempt`
+//! 7. provider `spawn`
+//! 8. every `post_spawn` hook
+//! 9. every child wrapper
+//! 10. transaction `commit`
+//!
+//! Validation rejects unsupported portable policy before operating-system allocation. `spawn`
+//! returns a child satisfying the frontend's complete `ChildWrapper` contract and a fresh, armed
+//! `SpawnTransaction` which owns cleanup independently of the child chain. A later public hook,
+//! wrapper, or commit error/panic causes best-effort rollback while preserving the original failure.
+//! Cleanup before `spawn` returns that product remains the provider's responsibility.
+//!
+//! A command may register only one provider; conflicts are rejected before callbacks or allocation.
+//! Providers and wrapper state are reusable across repeated spawns. `spawn_with` and
+//! `spawn_with_child` reject a registered provider instead of bypassing it.
 //!
 //! ## An Example Logging Wrapper
 //!
@@ -338,6 +369,10 @@
 //! # }
 //! # fn main() {}
 //! ```
+//!
+//! Calling `stdout` and `stderr` makes this attempt native-only, so this particular wrapper is for the
+//! native or explicit spawning paths. A registered portable provider rejects the opaque attempt before
+//! its validation or allocation callbacks.
 //!
 //! The tracked process-wrap command does not retain the `tx` handles from this hook. Each spawn uses
 //! a fresh native attempt command, and that attempt is dropped before `spawn()` returns. The child has
@@ -489,6 +524,10 @@
 //! - `process-session`: **default**, enables the process session wrapper (Unix-only).
 //! - `reset-sigmask`: enables the sigmask reset wrapper (Unix-only).
 //!
+//! ## Diagnostics
+//!
+//! - `tracing`: **default**, enables internal lifecycle diagnostics through the `tracing` crate.
+//!
 #![doc(html_favicon_url = "https://watchexec.github.io/logo:command-group.svg")]
 #![doc(html_logo_url = "https://watchexec.github.io/logo:command-group.svg")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -503,15 +542,18 @@ pub(crate) mod unix;
 pub use unix::ProcessGroupTarget;
 
 #[cfg(windows)]
+#[cfg_attr(docsrs, doc(cfg(windows)))]
 pub use command::WindowsSpawnPolicy;
 #[doc(hidden)]
 pub use command::{Backend, Blocking, NativeCommand, Tokio1};
 pub use command::{Command, SpawnAttempt, SpawnTransaction};
 
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod std;
 
 #[cfg(feature = "tokio1")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio1")))]
 pub mod tokio;
 
 #[cfg(all(

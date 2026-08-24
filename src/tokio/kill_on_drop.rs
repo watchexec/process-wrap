@@ -2,11 +2,11 @@ use std::io::Result;
 
 use super::{CommandWrap, CommandWrapper, SpawnAttempt};
 
-/// Shim wrapper which sets kill-on-drop on a [`Command`](super::Command).
+/// Portable kill-on-drop policy wrapper for a [`Command`](super::Command).
 ///
-/// This wrapper exists to be able to set the kill-on-drop flag on a `Command` and also store that
-/// fact in the wrapper, so that it can be used by other wrappers. Notably this is used by the
-/// `JobObject` wrapper.
+/// Calling the native-shaped `Command::kill_on_drop` method makes the command native-only because the
+/// setting cannot be queried afterward. This wrapper instead records the policy on each `SpawnAttempt`,
+/// allowing `JobObject` and alternate spawn providers to preserve it.
 #[derive(Clone, Copy, Debug)]
 pub struct KillOnDrop;
 

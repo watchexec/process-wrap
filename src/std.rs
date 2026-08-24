@@ -24,18 +24,23 @@ pub use core::{
 	SpawnProvider,
 };
 #[cfg(all(windows, feature = "creation-flags"))]
+#[cfg_attr(docsrs, doc(cfg(all(windows, feature = "creation-flags"))))]
 #[doc(inline)]
 pub use creation_flags::CreationFlags;
 #[cfg(all(windows, feature = "job-object"))]
+#[cfg_attr(docsrs, doc(cfg(all(windows, feature = "job-object"))))]
 #[doc(inline)]
 pub use job_object::{JobObject, JobObjectChild};
 #[cfg(all(unix, feature = "process-group"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "process-group"))))]
 #[doc(inline)]
 pub use process_group::{ProcessGroup, ProcessGroupChild};
 #[cfg(all(unix, feature = "process-session"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "process-session"))))]
 #[doc(inline)]
 pub use process_session::ProcessSession;
 #[cfg(all(unix, feature = "reset-sigmask"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "reset-sigmask"))))]
 #[doc(inline)]
 pub use reset_sigmask::ResetSigmask;
 

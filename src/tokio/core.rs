@@ -95,7 +95,8 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	/// default implementation.
 	///
 	/// Implementations returning `Some` must return a process handle, rather than another kind of
-	/// Windows object.
+	/// Windows object. A provider child used with `JobObject` must expose this capability; otherwise
+	/// process-wrap returns `Unsupported` and makes a best-effort attempt to terminate the child.
 	#[cfg(windows)]
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
 		None
@@ -103,9 +104,12 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 
 	/// Resume the exact thread which process-wrap temporarily suspended for job-object assignment.
 	///
-	/// This method is only available on Windows. A provider child which retains its primary thread
-	/// handle should return `Some(result)` after attempting one exact resume. Other children retain the
-	/// default `None`, which lets `JobObject` use its process-wide compatibility fallback.
+	/// This method is only available on Windows. A provider which creates the process temporarily
+	/// suspended according to `WindowsSpawnPolicy` should retain its primary-thread handle and return
+	/// `Some(result)` after attempting one exact resume. `Some(Err(_))` is authoritative and fails the
+	/// spawn lifecycle; process-wrap does not then try another resume mechanism. Return `None` only when
+	/// no exact capability exists, which lets `JobObject` use its process-wide thread-enumeration
+	/// compatibility fallback.
 	#[cfg(windows)]
 	fn resume_after_job_assignment(&mut self) -> Option<Result<()>> {
 		None
@@ -358,8 +362,9 @@ impl dyn ChildWrapper + '_ {
 
 	/// Try the first exact post-assignment resume capability in this wrapper chain.
 	///
-	/// Returns `None` when no layer owns an exact primary-thread resume operation, allowing callers to
-	/// use a compatibility fallback.
+	/// Returns `None` only when no layer owns an exact primary-thread resume operation, allowing callers
+	/// to use a thread-enumeration compatibility fallback. A returned `Some(Err(_))` is authoritative
+	/// and must fail the lifecycle rather than fall back.
 	#[cfg(windows)]
 	pub fn try_resume_after_job_assignment(&mut self) -> Option<Result<()>> {
 		let mut inner = self;

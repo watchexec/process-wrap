@@ -4,13 +4,12 @@ use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
 use super::{CommandWrap, CommandWrapper, SpawnAttempt};
 
-/// Shim wrapper which sets Windows process creation flags.
+/// Portable wrapper for Windows process creation flags.
 ///
-/// This wrapper is only available on Windows.
-///
-/// It exists to be able to set creation flags on a `Command` and also store them in the wrapper, so
-/// that they are not overwritten by other wrappers. Notably this is the only way to use creation
-/// flags and the `JobObject` wrapper together.
+/// This wrapper is only available on Windows. Calling the native-shaped `Command::creation_flags`
+/// method makes the command native-only because those flags cannot be queried afterward. This wrapper
+/// instead records them on each `SpawnAttempt`, allowing `JobObject` and alternate spawn providers to
+/// preserve and inspect the policy.
 ///
 /// When both `CreationFlags` and `JobObject` are used, process-wrap preserves these flags while
 /// temporarily adding `CREATE_SUSPENDED`; registration order does not matter.

@@ -517,13 +517,19 @@ impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
 
 /// Cleanup and finalization owned by an alternate spawn provider.
 ///
-/// A transaction is returned armed after a provider creates a child. Process-wrap calls [`commit`]
-/// only after every post-spawn and child-wrapping hook succeeds. On any later error or panic,
-/// process-wrap calls [`rollback`] and preserves the original failure even if rollback also fails.
-/// Implementations must own their cleanup resources independently of the child wrapper chain.
+/// A provider returns a fresh, armed transaction with every child it successfully creates. The
+/// transaction must own its cleanup resources independently of the child wrapper chain, because a
+/// failing child wrapper may already have consumed or dropped that chain.
 ///
-/// [`commit`]: SpawnTransaction::commit
-/// [`rollback`]: SpawnTransaction::rollback
+/// Process-wrap calls [`commit`](SpawnTransaction::commit) only after every public post-spawn and
+/// child-wrapping hook succeeds. `commit` must disarm rollback resources on success. If it returns an
+/// error or panics, the transaction must remain rollbackable; process-wrap then makes one best-effort
+/// [`rollback`](SpawnTransaction::rollback) call. A rollback error or panic is suppressed so the
+/// original error or panic is preserved. After a successful commit, process-wrap drops the transaction
+/// and does not roll it back if a later internal child-finalization phase fails.
+///
+/// Until a provider returns its `ProviderProduct`, cleanup for errors or panics in its own `spawn`
+/// implementation remains the provider's responsibility.
 pub trait SpawnTransaction: fmt::Debug + Send + 'static {
 	/// Finalize the successful spawn and disarm rollback resources.
 	fn commit(&mut self) -> std::io::Result<()>;
@@ -704,9 +710,11 @@ struct PlatformCommandState {
 
 /// The command configuration for one spawn attempt.
 ///
-/// Each call to a spawn method creates a fresh attempt. Hooks may modify it without changing a
-/// tracked base [`Command`]. Explicit native mutation makes only that attempt native-only, which
-/// alternate portable spawn providers reject rather than reconstructing or partially applying.
+/// Each call to a spawn method creates a fresh attempt. Hooks may modify an attempt copied from a
+/// tracked base [`Command`] without changing that base. A native-only command instead lends its exact
+/// native command to the attempt and retains hook mutations when the command is restored afterward.
+/// Explicit native mutation makes a tracked attempt native-only, which alternate portable spawn
+/// providers reject rather than reconstructing or partially applying.
 pub struct SpawnAttempt<B: Backend> {
 	state: AttemptState<B::NativeCommand>,
 	#[cfg_attr(not(unix), allow(dead_code))]
