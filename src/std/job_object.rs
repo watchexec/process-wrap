@@ -1,4 +1,5 @@
 use std::{
+	any::Any,
 	io::{Error, ErrorKind, Result},
 	os::windows::io::{AsRawHandle, BorrowedHandle},
 	process::ExitStatus,
@@ -15,7 +16,8 @@ use windows::Win32::{
 use crate::{
 	ChildExitStatus,
 	windows::{
-		JobPort, job_creation_flags, make_job_object, resume_threads, terminate_job, wait_on_job,
+		JobPort, job_creation_flags, make_job_object, resume_threads, set_job_kill_on_drop,
+		terminate_job, wait_on_job,
 	},
 };
 
@@ -57,19 +59,17 @@ fn terminate_child(child: &mut dyn ChildWrapper) {
 	}
 }
 
-impl CommandWrapper for JobObject {
-	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
-	fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, _core: &CommandWrap) -> Result<()> {
-		attempt.set_job_object();
-		Ok(())
-	}
+#[derive(Debug)]
+struct PreparedJobObject {
+	job_port: JobPort,
+}
 
-	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
-	fn wrap_child(
-		&mut self,
-		mut inner: Box<dyn ChildWrapper>,
+impl JobObject {
+	fn prepare_job(
+		&self,
+		child: &mut dyn ChildWrapper,
 		core: &CommandWrap,
-	) -> Result<Box<dyn ChildWrapper>> {
+	) -> Result<PreparedJobObject> {
 		let policy = job_creation_flags(user_creation_flags(core));
 
 		#[cfg(feature = "tracing")]
@@ -80,10 +80,10 @@ impl CommandWrapper for JobObject {
 
 		// Prefer the explicit capability, while preserving composition with transparent wrappers
 		// written before `process_handle` was added.
-		let handle = match inner.as_ref().try_process_handle() {
+		let handle = match child.try_process_handle() {
 			Some(handle) => HANDLE(handle.as_raw_handle()),
 			None => {
-				terminate_child(&mut *inner);
+				terminate_child(child);
 				return Err(Error::new(
 					ErrorKind::Unsupported,
 					"child wrapper does not expose a Windows process handle",
@@ -91,27 +91,74 @@ impl CommandWrapper for JobObject {
 			}
 		};
 
-		let job_port = match make_job_object(handle, false) {
+		let job_port = match make_job_object(handle, true) {
 			Ok(job_port) => job_port,
 			Err(error) => {
-				terminate_child(&mut *inner);
+				terminate_child(child);
 				return Err(error);
 			}
 		};
 
 		if policy.resume_after_assignment {
-			let resumed = inner
-				.as_mut()
+			let resumed = child
 				.try_resume_after_job_assignment()
 				.unwrap_or_else(|| resume_threads(handle));
 			if let Err(error) = resumed {
 				let _ = terminate_job(job_port.job, 1);
-				terminate_child(&mut *inner);
+				terminate_child(child);
 				return Err(error);
 			}
 		}
 
-		Ok(Box::new(JobObjectChild::new(inner, job_port)))
+		Ok(PreparedJobObject { job_port })
+	}
+}
+
+impl CommandWrapper for JobObject {
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
+	fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, _core: &CommandWrap) -> Result<()> {
+		attempt.set_job_object();
+		Ok(())
+	}
+
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self, child)))]
+	fn prepare_child(
+		&mut self,
+		_attempt: &mut SpawnAttempt,
+		child: &mut dyn ChildWrapper,
+		core: &CommandWrap,
+	) -> Result<Option<Box<dyn Any + Send>>> {
+		Ok(Some(Box::new(self.prepare_job(child, core)?)))
+	}
+
+	fn wrap_prepared_child(
+		&mut self,
+		inner: Box<dyn ChildWrapper>,
+		prepared: Option<Box<dyn Any + Send>>,
+		_core: &CommandWrap,
+	) -> Result<Box<dyn ChildWrapper>> {
+		let prepared = prepared.expect("JobObject child preparation always produces state");
+		let prepared = match prepared.downcast::<PreparedJobObject>() {
+			Ok(prepared) => *prepared,
+			Err(_) => unreachable!("JobObject prepared state retains its concrete type"),
+		};
+		Ok(Box::new(JobObjectChild::new(
+			inner,
+			prepared.job_port,
+			false,
+		)))
+	}
+
+	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self, inner)))]
+	fn wrap_child(
+		&mut self,
+		mut inner: Box<dyn ChildWrapper>,
+		core: &CommandWrap,
+	) -> Result<Box<dyn ChildWrapper>> {
+		let prepared = self.prepare_job(inner.as_mut(), core)?;
+		let mut child = JobObjectChild::new(inner, prepared.job_port, false);
+		child.disarm_job_object_layer()?;
+		Ok(Box::new(child))
 	}
 }
 
@@ -121,15 +168,23 @@ pub struct JobObjectChild {
 	inner: Box<dyn ChildWrapper>,
 	exit_status: ChildExitStatus,
 	job_port: JobPort,
+	final_kill_on_drop: bool,
+	spawn_finalized: bool,
 }
 
 impl JobObjectChild {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(job_port)))]
-	pub(crate) fn new(inner: Box<dyn ChildWrapper>, job_port: JobPort) -> Self {
+	pub(crate) fn new(
+		inner: Box<dyn ChildWrapper>,
+		job_port: JobPort,
+		final_kill_on_drop: bool,
+	) -> Self {
 		Self {
 			inner,
 			exit_status: ChildExitStatus::Running,
 			job_port,
+			final_kill_on_drop,
+			spawn_finalized: false,
 		}
 	}
 }
@@ -142,16 +197,32 @@ impl ChildWrapper for JobObjectChild {
 		self.inner.as_mut()
 	}
 	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-		// manually drop the completion port
-		let its = std::mem::ManuallyDrop::new(self.job_port);
-		unsafe { CloseHandle(its.completion_port.0) }.ok();
-		// we leave the job handle unclosed, otherwise the Child is useless
-		// (as closing it will terminate the job)
+		let Self {
+			inner,
+			job_port,
+			final_kill_on_drop,
+			spawn_finalized,
+			..
+		} = *self;
+		if spawn_finalized && final_kill_on_drop {
+			// manually drop the completion port
+			let its = std::mem::ManuallyDrop::new(job_port);
+			unsafe { CloseHandle(its.completion_port.0) }.ok();
+			// we leave the job handle unclosed, otherwise the Child is useless
+			// (as closing it may terminate the job)
+		}
+		// Before spawn finalization, dropping the still-armed job instead guarantees that removing this
+		// layer cannot let descendants escape a later lifecycle failure.
 
-		self.inner
+		inner
 	}
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
 		self.inner.try_process_handle()
+	}
+	fn disarm_job_object_layer(&mut self) -> Result<()> {
+		set_job_kill_on_drop(self.job_port.job, self.final_kill_on_drop)?;
+		self.spawn_finalized = true;
+		Ok(())
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]

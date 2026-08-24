@@ -641,21 +641,14 @@ const WAIT_INFINITE: u32 = u32::MAX;
 pub(crate) fn terminate_process_and_wait(process: BorrowedHandle<'_>) -> std::io::Result<()> {
 	let raw = process.as_raw_handle();
 	// SAFETY: `raw` is a live process handle for both calls and remains borrowed until they finish.
-	let terminate_error = if unsafe { TerminateProcess(raw, 1) } == 0 {
-		Some(std::io::Error::last_os_error())
-	} else {
-		None
-	};
+	if unsafe { TerminateProcess(raw, 1) } == 0 {
+		return Err(std::io::Error::last_os_error());
+	}
 	// SAFETY: the process handle remains live for the duration of this call.
-	let wait_error = if unsafe { WaitForSingleObject(raw, WAIT_INFINITE) } == WAIT_FAILED {
-		Some(std::io::Error::last_os_error())
+	if unsafe { WaitForSingleObject(raw, WAIT_INFINITE) } == WAIT_FAILED {
+		Err(std::io::Error::last_os_error())
 	} else {
-		None
-	};
-
-	match (terminate_error, wait_error) {
-		(None, None) => Ok(()),
-		(Some(error), _) | (None, Some(error)) => Err(error),
+		Ok(())
 	}
 }
 

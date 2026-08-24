@@ -258,6 +258,36 @@ macro_rules! Wrap {
 				Ok(())
 			}
 
+			#[cfg(windows)]
+			#[inline]
+			fn run_prepare_child(
+				&mut self,
+				attempt: &mut SpawnAttempt,
+				child: &mut dyn $childer,
+			) -> ::std::io::Result<
+				Vec<Option<Box<dyn ::std::any::Any + Send>>>,
+			> {
+				let len = self.wrapper_registry().wrappers.len();
+				let mut prepared = Vec::with_capacity(len);
+				for index in 0..len {
+					#[cfg(feature = "tracing")]
+					{
+						let id = self
+							.wrapper_registry()
+							.wrappers
+							.get_index(index)
+							.expect("wrapper indices cannot disappear during ordered hook traversal")
+							.0;
+						::tracing::debug!(?id, "prepare_child");
+					}
+					prepared.push(self.with_wrapper_at(index, |wrapper, command| {
+						wrapper.prepare_child(attempt, child, command)
+					})?);
+				}
+
+				Ok(prepared)
+			}
+
 			#[inline]
 			fn run_post_spawn(
 				&mut self,
@@ -288,6 +318,9 @@ macro_rules! Wrap {
 			fn run_wrap_child(
 				&mut self,
 				mut child: Box<dyn $childer>,
+				#[cfg(windows)] mut prepared: Vec<
+					Option<Box<dyn ::std::any::Any + Send>>,
+				>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
 				let len = self.wrapper_registry().wrappers.len();
 				for index in 0..len {
@@ -302,7 +335,18 @@ macro_rules! Wrap {
 						::tracing::debug!(?id, "wrap_child");
 					}
 					child = self.with_wrapper_at(index, |wrapper, command| {
-						wrapper.wrap_child(child, command)
+						#[cfg(windows)]
+						{
+							wrapper.wrap_prepared_child(
+								child,
+								prepared[index].take(),
+								command,
+							)
+						}
+						#[cfg(not(windows))]
+						{
+							wrapper.wrap_child(child, command)
+						}
 					})?;
 				}
 
@@ -337,15 +381,27 @@ macro_rules! Wrap {
 					None
 				};
 
-				let result = self
-					.run_post_spawn(attempt, child.as_mut())
-					.and_then(|()| self.run_wrap_child(child));
+				let result = (|| {
+					#[cfg(windows)]
+					let prepared = self.run_prepare_child(attempt, child.as_mut())?;
+					self.run_post_spawn(attempt, child.as_mut())?;
+					#[cfg(windows)]
+					{
+						self.run_wrap_child(child, prepared)
+					}
+					#[cfg(not(windows))]
+					{
+						self.run_wrap_child(child)
+					}
+				})();
 				#[cfg(windows)]
-				if result.is_ok() {
+				let result = result.and_then(|mut child| {
+					child.finalize_spawn()?;
 					if let Some(cleanup) = cleanup.as_mut() {
 						cleanup.disarm();
 					}
-				}
+					Ok(child)
+				});
 				result
 			}
 
@@ -364,7 +420,12 @@ macro_rules! Wrap {
 				let (mut child, transaction) = product.into_parts();
 				let mut transaction = Some(transaction);
 				let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+					#[cfg(windows)]
+					let prepared = self.run_prepare_child(attempt, child.as_mut())?;
 					self.run_post_spawn(attempt, child.as_mut())?;
+					#[cfg(windows)]
+					let child = self.run_wrap_child(child, prepared)?;
+					#[cfg(not(windows))]
 					let child = self.run_wrap_child(child)?;
 					transaction
 						.as_mut()
@@ -375,6 +436,12 @@ macro_rules! Wrap {
 							.take()
 							.expect("a committed provider transaction is still present"),
 					);
+					#[cfg(windows)]
+					let child = {
+						let mut child = child;
+						child.finalize_spawn()?;
+						child
+					};
 					Ok(child)
 				}));
 
@@ -576,6 +643,21 @@ macro_rules! Wrap {
 				Ok(())
 			}
 
+			/// Prepare Windows child state which must exist before public post-spawn hooks run.
+			///
+			/// Process-wrap retains the returned state through post-spawn hooks and supplies it to the
+			/// matching wrapper's `wrap_prepared_child` call.
+			#[doc(hidden)]
+			#[cfg(windows)]
+			fn prepare_child(
+				&mut self,
+				_attempt: &mut SpawnAttempt,
+				_child: &mut dyn $childer,
+				_command: &Command,
+			) -> ::std::io::Result<Option<Box<dyn ::std::any::Any + Send>>> {
+				Ok(None)
+			}
+
 			/// Called after any transport spawns a child, but before the child is wrapped.
 			///
 			/// The child is exposed through the frontend's object-safe capability trait, so this hook
@@ -605,6 +687,22 @@ macro_rules! Wrap {
 				_command: &Command,
 			) -> ::std::io::Result<Box<dyn $childer>> {
 				Ok(child)
+			}
+
+			/// Install a child wrapper using state returned by `prepare_child`.
+			#[doc(hidden)]
+			#[cfg(windows)]
+			fn wrap_prepared_child(
+				&mut self,
+				child: Box<dyn $childer>,
+				prepared: Option<Box<dyn ::std::any::Any + Send>>,
+				command: &Command,
+			) -> ::std::io::Result<Box<dyn $childer>> {
+				debug_assert!(
+					prepared.is_none(),
+					"the default child preparation does not produce wrapper state"
+				);
+				self.wrap_child(child, command)
 			}
 
 			/// Expose an alternate spawn provider implemented by this wrapper.

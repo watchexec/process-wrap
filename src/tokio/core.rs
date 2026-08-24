@@ -111,6 +111,35 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 		None
 	}
 
+	/// Finalize Windows spawn state owned by this child layer.
+	///
+	/// Process-wrap invokes this internal lifecycle hook after all child wrappers have been installed.
+	/// Implementations act only on their own layer; process-wrap traverses the complete chain.
+	#[doc(hidden)]
+	#[cfg(windows)]
+	fn finalize_spawn_layer(&mut self) -> Result<()> {
+		Ok(())
+	}
+
+	/// Disarm Windows cleanup state owned by this child layer.
+	///
+	/// Process-wrap invokes this internal hook only after every ordinary spawn finalizer succeeds, so
+	/// cleanup remains armed if any earlier finalizer errors or panics.
+	#[doc(hidden)]
+	#[cfg(windows)]
+	fn disarm_spawn_cleanup_layer(&mut self) -> Result<()> {
+		Ok(())
+	}
+
+	/// Disarm the JobObject cleanup state owned by this child layer.
+	///
+	/// This process-wrap-internal phase runs after every other fallible finalizer and cleanup disarm.
+	#[doc(hidden)]
+	#[cfg(windows)]
+	fn disarm_job_object_layer(&mut self) -> Result<()> {
+		Ok(())
+	}
+
 	/// Obtain a clone if possible.
 	///
 	/// Some implementations may make it possible to clone the implementing structure, even though
@@ -349,6 +378,34 @@ impl dyn ChildWrapper + '_ {
 			}
 			inner = next;
 		}
+	}
+
+	#[cfg(windows)]
+	fn visit_spawn_layers(
+		&mut self,
+		mut visit: impl FnMut(&mut dyn ChildWrapper) -> Result<()>,
+	) -> Result<()> {
+		let mut inner = self;
+		loop {
+			visit(inner)?;
+
+			let inner_type = (&*inner as &dyn Any).type_id();
+			let inner_ptr = std::ptr::from_mut(inner);
+			let next = inner.inner_mut();
+			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
+				&& inner_type == (&*next as &dyn Any).type_id()
+			{
+				return Ok(());
+			}
+			inner = next;
+		}
+	}
+
+	#[cfg(windows)]
+	pub(crate) fn finalize_spawn(&mut self) -> Result<()> {
+		self.visit_spawn_layers(|inner| inner.finalize_spawn_layer())?;
+		self.visit_spawn_layers(|inner| inner.disarm_spawn_cleanup_layer())?;
+		self.visit_spawn_layers(|inner| inner.disarm_job_object_layer())
 	}
 
 	/// Try to obtain a reference to the underlying native [`Child`].
