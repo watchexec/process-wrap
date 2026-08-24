@@ -78,9 +78,9 @@ macro_rules! Wrap {
 			/// called.
 			///
 			/// Only one wrapper of a given type can be applied to a command. If `wrap` is called
-			/// twice with the same type, the existing wrapper will have its `extend` hook called,
-			/// which gives it a chance to absorb the new wrapper. If it does not, the _new_ wrapper
-			/// will be silently discarded.
+			/// twice with the same type, the existing wrapper receives the newly registered wrapper
+			/// through its typed `extend` hook and can merge its configuration. If the hook does
+			/// nothing, the _new_ wrapper is silently discarded.
 			///
 			/// Returns `&mut self` for chaining.
 			pub fn wrap<W: CommandWrapper + 'static>(&mut self, wrapper: W) -> &mut Self {
