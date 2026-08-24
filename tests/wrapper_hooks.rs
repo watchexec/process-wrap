@@ -306,7 +306,7 @@ macro_rules! wrapper_hook_tests {
 				match failure {
 					Failure::Error => assert_eq!(
 						spawn()
-							.expect_err("the first hook invocation must fail")
+							.expect_err("FailOnce is guaranteed to fail its first hook invocation")
 							.to_string(),
 						"fail once"
 					),
@@ -323,7 +323,9 @@ macro_rules! wrapper_hook_tests {
 						events.lock().unwrap().push(RecoveryEvent::Spawn);
 						command.spawn()
 					})
-					.expect("the restored command and wrappers must be reusable");
+					.expect(
+						"state restoration guarantees that the command and wrappers remain reusable",
+					);
 				wait_for_exit(child);
 				assert_eq!(*events.lock().unwrap(), retry_events());
 			}
@@ -387,9 +389,13 @@ macro_rules! wrapper_hook_tests {
 				let mut command = command();
 				let error = command
 					.spawn_with(|_| Err(io::Error::other("spawner failed")))
-					.expect_err("the spawner must fail");
+					.expect_err("the test spawner is guaranteed to fail");
 				assert_eq!(error.to_string(), "spawner failed");
-				wait_for_exit(command.spawn().expect("the command must be restored"));
+				wait_for_exit(
+					command
+						.spawn()
+						.expect("state restoration guarantees that the command remains reusable"),
+				);
 			}
 
 			#[test]
@@ -403,7 +409,11 @@ macro_rules! wrapper_hook_tests {
 					});
 				}));
 				assert!(panic.is_err());
-				wait_for_exit(command.spawn().expect("the command must be restored"));
+				wait_for_exit(
+					command
+						.spawn()
+						.expect("state restoration guarantees that the command remains reusable"),
+				);
 			}
 		}
 	};
