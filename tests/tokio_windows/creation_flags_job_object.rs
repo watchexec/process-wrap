@@ -1,9 +1,11 @@
 use std::{
+	fs,
 	io::{Error, ErrorKind},
 	panic::{AssertUnwindSafe, catch_unwind},
-	process::ExitStatus,
+	path::PathBuf,
+	process::{Command as StdCommand, ExitStatus},
 	sync::{
-		Arc,
+		Arc, Mutex,
 		atomic::{AtomicU32, Ordering},
 	},
 	time::Instant,
@@ -13,9 +15,14 @@ use windows::Win32::System::Threading::{
 	CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_CREATION_FLAGS,
 };
 
-use super::{prelude::*, windows_thread::process_has_suspended_thread};
+use super::{
+	prelude::*,
+	windows_thread::{ProcessGuard, process_has_suspended_thread, resume_process_threads},
+};
 
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const DESCENDANT_PID_FILE: &str = "PROCESS_WRAP_DESCENDANT_PID_FILE";
+static PID_FILE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 enum Order {
@@ -128,6 +135,169 @@ impl CommandWrapper for FailWrapOnce {
 	}
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailureHook {
+	PostSpawn,
+	WrapChild,
+	FinalizeSpawn,
+	DisarmSpawnCleanup,
+}
+
+#[derive(Debug)]
+struct FailFinalizationChild {
+	inner: Box<dyn ChildWrapper>,
+	failure: Failure,
+	hook: FailureHook,
+}
+
+impl ChildWrapper for FailFinalizationChild {
+	fn inner(&self) -> &dyn ChildWrapper {
+		self.inner.as_ref()
+	}
+
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+		self.inner.as_mut()
+	}
+
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+		self.inner
+	}
+
+	fn finalize_spawn_layer(&mut self) -> Result<()> {
+		if self.hook == FailureHook::FinalizeSpawn {
+			match self.failure {
+				Failure::Error => Err(Error::other("child wrapping failed")),
+				Failure::Panic => panic!("child wrapping failed"),
+			}
+		} else {
+			Ok(())
+		}
+	}
+
+	fn disarm_spawn_cleanup_layer(&mut self) -> Result<()> {
+		if self.hook == FailureHook::DisarmSpawnCleanup {
+			match self.failure {
+				Failure::Error => Err(Error::other("child wrapping failed")),
+				Failure::Panic => panic!("child wrapping failed"),
+			}
+		} else {
+			Ok(())
+		}
+	}
+}
+
+#[derive(Debug)]
+struct FailAfterDescendant {
+	failure: Failure,
+	hook: FailureHook,
+	unwrap_child: bool,
+	pid_file: PathBuf,
+	guard: Arc<Mutex<Option<ProcessGuard>>>,
+}
+
+impl FailAfterDescendant {
+	fn observe_descendant(&self) -> Result<()> {
+		let deadline = Instant::now() + EXIT_TIMEOUT;
+		let pid = loop {
+			if let Ok(pid) = fs::read_to_string(&self.pid_file)
+				.and_then(|pid| pid.trim().parse().map_err(Error::other))
+			{
+				break pid;
+			}
+			if Instant::now() >= deadline {
+				return Err(Error::new(
+					ErrorKind::TimedOut,
+					"descendant helper did not report its process ID",
+				));
+			}
+			std::thread::sleep(Duration::from_millis(10));
+		};
+		*self.guard.lock().unwrap() = Some(ProcessGuard::open(pid)?);
+		Ok(())
+	}
+
+	fn fail<T>(&self) -> Result<T> {
+		match self.failure {
+			Failure::Error => Err(Error::other("child wrapping failed")),
+			Failure::Panic => panic!("child wrapping failed"),
+		}
+	}
+}
+
+fn child_id(child: &dyn ChildWrapper) -> Result<u32> {
+	child
+		.id()
+		.ok_or_else(|| Error::other("a newly spawned child must expose its process ID"))
+}
+
+impl CommandWrapper for FailAfterDescendant {
+	fn post_spawn(
+		&mut self,
+		_attempt: &mut SpawnAttempt,
+		child: &mut dyn ChildWrapper,
+		_core: &CommandWrap,
+	) -> Result<()> {
+		if self.hook != FailureHook::PostSpawn {
+			return Ok(());
+		}
+		resume_process_threads(child_id(child)?)?;
+		self.observe_descendant()?;
+		self.fail()
+	}
+
+	fn wrap_child(
+		&mut self,
+		child: Box<dyn ChildWrapper>,
+		_core: &CommandWrap,
+	) -> Result<Box<dyn ChildWrapper>> {
+		if self.hook == FailureHook::PostSpawn {
+			return Ok(child);
+		}
+		resume_process_threads(child_id(child.as_ref())?)?;
+		self.observe_descendant()?;
+		if matches!(
+			self.hook,
+			FailureHook::FinalizeSpawn | FailureHook::DisarmSpawnCleanup
+		) {
+			return Ok(Box::new(FailFinalizationChild {
+				inner: child,
+				failure: self.failure,
+				hook: self.hook,
+			}));
+		}
+		if self.unwrap_child {
+			drop(child.into_inner());
+		} else {
+			drop(child);
+		}
+		self.fail()
+	}
+}
+
+fn descendant_pid_file() -> PathBuf {
+	std::env::temp_dir().join(format!(
+		"process-wrap-{}-{}.pid",
+		std::process::id(),
+		PID_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+	))
+}
+
+async fn wait_for_process_exit(guard: ProcessGuard) -> Result<()> {
+	let deadline = Instant::now() + EXIT_TIMEOUT;
+	loop {
+		if guard.has_exited()? {
+			return guard.disarm();
+		}
+		if Instant::now() >= deadline {
+			return Err(Error::new(
+				ErrorKind::TimedOut,
+				"descendant survived the failed spawn lifecycle",
+			));
+		}
+		sleep(Duration::from_millis(10)).await;
+	}
+}
+
 fn command(flags: PROCESS_CREATION_FLAGS, order: Order) -> CommandWrap {
 	let mut command = CommandWrap::with_new("cmd.exe", |command| {
 		command.args(["/D", "/S", "/C", "exit /b 0"]);
@@ -231,6 +401,88 @@ fn portable_policy_covers_flags_jobs_suspension_and_kill_on_drop() {
 			},
 		);
 	}
+}
+
+#[test]
+#[ignore = "subprocess helper"]
+fn lifecycle_descendant_leaf() {
+	std::thread::sleep(Duration::from_secs(300));
+}
+
+#[test]
+#[ignore = "subprocess helper"]
+fn lifecycle_descendant_parent() {
+	let mut descendant = StdCommand::new(std::env::current_exe().unwrap())
+		.args(["lifecycle_descendant_leaf", "--ignored", "--nocapture"])
+		.spawn()
+		.unwrap();
+	fs::write(
+		std::env::var_os(DESCENDANT_PID_FILE).unwrap(),
+		descendant.id().to_string(),
+	)
+	.unwrap();
+	descendant.wait().unwrap();
+}
+
+#[tokio::test]
+async fn armed_job_kills_descendants_after_later_failures() -> Result<()> {
+	let cases = [
+		(FailureHook::PostSpawn, false, false),
+		(FailureHook::WrapChild, false, false),
+		(FailureHook::WrapChild, true, false),
+		(FailureHook::WrapChild, true, true),
+		(FailureHook::FinalizeSpawn, false, false),
+		(FailureHook::FinalizeSpawn, true, false),
+		(FailureHook::DisarmSpawnCleanup, false, false),
+		(FailureHook::DisarmSpawnCleanup, true, false),
+	];
+	for failure in [Failure::Error, Failure::Panic] {
+		for (hook, job_first, unwrap_child) in cases {
+			let pid_file = descendant_pid_file();
+			let guard = Arc::new(Mutex::new(None));
+			let mut command = CommandWrap::with_new(std::env::current_exe()?, |command| {
+				command
+					.args(["lifecycle_descendant_parent", "--ignored", "--nocapture"])
+					.env(DESCENDANT_PID_FILE, &pid_file);
+			});
+			let fail = FailAfterDescendant {
+				failure,
+				hook,
+				unwrap_child,
+				pid_file: pid_file.clone(),
+				guard: Arc::clone(&guard),
+			};
+			if job_first {
+				command.wrap(JobObject).wrap(fail);
+			} else {
+				command.wrap(fail).wrap(JobObject);
+			}
+
+			match failure {
+				Failure::Error => {
+					let error = command.spawn().expect_err("child wrapping must fail");
+					assert_eq!(error.to_string(), "child wrapping failed");
+				}
+				Failure::Panic => {
+					let panic = catch_unwind(AssertUnwindSafe(|| command.spawn()))
+						.expect_err("child wrapping must panic");
+					assert_eq!(
+						*panic.downcast::<&'static str>().unwrap(),
+						"child wrapping failed"
+					);
+				}
+			}
+
+			let process = guard
+				.lock()
+				.unwrap()
+				.take()
+				.expect("the failure hook opened the descendant process");
+			wait_for_process_exit(process).await?;
+			fs::remove_file(pid_file)?;
+		}
+	}
+	Ok(())
 }
 
 #[tokio::test]
