@@ -55,14 +55,17 @@ async fn preserves_flags_and_resumes_in_both_orders() -> Result<()> {
 		assert_eq!(command.get_wrap::<CreationFlags>().unwrap().0, flags);
 		let mut child = command.spawn_with(|command| {
 			let mut child = command.spawn()?;
-			let suspended =
-				match process_has_suspended_thread(child.id().expect("child must have an id")) {
-					Ok(suspended) => suspended,
-					Err(error) => {
-						let _ = child.start_kill();
-						return Err(error);
-					}
-				};
+			let suspended = match process_has_suspended_thread(
+				child
+					.id()
+					.expect("a newly spawned child exposes its process ID before it is reaped"),
+			) {
+				Ok(suspended) => suspended,
+				Err(error) => {
+					let _ = child.start_kill();
+					return Err(error);
+				}
+			};
 			if suspended {
 				Ok(child)
 			} else {
@@ -82,14 +85,17 @@ async fn leaves_explicit_suspension_in_both_orders() -> Result<()> {
 	for order in [Order::CreationFlagsFirst, Order::JobObjectFirst] {
 		let mut command = command(flags, order);
 		let mut child = command.spawn()?;
-		let remained_suspended =
-			match process_has_suspended_thread(child.id().expect("child must have an id")) {
-				Ok(suspended) => suspended,
-				Err(error) => {
-					let _ = child.start_kill();
-					return Err(error);
-				}
-			};
+		let remained_suspended = match process_has_suspended_thread(
+			child
+				.id()
+				.expect("a newly spawned child exposes its process ID before it is reaped"),
+		) {
+			Ok(suspended) => suspended,
+			Err(error) => {
+				let _ = child.start_kill();
+				return Err(error);
+			}
+		};
 		child.start_kill()?;
 		let _ = wait_for_exit(&mut *child).await?;
 		assert!(remained_suspended);
