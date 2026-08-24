@@ -94,7 +94,7 @@ impl CommandState {
 			return;
 		}
 
-		if !native_only_base || !self.0.installed_on_native_only.load(Ordering::Acquire) {
+		if !native_only_base || !self.0.has_native_only_callback() {
 			self.install(command);
 			if native_only_base {
 				self.0
@@ -136,16 +136,6 @@ impl CommandState {
 		self.0.invalidate();
 	}
 
-	/// Require the next native-only attempt to install a fresh dispatcher callback.
-	///
-	/// The currently active callback remains usable by an explicit spawner which has just received the
-	/// native command, but arbitrary mutation may replace and drop it before that spawner returns.
-	pub(crate) fn require_reinstall(&self) {
-		self.0
-			.installed_on_native_only
-			.store(false, Ordering::Release);
-	}
-
 	pub(crate) fn disarm(&self) {
 		self.0.disarm();
 	}
@@ -173,6 +163,22 @@ impl Default for Dispatcher {
 }
 
 impl Dispatcher {
+	fn has_native_only_callback(&self) -> bool {
+		if !self.installed_on_native_only.load(Ordering::Acquire) {
+			return false;
+		}
+
+		let installed = self
+			.active_callback
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		// `active_callback` owns one strong reference and the native command's callback owns
+		// another. The second reference disappears if an explicit spawner replaces the command.
+		installed
+			.as_ref()
+			.is_some_and(|active| Arc::strong_count(active) > 1)
+	}
+
 	fn arm(&self, policy: SpawnPolicy) {
 		let process_group = policy
 			.process_group
@@ -242,7 +248,118 @@ impl Dispatcher {
 				return Err(io::Error::last_os_error());
 			}
 		}
-
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		ffi::{OsStr, OsString},
+		fmt,
+		path::{Path, PathBuf},
+		process::Stdio,
+	};
+
+	use super::*;
+
+	#[derive(Default)]
+	struct FakeCommand {
+		program: OsString,
+		args: Vec<OsString>,
+		env: Vec<(OsString, Option<OsString>)>,
+		current_dir: Option<PathBuf>,
+		callbacks: Vec<Box<dyn FnMut() -> io::Result<()> + Send + Sync>>,
+	}
+
+	impl fmt::Debug for FakeCommand {
+		fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+			formatter
+				.debug_struct("FakeCommand")
+				.field("program", &self.program)
+				.field("callbacks", &self.callbacks.len())
+				.finish_non_exhaustive()
+		}
+	}
+
+	impl NativeCommand for FakeCommand {
+		fn new(program: &OsStr) -> Self {
+			Self {
+				program: program.to_owned(),
+				..Self::default()
+			}
+		}
+
+		fn arg(&mut self, arg: &OsStr) {
+			self.args.push(arg.to_owned());
+		}
+
+		fn env(&mut self, key: &OsStr, value: &OsStr) {
+			self.env.push((key.to_owned(), Some(value.to_owned())));
+		}
+
+		fn env_remove(&mut self, key: &OsStr) {
+			self.env.push((key.to_owned(), None));
+		}
+
+		fn env_clear(&mut self) {
+			self.env.clear();
+		}
+
+		fn current_dir(&mut self, dir: &Path) {
+			self.current_dir = Some(dir.to_owned());
+		}
+
+		fn stdin(&mut self, _stdio: Stdio) {}
+
+		fn stdout(&mut self, _stdio: Stdio) {}
+
+		fn stderr(&mut self, _stdio: Stdio) {}
+
+		unsafe fn pre_exec<F>(&mut self, callback: F)
+		where
+			F: FnMut() -> io::Result<()> + Send + Sync + 'static,
+		{
+			self.callbacks.push(Box::new(callback));
+		}
+
+		fn get_program(&self) -> &OsStr {
+			&self.program
+		}
+
+		fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
+			Box::new(self.args.iter().map(OsString::as_os_str))
+		}
+
+		fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+			Box::new(
+				self.env
+					.iter()
+					.map(|(key, value)| (key.as_os_str(), value.as_deref())),
+			)
+		}
+
+		fn get_current_dir(&self) -> Option<&Path> {
+			self.current_dir.as_deref()
+		}
+	}
+
+	#[test]
+	fn native_only_dispatcher_is_reused_until_the_command_is_replaced() {
+		let state = CommandState::default();
+		let policy = SpawnPolicy {
+			process_group: Some(ProcessGroupTarget::Leader),
+			..SpawnPolicy::default()
+		};
+		let mut command = FakeCommand::new(OsStr::new("test"));
+
+		for _ in 0..4 {
+			state.prepare(&mut command, true, policy);
+			assert_eq!(command.callbacks.len(), 1);
+		}
+
+		command = FakeCommand::new(OsStr::new("replacement"));
+		state.prepare(&mut command, true, policy);
+		assert_eq!(command.callbacks.len(), 1);
 	}
 }
