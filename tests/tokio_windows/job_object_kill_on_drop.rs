@@ -34,7 +34,8 @@ impl ProcessGuard {
 	}
 
 	fn handle(&self) -> HANDLE {
-		self.0.expect("the process guard must still be armed")
+		self.0
+			.expect("only ProcessGuard::disarm clears the handle, and it consumes the guard")
 	}
 
 	fn disarm(mut self) -> Result<()> {

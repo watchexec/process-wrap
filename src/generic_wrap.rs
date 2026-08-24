@@ -92,7 +92,7 @@ macro_rules! Wrap {
 				if let Some(wrapper) = wrapper {
 					extant
 						.as_mut()
-						.expect("a wrapper cannot be replaced while its hook is active")
+						.expect("wrap() cannot run while the matching wrapper's hook is active")
 						.as_any_mut()
 						.downcast_mut::<W>()
 						.expect("downcasting is guaranteed to succeed due to wrap()'s internals")
@@ -114,10 +114,10 @@ macro_rules! Wrap {
 				let mut wrapper = self
 					.wrappers
 					.get_index_mut(index)
-					.expect("the wrapper index must remain valid")
+					.expect("wrapper indices cannot disappear during ordered hook traversal")
 					.1
 					.take()
-					.expect("the wrapper must be present before invoking its hook");
+					.expect("each wrapper is present when its lifecycle hook begins");
 
 				let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
 					invoke(wrapper.as_command_wrapper_mut(), self)
@@ -126,7 +126,7 @@ macro_rules! Wrap {
 				let slot = self
 					.wrappers
 					.get_index_mut(index)
-					.expect("the wrapper key must remain present")
+					.expect("wrapper registrations cannot disappear while their hooks run")
 					.1;
 				debug_assert!(slot.is_none());
 				*slot = Some(wrapper);
@@ -142,7 +142,10 @@ macro_rules! Wrap {
 				for index in 0..self.wrappers.len() {
 					#[cfg(feature = "tracing")]
 					{
-						let id = self.wrappers.get_index(index).unwrap().0;
+						let id = self
+								.wrappers
+								.get_index(index)
+								.expect("wrapper indices cannot disappear during ordered hook traversal").0;
 						::tracing::debug!(?id, "pre_spawn");
 					}
 					self.with_wrapper_at(index, |wrapper, core| {
@@ -161,7 +164,10 @@ macro_rules! Wrap {
 				for index in 0..self.wrappers.len() {
 					#[cfg(feature = "tracing")]
 					{
-						let id = self.wrappers.get_index(index).unwrap().0;
+						let id = self
+								.wrappers
+								.get_index(index)
+								.expect("wrapper indices cannot disappear during ordered hook traversal").0;
 						::tracing::debug!(?id, "wrap_child");
 					}
 					child = self.with_wrapper_at(index, |wrapper, core| {
@@ -205,7 +211,10 @@ macro_rules! Wrap {
 				for index in 0..self.wrappers.len() {
 					#[cfg(feature = "tracing")]
 					{
-						let id = self.wrappers.get_index(index).unwrap().0;
+						let id = self
+								.wrappers
+								.get_index(index)
+								.expect("wrapper indices cannot disappear during ordered hook traversal").0;
 						::tracing::debug!(?id, "post_spawn");
 					}
 					self.with_wrapper_at(index, |wrapper, core| {
