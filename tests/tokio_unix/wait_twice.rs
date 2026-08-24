@@ -16,6 +16,7 @@ async fn nowrap() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(feature = "process-group")]
 #[tokio::test]
 async fn process_group() -> Result<()> {
 	let mut child = CommandWrap::with_new("echo", |command| {
@@ -33,6 +34,7 @@ async fn process_group() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(feature = "process-session")]
 #[tokio::test]
 async fn process_session() -> Result<()> {
 	let mut child = CommandWrap::with_new("echo", |command| {

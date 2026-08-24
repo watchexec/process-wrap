@@ -24,6 +24,7 @@ async fn nowrap() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(feature = "job-object")]
 #[tokio::test]
 async fn job_object() -> Result<()> {
 	let mut child = CommandWrap::with_new("findstr", |command| {

@@ -1,9 +1,13 @@
 name: Test
+
 on:
   pull_request:
   push:
     branches:
       - main
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -25,7 +29,9 @@ jobs:
     runs-on: "${{ matrix.platform }}-latest"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Configure Rust
         run: |
@@ -34,23 +40,119 @@ jobs:
           rustup default ${{ matrix.toolchain }}
           rustup component add clippy
 
-      - uses: Swatinem/rust-cache@v2
-
       - run: tests/multiproc_helper.rs 1 1
-      - run: cargo test --features ${{ matrix.features }} --all-targets
-      - run: cargo clippy --features ${{ matrix.features }}
 
-  formatting:
-    name: Fmt check
+      - name: Test defaults plus frontend
+        run: cargo test --locked --features ${{ matrix.features }} --all-targets
+
+      - name: Test frontend without default wrappers
+        if: matrix.toolchain == 'stable'
+        run: cargo test --locked --no-default-features --features ${{ matrix.features }} --all-targets
+
+      - run: cargo clippy --locked --features ${{ matrix.features }}
+
+  no-default-features:
+    name: Check without any features
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Configure Rust
         run: |
           rustup toolchain install --profile minimal --no-self-update stable
           rustup default stable
 
-      - run: cargo fmt --check
+      - run: cargo check --locked --no-default-features --lib
 
+  all-features:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - macos
+          - ubuntu
+          - windows
+
+    name: "Test all features on ${{ matrix.platform }}"
+    runs-on: "${{ matrix.platform }}-latest"
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update nightly
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+
+      - run: tests/multiproc_helper.rs 1 1
+      - run: cargo test --locked --all-features --all-targets
+
+  rustdoc:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+
+      - name: Build documentation with warnings denied
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --all-features --no-deps
+
+  semver:
+    name: Semver against PR base
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+
+      - name: Install cargo-semver-checks
+        run: cargo install --locked --version 0.50.0 cargo-semver-checks
+
+      - name: Check API compatibility
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          printf 'Comparing against %s at %s\n' "$BASE_REF" "$BASE_SHA"
+          git cat-file -e "${BASE_SHA}^{commit}"
+          cargo semver-checks check-release --all-features --baseline-rev "$BASE_SHA"
+
+  formatting:
+    name: Fmt check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+          rustup component add rustfmt
+
+      - run: cargo fmt --check

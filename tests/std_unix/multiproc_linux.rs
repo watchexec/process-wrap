@@ -2,6 +2,7 @@
 
 use super::prelude::*;
 
+#[cfg(feature = "process-group")]
 #[test]
 fn process_group_kill_leader() -> Result<()> {
 	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
@@ -44,6 +45,7 @@ fn process_group_kill_leader() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(feature = "process-group")]
 #[test]
 fn process_group_kill_group() -> Result<()> {
 	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
@@ -87,6 +89,7 @@ fn process_group_kill_group() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(feature = "process-session")]
 #[test]
 fn process_session_kill_leader() -> Result<()> {
 	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
@@ -129,6 +132,7 @@ fn process_session_kill_leader() -> Result<()> {
 	Ok(())
 }
 
+#[cfg(feature = "process-session")]
 #[test]
 fn process_session_kill_group() -> Result<()> {
 	let mut leader = CommandWrap::with_new("tests/multiproc_helper.rs", |command| {
