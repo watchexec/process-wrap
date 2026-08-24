@@ -8,16 +8,20 @@
 //! ```
 //!
 //! ```rust,no_run
-//! # fn main() -> std::io::Result<()> {
+//! # #[cfg(feature = "std")]
+//! # mod example {
+//! # fn run() -> std::io::Result<()> {
 //! use process_wrap::std::*;
 //!
 //! let mut command = Command::with_new("watch", |command| { command.arg("ls"); });
-//! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
-//! #[cfg(windows)] { command.wrap(JobObject); }
+//! #[cfg(all(unix, feature = "process-group"))] { command.wrap(ProcessGroup::leader()); }
+//! #[cfg(all(windows, feature = "job-object"))] { command.wrap(JobObject); }
 //! let mut child = command.spawn()?;
 //! let status = child.wait()?;
 //! dbg!(status);
 //! # Ok(()) }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! ## Migrating from command-group
@@ -42,21 +46,33 @@
 //! modules for compatibility.
 //!
 //! ```rust
+//! # #[cfg(feature = "std")]
+//! # mod example {
 //! use process_wrap::std::*;
+//! # fn run() {
 //! let mut command = Command::new("ls");
 //! command.arg("-l");
-//! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
-//! #[cfg(windows)] { command.wrap(JobObject); }
+//! #[cfg(all(unix, feature = "process-group"))] { command.wrap(ProcessGroup::leader()); }
+//! #[cfg(all(windows, feature = "job-object"))] { command.wrap(JobObject); }
+//! # }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! The closure constructor remains available, and its inferred argument is now process-wrap's
 //! command:
 //!
 //! ```rust
+//! # #[cfg(feature = "std")]
+//! # mod example {
 //! use process_wrap::std::*;
+//! # fn run() {
 //! let mut command = Command::with_new("ls", |command| { command.arg("-l"); });
-//! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
-//! #[cfg(windows)] { command.wrap(JobObject); }
+//! #[cfg(all(unix, feature = "process-group"))] { command.wrap(ProcessGroup::leader()); }
+//! #[cfg(all(windows, feature = "job-object"))] { command.wrap(JobObject); }
+//! # }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! Existing native commands can still be converted with `Command::from`. They retain exact native
@@ -74,9 +90,15 @@
 //! If targetting a single platform, then a fluent style is possible:
 //!
 //! ```rust
+//! # #[cfg(all(unix, feature = "std", feature = "process-group"))]
+//! # mod example {
 //! use process_wrap::std::*;
+//! # fn run() {
 //! Command::with_new("ls", |command| { command.arg("-l"); })
 //!    .wrap(ProcessGroup::leader());
+//! # }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! The `wrap` method can be called multiple times to add multiple wrappers. The order of the
@@ -101,9 +123,15 @@
 //! ## Instead of `.kill_on_drop(true)` (Tokio-only):
 //!
 //! ```rust
+//! # #[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
+//! # mod example {
 //! use process_wrap::tokio::*;
+//! # fn run() {
 //! let mut command = Command::with_new("ls", |command| { command.arg("-l"); });
 //! command.wrap(KillOnDrop);
+//! # }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! ## Instead of `.creation_flags(CREATE_NO_WINDOW)` (Windows-only):
@@ -132,10 +160,14 @@
 //! Here's the most basic impl (shown for Tokio):
 //!
 //! ```rust
+//! # #[cfg(feature = "tokio1")]
+//! # mod example {
 //! use process_wrap::tokio::*;
 //! #[derive(Debug)]
 //! pub struct YourWrapper;
 //! impl CommandWrapper for YourWrapper {}
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! The trait provides extension or hook points into the lifecycle of a `Command`:
@@ -171,6 +203,8 @@
 //! in.
 //!
 //! ```rust
+//! # #[cfg(feature = "std")]
+//! # mod example {
 //! # use process_wrap::std::{CommandWrap, CommandWrapper, SpawnAttempt};
 //! # use std::{fs::File, io, path::PathBuf, thread};
 //! #[derive(Debug)]
@@ -199,6 +233,8 @@
 //!         Ok(())
 //!     }
 //! }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! That's a great start, but it's actually introduced a resource leak: if the main thread of your
@@ -208,6 +244,8 @@
 //! when calling `.wait()` on the `ChildWrapper`.
 //!
 //! ```rust
+//! # #[cfg(feature = "std")]
+//! # mod example {
 //! # use process_wrap::std::{
 //! #     ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper, SpawnAttempt,
 //! # };
@@ -297,6 +335,8 @@
 //!         exit_status
 //!     }
 //! }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! The tracked process-wrap command does not retain the `tx` handles from this hook. Each spawn uses
@@ -308,6 +348,8 @@
 //! Finally, we can test that our new command-wrapper works:
 //!
 //! ```rust
+//! # #[cfg(feature = "std")]
+//! # mod example {
 //! # use process_wrap::std::{
 //! #     ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper, SpawnAttempt,
 //! # };
@@ -423,6 +465,8 @@
 //!
 //!     Ok(())
 //! }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! # Features
