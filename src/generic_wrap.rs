@@ -120,9 +120,9 @@ macro_rules! Wrap {
 
 			/// Validate the completed portable attempt before operating-system allocation.
 			///
-			/// Providers should inspect the attempt's arguments, environment, directory, and portable policy
-			/// getters here and reject any policy they cannot preserve. Process-wrap has already rejected an
-			/// opaque attempt before this callback.
+			/// Providers should inspect `get_portable_args`, `inherits_environment`, `get_envs`, the current
+			/// directory, and platform policy getters here, then reject any policy they cannot preserve.
+			/// Process-wrap has already rejected an opaque attempt before this callback.
 			fn validate_attempt(
 				&self,
 				_attempt: &SpawnAttempt,

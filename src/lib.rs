@@ -546,7 +546,7 @@ pub use unix::ProcessGroupTarget;
 pub use command::WindowsSpawnPolicy;
 #[doc(hidden)]
 pub use command::{Backend, Blocking, NativeCommand, Tokio1};
-pub use command::{Command, SpawnAttempt, SpawnTransaction};
+pub use command::{Command, CommandArg, SpawnAttempt, SpawnTransaction};
 
 #[cfg(feature = "std")]
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]

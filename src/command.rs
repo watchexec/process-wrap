@@ -259,15 +259,24 @@ impl NativeCommand for tokio::process::Command {
 	}
 }
 
-#[derive(Clone, Debug)]
-pub(crate) enum CommandArg {
+/// One losslessly tracked command-line argument.
+///
+/// [`Command::get_args`] and [`SpawnAttempt::get_args`] provide native-shaped value iterators. This
+/// type additionally preserves whether a Windows argument was supplied through `raw_arg`, which an
+/// alternate spawn provider needs in order to reproduce or reject the exact command line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandArg {
+	/// A regular argument which the transport must quote according to its command-line model.
 	Regular(OsString),
+	/// A raw Windows command-line fragment which the transport must not quote or escape.
 	#[cfg(windows)]
+	#[cfg_attr(docsrs, doc(cfg(windows)))]
 	Raw(OsString),
 }
 
 impl CommandArg {
-	fn value(&self) -> &OsStr {
+	/// Return the argument or raw fragment value.
+	pub fn value(&self) -> &OsStr {
 		match self {
 			Self::Regular(value) => value,
 			#[cfg(windows)]
@@ -924,6 +933,17 @@ impl<B: Backend> Command<B> {
 		}
 	}
 
+	/// Get the losslessly tracked portable arguments in command-line order.
+	///
+	/// Unlike [`get_args`](Self::get_args), this preserves regular versus raw Windows arguments. Returns
+	/// `None` for a native-only command because its native API cannot recover that distinction.
+	pub fn get_portable_args(&self) -> Option<&[CommandArg]> {
+		match &self.state {
+			CommandState::Tracked(intent) => Some(&intent.args),
+			CommandState::NativeOnly(_) => None,
+		}
+	}
+
 	/// Get explicitly configured environment changes.
 	pub fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
 		match &self.state {
@@ -932,6 +952,17 @@ impl<B: Backend> Command<B> {
 				Some(command) => command.get_envs(),
 				None => command.view.get_envs(),
 			},
+		}
+	}
+
+	/// Return whether this portable command inherits the parent environment.
+	///
+	/// Returns `Some(true)` for normal inheritance, `Some(false)` after `env_clear`, and `None` for a
+	/// native-only command because native command APIs do not expose that state.
+	pub fn inherits_environment(&self) -> Option<bool> {
+		match &self.state {
+			CommandState::Tracked(intent) => Some(!intent.env_clear),
+			CommandState::NativeOnly(_) => None,
 		}
 	}
 
@@ -1194,11 +1225,35 @@ impl<B: Backend> SpawnAttempt<B> {
 		}
 	}
 
+	/// Get the losslessly tracked portable arguments in command-line order.
+	///
+	/// Unlike [`get_args`](Self::get_args), this preserves regular versus raw Windows arguments. Returns
+	/// `None` for a native-only attempt. Process-wrap performs that rejection before a provider's
+	/// `validate_attempt` callback, so providers receive `Some` there.
+	pub fn get_portable_args(&self) -> Option<&[CommandArg]> {
+		match &self.state {
+			AttemptState::Tracked(intent) => Some(&intent.args),
+			AttemptState::NativeOnly(_) => None,
+		}
+	}
+
 	/// Get explicitly configured environment changes for this spawn attempt.
 	pub fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
 		match &self.state {
 			AttemptState::Tracked(intent) => Box::new(intent.get_envs()),
 			AttemptState::NativeOnly(command) => command.get_envs(),
+		}
+	}
+
+	/// Return whether this portable attempt inherits the parent environment.
+	///
+	/// Returns `Some(true)` for normal inheritance, `Some(false)` after `env_clear`, and `None` for a
+	/// native-only attempt. Process-wrap performs that rejection before a provider's `validate_attempt`
+	/// callback, so providers receive `Some` there.
+	pub fn inherits_environment(&self) -> Option<bool> {
+		match &self.state {
+			AttemptState::Tracked(intent) => Some(!intent.env_clear),
+			AttemptState::NativeOnly(_) => None,
 		}
 	}
 

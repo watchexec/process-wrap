@@ -25,7 +25,7 @@ macro_rules! spawn_provider_tests {
 				time::{Duration, Instant},
 			};
 
-			use process_wrap::SpawnTransaction;
+			use process_wrap::{CommandArg, SpawnTransaction};
 			use $child_wrapper as ChildWrapper;
 			use $command_wrap as CommandWrap;
 			use $command_wrapper as CommandWrapper;
@@ -166,6 +166,18 @@ macro_rules! spawn_provider_tests {
 
 				fn validate_command(&self, command: &CommandWrap) -> io::Result<()> {
 					self.assert_callback_visibility(command);
+					assert_eq!(command.inherits_environment(), Some(false));
+					let args = command
+						.get_portable_args()
+						.expect("provider validation receives tracked portable arguments");
+					assert!(matches!(args.first(), Some(CommandArg::Regular(_))));
+					#[cfg(windows)]
+					assert!(matches!(
+						args.last(),
+						Some(CommandArg::Raw(arg)) if arg == OsStr::new(" provider-raw-fragment")
+					));
+					#[cfg(unix)]
+					assert!(args.iter().all(|arg| matches!(arg, CommandArg::Regular(_))));
 					assert!(command.get_envs().any(|(key, value)| {
 						key == OsStr::new("PROCESS_WRAP_PROVIDER_BASE")
 							&& value == Some(OsStr::new("set"))
@@ -192,6 +204,18 @@ macro_rules! spawn_provider_tests {
 						assert!(!attempt.creates_process_session());
 						assert!(!attempt.resets_sigmask());
 					}
+					assert_eq!(attempt.inherits_environment(), Some(false));
+					let args = attempt
+						.get_portable_args()
+						.expect("provider validation receives tracked portable arguments");
+					assert!(matches!(args.first(), Some(CommandArg::Regular(_))));
+					#[cfg(windows)]
+					assert!(matches!(
+						args.last(),
+						Some(CommandArg::Raw(arg)) if arg == OsStr::new(" provider-raw-fragment")
+					));
+					#[cfg(unix)]
+					assert!(args.iter().all(|arg| matches!(arg, CommandArg::Regular(_))));
 					assert!(attempt.get_envs().any(|(key, value)| {
 						key == OsStr::new("PROCESS_WRAP_PROVIDER_HOOK")
 							&& value == Some(OsStr::new(self.name))
@@ -387,8 +411,17 @@ macro_rules! spawn_provider_tests {
 				command
 			}
 
+			fn configure_provider_intent(command: &mut CommandWrap) {
+				command
+					.env_clear()
+					.env("PROCESS_WRAP_PROVIDER_BASE", "set");
+				#[cfg(windows)]
+				command.raw_arg(" provider-raw-fragment");
+			}
+
 			fn provider_command(shared: Arc<Shared>, name: &'static str) -> CommandWrap {
 				let mut command = command();
+				configure_provider_intent(&mut command);
 				command
 					.wrap(ProviderWrapper::new(name, Arc::clone(&shared)))
 					.wrap(Peer {
@@ -530,6 +563,7 @@ macro_rules! spawn_provider_tests {
 				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
 				let shared = Arc::new(Shared::default());
 				let mut command = command();
+				configure_provider_intent(&mut command);
 				command
 					.wrap(ProviderWrapper::new("first", Arc::clone(&shared)))
 					.wrap(ProviderWrapper::new("second", Arc::clone(&shared)))

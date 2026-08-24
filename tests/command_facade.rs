@@ -2,7 +2,7 @@
 mod std_frontend {
 	use std::{ffi::OsStr, io};
 
-	use process_wrap::std::{Command, CommandWrap, CommandWrapper, SpawnAttempt};
+	use process_wrap::std::{Command, CommandArg, CommandWrap, CommandWrapper, SpawnAttempt};
 
 	#[derive(Debug)]
 	struct AttemptArgument;
@@ -45,6 +45,17 @@ mod std_frontend {
 			command.get_args().collect::<Vec<_>>(),
 			[OsStr::new("first"), OsStr::new("second")]
 		);
+		assert_eq!(
+			command.get_portable_args(),
+			Some(
+				[
+					CommandArg::Regular("first".into()),
+					CommandArg::Regular("second".into()),
+				]
+				.as_slice()
+			)
+		);
+		assert_eq!(command.inherits_environment(), Some(true));
 
 		let alias: CommandWrap = command;
 		assert_eq!(alias.get_program(), OsStr::new("tool"));
@@ -104,6 +115,8 @@ mod std_frontend {
 		let mut command = Command::from(native);
 		command.arg("facade");
 		command.native_mut().arg("escape");
+		assert!(command.get_portable_args().is_none());
+		assert_eq!(command.inherits_environment(), None);
 
 		command
 			.spawn_with(|native| {
@@ -148,6 +161,7 @@ mod std_frontend {
 			.current_dir(&cwd);
 
 		let tracked_env = command.get_envs().collect::<Vec<_>>();
+		assert_eq!(command.inherits_environment(), Some(false));
 		assert_eq!(
 			tracked_env,
 			[(
@@ -202,6 +216,17 @@ mod std_frontend {
 				OsStr::new("regular-2")
 			]
 		);
+		assert_eq!(
+			command.get_portable_args(),
+			Some(
+				[
+					CommandArg::Regular("regular-1".into()),
+					CommandArg::Raw(" raw ".into()),
+					CommandArg::Regular("regular-2".into()),
+				]
+				.as_slice()
+			)
+		);
 	}
 
 	#[cfg(windows)]
@@ -225,7 +250,7 @@ mod std_frontend {
 mod tokio_frontend {
 	use std::{ffi::OsStr, io};
 
-	use process_wrap::tokio::{Command, CommandWrap, CommandWrapper, SpawnAttempt};
+	use process_wrap::tokio::{Command, CommandArg, CommandWrap, CommandWrapper, SpawnAttempt};
 
 	#[derive(Debug)]
 	struct AttemptArgument;
@@ -268,6 +293,17 @@ mod tokio_frontend {
 			command.get_args().collect::<Vec<_>>(),
 			[OsStr::new("first"), OsStr::new("second")]
 		);
+		assert_eq!(
+			command.get_portable_args(),
+			Some(
+				[
+					CommandArg::Regular("first".into()),
+					CommandArg::Regular("second".into()),
+				]
+				.as_slice()
+			)
+		);
+		assert_eq!(command.inherits_environment(), Some(true));
 
 		let alias: CommandWrap = command;
 		assert_eq!(alias.get_program(), OsStr::new("tool"));
@@ -327,6 +363,8 @@ mod tokio_frontend {
 		let mut command = Command::from(native);
 		command.arg("facade");
 		command.native_mut().arg("escape");
+		assert!(command.get_portable_args().is_none());
+		assert_eq!(command.inherits_environment(), None);
 
 		command
 			.spawn_with(|native| {
@@ -371,6 +409,7 @@ mod tokio_frontend {
 			.current_dir(&cwd);
 
 		let tracked_env = command.get_envs().collect::<Vec<_>>();
+		assert_eq!(command.inherits_environment(), Some(false));
 		assert_eq!(
 			tracked_env,
 			[(
@@ -437,6 +476,17 @@ mod tokio_frontend {
 				OsStr::new(" raw "),
 				OsStr::new("regular-2")
 			]
+		);
+		assert_eq!(
+			command.get_portable_args(),
+			Some(
+				[
+					CommandArg::Regular("regular-1".into()),
+					CommandArg::Raw(" raw ".into()),
+					CommandArg::Regular("regular-2".into()),
+				]
+				.as_slice()
+			)
 		);
 	}
 

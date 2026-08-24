@@ -8,6 +8,8 @@
 //! use process_wrap::std::*;
 //! ```
 
+#[doc(inline)]
+pub use crate::CommandArg;
 #[cfg(unix)]
 #[cfg_attr(docsrs, doc(cfg(unix)))]
 #[doc(inline)]
