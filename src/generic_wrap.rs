@@ -554,7 +554,11 @@ macro_rules! Wrap {
 			/// This explicit transport cannot be combined with a registered spawn provider. Without a
 			/// provider, it runs the same pre-spawn, capability-level post-spawn, and child-wrapping
 			/// lifecycle as [`spawn`](Self::spawn).
-			///			pub fn spawn_with(
+			///
+			/// On Unix, replacing the native command is supported, but the displaced command must be
+			/// dropped before the spawner returns. Retaining it prevents process-wrap from determining
+			/// whether the callback carrying built-in child setup belongs to the current command.
+			pub fn spawn_with(
 				&mut self,
 				spawner: impl FnOnce(&mut $command) -> ::std::io::Result<$child>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
@@ -577,7 +581,11 @@ macro_rules! Wrap {
 			///
 			/// This explicit transport cannot be combined with a registered spawn provider. Without a
 			/// provider, all `pre_spawn`, capability-level `post_spawn`, and `wrap_child` hooks run.
-			///			pub fn spawn_with_child(
+			///
+			/// On Unix, replacing the native command is supported, but the displaced command must be
+			/// dropped before the spawner returns. Retaining it prevents process-wrap from determining
+			/// whether the callback carrying built-in child setup belongs to the current command.
+			pub fn spawn_with_child(
 				&mut self,
 				spawner: impl FnOnce(
 					&mut $command,
