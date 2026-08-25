@@ -13,7 +13,9 @@ use command::{PreparedCommandLine, WideCString, prepare_command_line};
 use environment::{PreparedEnvironment, prepare_environment};
 
 mod api;
+mod attributes;
 pub(super) mod command;
+mod console;
 pub(super) mod environment;
 mod pipe;
 mod program;
