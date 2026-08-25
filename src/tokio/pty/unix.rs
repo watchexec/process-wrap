@@ -314,19 +314,18 @@ fn terminate_and_reap(child: &Mutex<tokio::process::Child>) -> io::Result<()> {
 	let mut child = child
 		.lock()
 		.unwrap_or_else(std::sync::PoisonError::into_inner);
-	if child.try_wait()?.is_some() {
+	let Some(pid) = child.id() else {
+		// A hook already observed and reaped the direct child through this shared object. Its cached
+		// numeric identity is no longer safe for signalling.
 		return Ok(());
-	}
-
-	let pid = child
-		.id()
-		.expect("an unreaped Tokio child retains its process ID");
+	};
 	let pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
 
-	// The PTY setup makes the direct child the leader of a fresh session and process group. While the
-	// child remains unreaped, its PID anchors that group identity, so signalling the negative PID cannot
-	// target a recycled group. This also cleans up descendants which are still present at rollback time.
-	// SAFETY: `pid` is positive and belongs to the live, unreaped child locked above.
+	// The PTY setup makes the direct child the leader of a fresh session and process group. Until the
+	// direct child is reaped, its PID anchors that group identity even if it has already become a zombie,
+	// so signalling the negative PID cannot target a recycled group. Signal before try_wait can reap an
+	// exited leader; this also cleans up descendants which are still present at rollback time.
+	// SAFETY: `pid` is positive and belongs to the unreaped child locked above.
 	let group_error = if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
 		let error = io::Error::last_os_error();
 		(error.raw_os_error() != Some(libc::ESRCH)).then_some(error)

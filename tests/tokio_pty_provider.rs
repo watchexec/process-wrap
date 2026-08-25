@@ -13,6 +13,8 @@
 	)
 ))]
 
+#[cfg(target_os = "linux")]
+use std::mem::MaybeUninit;
 use std::{
 	io,
 	panic::{AssertUnwindSafe, catch_unwind, panic_any},
@@ -542,6 +544,83 @@ impl CommandWrapper for FailAfterDescendantStarts {
 	}
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct FailAfterLeaderExits {
+	pid_file: std::path::PathBuf,
+	direct_pid: Arc<Mutex<Option<u32>>>,
+	descendant_pid: Arc<Mutex<Option<i32>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl CommandWrapper for FailAfterLeaderExits {
+	fn post_spawn(
+		&mut self,
+		_attempt: &mut SpawnAttempt,
+		child: &mut dyn ChildWrapper,
+		_command: &Command,
+	) -> io::Result<()> {
+		let direct_pid = child
+			.id()
+			.expect("the PTY provider reports its unreaped direct child");
+		*self
+			.direct_pid
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(direct_pid);
+
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while !self.pid_file.exists() {
+			if Instant::now() >= deadline {
+				return Err(io::Error::new(
+					io::ErrorKind::TimedOut,
+					"PTY descendant did not report its PID",
+				));
+			}
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		let descendant_pid = std::fs::read_to_string(&self.pid_file)?
+			.trim()
+			.parse()
+			.map_err(io::Error::other)?;
+		*self
+			.descendant_pid
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(descendant_pid);
+
+		loop {
+			let mut status = MaybeUninit::<libc::siginfo_t>::zeroed();
+			// SAFETY: direct_pid names this process's direct child, status is writable, and WNOWAIT
+			// observes an exit without releasing the PID which anchors the PTY process group.
+			if unsafe {
+				libc::waitid(
+					libc::P_PID,
+					direct_pid as libc::id_t,
+					status.as_mut_ptr(),
+					libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+				)
+			} == -1
+			{
+				return Err(io::Error::last_os_error());
+			}
+			// SAFETY: status was zero-initialized and waitid either filled it or left si_pid as zero.
+			if unsafe { status.assume_init().si_pid() }
+				== libc::pid_t::try_from(direct_pid).map_err(io::Error::other)?
+			{
+				break;
+			}
+			if Instant::now() >= deadline {
+				return Err(io::Error::new(
+					io::ErrorKind::TimedOut,
+					"PTY leader did not exit before hook failure",
+				));
+			}
+			std::thread::sleep(Duration::from_millis(10));
+		}
+
+		Err(io::Error::other("fail after the PTY leader exits"))
+	}
+}
+
 fn assert_process_disappears(pid: i32) {
 	let deadline = Instant::now() + Duration::from_secs(5);
 	loop {
@@ -585,6 +664,45 @@ async fn transaction_kills_the_live_pty_group_after_hook_failure() -> io::Result
 	assert_eq!(
 		command.spawn().unwrap_err().to_string(),
 		"fail with a live PTY descendant"
+	);
+	let direct_pid = direct_pid
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.expect("the hook records the direct child");
+	assert_reaped(direct_pid);
+	let descendant_pid = descendant_pid
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.expect("the hook records the descendant child");
+	assert_process_disappears(descendant_pid);
+	Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn transaction_kills_the_pty_group_before_reaping_an_exited_leader() -> io::Result<()> {
+	let directory = tempfile::tempdir()?;
+	let pid_file = directory.path().join("descendant-pid");
+	let direct_pid = Arc::new(Mutex::new(None));
+	let descendant_pid = Arc::new(Mutex::new(None));
+	let mut command = Command::with_new("sh", |command| {
+		command
+			.args([
+				"-c",
+				"trap '' HUP TERM; sleep 30 & printf '%s' $! > \"$1\"; exit 0",
+				"pty-test",
+			])
+			.arg(&pid_file);
+	});
+	command.wrap(Pty::default()).wrap(FailAfterLeaderExits {
+		pid_file,
+		direct_pid: Arc::clone(&direct_pid),
+		descendant_pid: Arc::clone(&descendant_pid),
+	});
+
+	assert_eq!(
+		command.spawn().unwrap_err().to_string(),
+		"fail after the PTY leader exits"
 	);
 	let direct_pid = direct_pid
 		.lock()
