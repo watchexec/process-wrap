@@ -14,6 +14,7 @@ use environment::{PreparedEnvironment, prepare_environment};
 
 pub(super) mod command;
 pub(super) mod environment;
+mod program;
 
 #[derive(Debug, Eq, PartialEq)]
 struct PreparedWindowsCommand {
@@ -25,9 +26,11 @@ struct PreparedWindowsCommand {
 }
 
 fn prepare(attempt: &SpawnAttempt) -> io::Result<PreparedWindowsCommand> {
-	prepare_with(attempt, |inherits, changes| {
+	let mut prepared = prepare_with(attempt, |inherits, changes| {
 		prepare_environment(inherits, changes)
-	})
+	})?;
+	prepared.application_name = program::resolve(attempt.get_program(), attempt.get_envs())?;
+	Ok(prepared)
 }
 
 fn prepare_with<'a>(
@@ -109,7 +112,10 @@ mod tests {
 			*self
 				.0
 				.lock()
-				.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prepare(attempt));
+				.unwrap_or_else(std::sync::PoisonError::into_inner) =
+				Some(prepare_with(attempt, |inherits, changes| {
+					prepare_environment(inherits, changes)
+				}));
 			Err(io::Error::other("Windows command model captured"))
 		}
 
