@@ -9,6 +9,7 @@ use std::{
 	},
 	pin::Pin,
 	process::ExitStatus,
+	sync::Arc,
 };
 
 use tokio::{
@@ -28,6 +29,8 @@ use windows::Win32::{
 
 use crate::{ChildExitStatus, tokio::ChildWrapper};
 
+use super::super::{ControllerSlot, PtyController};
+
 #[derive(Debug)]
 pub(super) struct ConPtyChild {
 	process: OwnedHandle,
@@ -36,6 +39,7 @@ pub(super) struct ConPtyChild {
 	pid: u32,
 	kill_on_drop: bool,
 	cleanup_armed: bool,
+	controller: Option<Arc<ControllerSlot>>,
 	exit_status: ChildExitStatus,
 	wait_task: Option<JoinHandle<io::Result<ExitStatus>>>,
 	stdin: Option<ChildStdin>,
@@ -56,6 +60,7 @@ impl ConPtyChild {
 			pid,
 			kill_on_drop,
 			cleanup_armed: true,
+			controller: None,
 			exit_status: ChildExitStatus::Running,
 			wait_task: None,
 			stdin: None,
@@ -90,6 +95,11 @@ impl ConPtyChild {
 		}
 	}
 
+	pub(super) fn install_controller(&mut self, controller: Arc<ControllerSlot>) {
+		debug_assert!(self.controller.is_none());
+		self.controller = Some(controller);
+	}
+
 	fn raw_process_handle(&self) -> HANDLE {
 		HANDLE(self.process.as_raw_handle())
 	}
@@ -117,9 +127,18 @@ impl ChildWrapper for ConPtyChild {
 		Some(self.resume_primary_thread())
 	}
 
-	fn disarm_spawn_cleanup_layer(&mut self) -> io::Result<()> {
+	fn disarm_job_object_layer(&mut self) -> io::Result<()> {
 		self.cleanup_armed = false;
+		if let Some(controller) = &self.controller {
+			controller.commit();
+		}
 		Ok(())
+	}
+
+	fn take_pty_controller_layer(&mut self) -> Option<PtyController> {
+		self.controller
+			.as_ref()
+			.and_then(|controller| controller.take())
 	}
 
 	fn stdin(&mut self) -> &mut Option<ChildStdin> {
@@ -273,6 +292,7 @@ mod tests {
 			pid: child.id(),
 			kill_on_drop,
 			cleanup_armed: false,
+			controller: None,
 			exit_status: ChildExitStatus::Running,
 			wait_task: None,
 			stdin: None,
@@ -386,11 +406,11 @@ mod tests {
 	}
 
 	#[test]
-	fn disarming_spawn_cleanup_preserves_a_running_process() {
+	fn final_spawn_disarm_preserves_a_running_process() {
 		let mut native = spawn_long_running();
 		let mut child = wrap(&native, false);
 		child.cleanup_armed = true;
-		child.disarm_spawn_cleanup_layer().unwrap();
+		child.disarm_job_object_layer().unwrap();
 		drop(child);
 		assert!(native.try_wait().unwrap().is_none());
 		native.kill().unwrap();

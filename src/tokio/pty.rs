@@ -5,6 +5,7 @@ use std::{
 };
 
 #[cfg(any(
+	windows,
 	target_os = "android",
 	target_os = "dragonfly",
 	target_os = "freebsd",
@@ -15,14 +16,22 @@ use std::{
 	target_os = "openbsd",
 	target_os = "solaris"
 ))]
-use std::{
-	future::Future,
-	process::ExitStatus,
-	sync::{
-		Arc, Mutex,
-		atomic::{AtomicBool, Ordering},
-	},
+use std::sync::{
+	Mutex,
+	atomic::{AtomicBool, Ordering},
 };
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
+use std::{future::Future, process::ExitStatus, sync::Arc};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(any(
@@ -65,6 +74,7 @@ use super::{Command, CommandWrapper, ProviderProduct, SpawnAttempt, SpawnProvide
 ))]
 mod unix;
 #[cfg(not(any(
+	windows,
 	target_os = "android",
 	target_os = "dragonfly",
 	target_os = "freebsd",
@@ -77,7 +87,6 @@ mod unix;
 )))]
 mod unsupported;
 #[cfg(windows)]
-#[allow(dead_code)]
 mod windows;
 #[cfg(any(
 	target_os = "android",
@@ -92,6 +101,7 @@ mod windows;
 ))]
 use unix as imp;
 #[cfg(not(any(
+	windows,
 	target_os = "android",
 	target_os = "dragonfly",
 	target_os = "freebsd",
@@ -103,6 +113,8 @@ use unix as imp;
 	target_os = "solaris"
 )))]
 use unsupported as imp;
+#[cfg(windows)]
+use windows as imp;
 
 /// A pseudo-terminal spawn provider for Tokio commands.
 ///
@@ -370,6 +382,7 @@ impl PtyController {
 }
 
 #[cfg(any(
+	windows,
 	target_os = "android",
 	target_os = "dragonfly",
 	target_os = "freebsd",
@@ -387,6 +400,7 @@ pub(super) struct ControllerSlot {
 }
 
 #[cfg(any(
+	windows,
 	target_os = "android",
 	target_os = "dragonfly",
 	target_os = "freebsd",

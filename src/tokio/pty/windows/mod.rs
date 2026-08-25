@@ -14,6 +14,7 @@ use environment::{PreparedEnvironment, prepare_environment};
 
 mod api;
 mod attributes;
+mod backend;
 mod child;
 pub(super) mod command;
 mod console;
@@ -22,6 +23,9 @@ pub(super) mod environment;
 mod pipe;
 mod program;
 mod spawn;
+
+pub(super) use backend::{check_available, spawn};
+pub(super) use controller::{Input, Output, Resize};
 
 #[derive(Debug, Eq, PartialEq)]
 struct PreparedWindowsCommand {

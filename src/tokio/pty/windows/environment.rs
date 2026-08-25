@@ -29,6 +29,7 @@ pub(super) enum PreparedEnvironment {
 }
 
 impl PreparedEnvironment {
+	#[cfg(test)]
 	pub(super) fn as_ptr(&self) -> *const u16 {
 		match self {
 			Self::Inherit => std::ptr::null(),
@@ -36,6 +37,7 @@ impl PreparedEnvironment {
 		}
 	}
 
+	#[cfg(test)]
 	pub(super) fn is_inherited(&self) -> bool {
 		matches!(self, Self::Inherit)
 	}
