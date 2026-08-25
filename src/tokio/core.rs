@@ -121,7 +121,11 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	/// observed and reaped a fast provider child. Ordinary child operations must continue to use
 	/// [`ChildWrapper::id`] so they never act on a recycled PID.
 	#[doc(hidden)]
-	#[cfg(all(unix, feature = "pty"))]
+	#[cfg(all(
+		unix,
+		feature = "pty",
+		any(feature = "process-group", feature = "process-session")
+	))]
 	fn spawned_id_layer(&self) -> Option<u32> {
 		None
 	}
@@ -358,7 +362,11 @@ impl dyn ChildWrapper + '_ {
 		self.downcast_ref::<Child>().is_some()
 	}
 
-	#[cfg(all(unix, feature = "pty"))]
+	#[cfg(all(
+		unix,
+		feature = "pty",
+		any(feature = "process-group", feature = "process-session")
+	))]
 	pub(crate) fn try_spawned_id(&self) -> Option<u32> {
 		let mut inner = self;
 		loop {
@@ -379,6 +387,7 @@ impl dyn ChildWrapper + '_ {
 	/// This traverses arbitrary child-wrapper layers without removing them. The controller can be taken
 	/// only once; subsequent calls and non-PTY children return `None`.
 	#[cfg(feature = "pty")]
+	#[cfg_attr(docsrs, doc(cfg(feature = "pty")))]
 	pub fn take_pty_controller(&mut self) -> Option<super::pty::PtyController> {
 		let mut inner = self;
 		loop {

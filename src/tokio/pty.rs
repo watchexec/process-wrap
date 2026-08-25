@@ -1,8 +1,6 @@
 use std::{
-	future::Future,
 	io,
 	pin::Pin,
-	process::ExitStatus,
 	task::{Context, Poll},
 };
 
@@ -17,11 +15,16 @@ use std::{
 	target_os = "openbsd",
 	target_os = "solaris"
 ))]
-use std::sync::{
-	Arc, Mutex,
-	atomic::{AtomicBool, Ordering},
+use std::{
+	future::Future,
+	process::ExitStatus,
+	sync::{
+		Arc, Mutex,
+		atomic::{AtomicBool, Ordering},
+	},
 };
 
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(any(
 	target_os = "android",
 	target_os = "dragonfly",
@@ -34,7 +37,6 @@ use std::sync::{
 	target_os = "solaris"
 ))]
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[cfg(any(
 	target_os = "android",
@@ -436,6 +438,10 @@ impl ControllerSlot {
 #[derive(Debug)]
 pub(super) struct PtyChild {
 	child: Arc<Mutex<Child>>,
+	#[cfg_attr(
+		not(any(feature = "process-group", feature = "process-session")),
+		allow(dead_code)
+	)]
 	pid: u32,
 	controller: Arc<ControllerSlot>,
 	stdin: Option<ChildStdin>,
@@ -455,11 +461,7 @@ pub(super) struct PtyChild {
 	target_os = "solaris"
 ))]
 impl PtyChild {
-	pub(super) fn new(
-		child: Arc<Mutex<Child>>,
-		pid: u32,
-		controller: Arc<ControllerSlot>,
-	) -> Self {
+	pub(super) fn new(child: Arc<Mutex<Child>>, pid: u32, controller: Arc<ControllerSlot>) -> Self {
 		Self {
 			child,
 			pid,
@@ -541,6 +543,7 @@ impl ChildWrapper for PtyChild {
 		ChildWrapper::signal(&*self.lock_child(), sig)
 	}
 
+	#[cfg(any(feature = "process-group", feature = "process-session"))]
 	fn spawned_id_layer(&self) -> Option<u32> {
 		Some(self.pid)
 	}
