@@ -3,9 +3,8 @@
 macro_rules! spawn_with_child_tests {
 	(
 		$module:ident,
-		$command:path,
-		$child:path,
 		$command_wrap:path,
+		$spawn_attempt:path,
 		$command_wrapper:path,
 		$child_wrapper:path,
 		$runtime:expr
@@ -20,11 +19,10 @@ macro_rules! spawn_with_child_tests {
 				time::{Duration, Instant},
 			};
 
-			use $child as Child;
 			use $child_wrapper as ChildWrapper;
-			use $command as Command;
 			use $command_wrap as CommandWrap;
 			use $command_wrapper as CommandWrapper;
+			use $spawn_attempt as SpawnAttempt;
 
 			const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -42,7 +40,7 @@ macro_rules! spawn_with_child_tests {
 			impl CommandWrapper for First {
 				fn pre_spawn(
 					&mut self,
-					_command: &mut Command,
+					_attempt: &mut SpawnAttempt,
 					_core: &CommandWrap,
 				) -> io::Result<()> {
 					self.0.lock().unwrap().push(Event::Pre("first"));
@@ -51,8 +49,8 @@ macro_rules! spawn_with_child_tests {
 
 				fn post_spawn(
 					&mut self,
-					_command: &mut Command,
-					_child: &mut Child,
+					_attempt: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
 					_core: &CommandWrap,
 				) -> io::Result<()> {
 					self.0.lock().unwrap().push(Event::Post("first"));
@@ -75,7 +73,7 @@ macro_rules! spawn_with_child_tests {
 			impl CommandWrapper for Second {
 				fn pre_spawn(
 					&mut self,
-					_command: &mut Command,
+					_attempt: &mut SpawnAttempt,
 					_core: &CommandWrap,
 				) -> io::Result<()> {
 					self.0.lock().unwrap().push(Event::Pre("second"));
@@ -84,8 +82,8 @@ macro_rules! spawn_with_child_tests {
 
 				fn post_spawn(
 					&mut self,
-					_command: &mut Command,
-					_child: &mut Child,
+					_attempt: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
 					_core: &CommandWrap,
 				) -> io::Result<()> {
 					self.0.lock().unwrap().push(Event::Post("second"));
@@ -147,6 +145,25 @@ macro_rules! spawn_with_child_tests {
 			}
 
 			#[derive(Debug)]
+			struct InspectCompletedAttempt {
+				portable: bool,
+			}
+
+			impl CommandWrapper for InspectCompletedAttempt {
+				fn post_spawn(
+					&mut self,
+					attempt: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
+					_core: &CommandWrap,
+				) -> io::Result<()> {
+					assert_eq!(!attempt.is_native_only(), self.portable);
+					assert_eq!(attempt.get_portable_args().is_some(), self.portable);
+					assert_eq!(attempt.inherits_environment().is_some(), self.portable);
+					Ok(())
+				}
+			}
+
+			#[derive(Debug)]
 			struct CustomLeaf;
 
 			impl ChildWrapper for CustomLeaf {
@@ -166,6 +183,7 @@ macro_rules! spawn_with_child_tests {
 			#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 			enum Phase {
 				Pre,
+				Post,
 				Wrap,
 			}
 
@@ -199,7 +217,7 @@ macro_rules! spawn_with_child_tests {
 			impl CommandWrapper for FailOnce {
 				fn pre_spawn(
 					&mut self,
-					_command: &mut Command,
+					_attempt: &mut SpawnAttempt,
 					_core: &CommandWrap,
 				) -> io::Result<()> {
 					self.visit(Phase::Pre)
@@ -207,11 +225,11 @@ macro_rules! spawn_with_child_tests {
 
 				fn post_spawn(
 					&mut self,
-					_command: &mut Command,
-					_child: &mut Child,
+					_attempt: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
 					_core: &CommandWrap,
 				) -> io::Result<()> {
-					panic!("boxed-child spawning must not run post_spawn")
+					self.visit(Phase::Post)
 				}
 
 				fn wrap_child(
@@ -321,7 +339,18 @@ macro_rules! spawn_with_child_tests {
 			}
 
 			#[test]
-			fn boxed_child_runs_pre_spawn_and_wrap_child_without_post_spawn() {
+			fn ordinary_spawn_keeps_portable_state_for_post_spawn_hooks() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let mut command = command();
+				command.wrap(InspectCompletedAttempt { portable: true });
+
+				let child = command.spawn().expect("spawn native child");
+				wait_for_exit(child);
+			}
+
+			#[test]
+			fn boxed_child_runs_the_complete_wrapper_lifecycle() {
 				let runtime = runtime();
 				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
 				let events = Arc::new(Mutex::new(Vec::new()));
@@ -346,6 +375,8 @@ macro_rules! spawn_with_child_tests {
 						Event::Pre("first"),
 						Event::Pre("second"),
 						Event::Spawn,
+						Event::Post("first"),
+						Event::Post("second"),
 						Event::Wrap("first"),
 						Event::Wrap("second"),
 					]
@@ -360,7 +391,8 @@ macro_rules! spawn_with_child_tests {
 				let mut command = command();
 				command
 					.wrap(First(Arc::clone(&events)))
-					.wrap(Second(Arc::clone(&events)));
+					.wrap(Second(Arc::clone(&events)))
+					.wrap(InspectCompletedAttempt { portable: false });
 
 				let child = command
 					.spawn_with(|command| {
@@ -386,14 +418,14 @@ macro_rules! spawn_with_child_tests {
 
 			#[test]
 			fn boxed_child_restores_hooks_after_errors() {
-				for phase in [Phase::Pre, Phase::Wrap] {
+				for phase in [Phase::Pre, Phase::Post, Phase::Wrap] {
 					recover_hook(Failure::Error, phase);
 				}
 			}
 
 			#[test]
 			fn boxed_child_restores_hooks_after_panics() {
-				for phase in [Phase::Pre, Phase::Wrap] {
+				for phase in [Phase::Pre, Phase::Post, Phase::Wrap] {
 					recover_hook(Failure::Panic, phase);
 				}
 			}
@@ -414,9 +446,8 @@ macro_rules! spawn_with_child_tests {
 #[cfg(feature = "std")]
 spawn_with_child_tests!(
 	std_frontend,
-	std::process::Command,
-	std::process::Child,
 	process_wrap::std::CommandWrap,
+	process_wrap::std::SpawnAttempt,
 	process_wrap::std::CommandWrapper,
 	process_wrap::std::ChildWrapper,
 	None
@@ -425,9 +456,8 @@ spawn_with_child_tests!(
 #[cfg(feature = "tokio1")]
 spawn_with_child_tests!(
 	tokio_frontend,
-	tokio::process::Command,
-	tokio::process::Child,
 	process_wrap::tokio::CommandWrap,
+	process_wrap::tokio::SpawnAttempt,
 	process_wrap::tokio::CommandWrapper,
 	process_wrap::tokio::ChildWrapper,
 	Some(

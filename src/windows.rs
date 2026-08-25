@@ -113,6 +113,29 @@ impl Drop for JobPort {
 	}
 }
 
+/// Set whether closing a job's final handle terminates every process in the job.
+#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
+pub(crate) fn set_job_kill_on_drop(job: JobHandle, kill_on_drop: bool) -> Result<()> {
+	let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+	if kill_on_drop {
+		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+	}
+
+	unsafe {
+		SetInformationJobObject(
+			job.0,
+			JobObjectExtendedLimitInformation,
+			&info as *const _ as _,
+			std::mem::size_of_val(&info)
+				.try_into()
+				.expect("cannot safely cast to DWORD"),
+		)
+	}?;
+	#[cfg(feature = "tracing")]
+	debug!(?info, "done SetInformationJobObject(limit)");
+	Ok(())
+}
+
 /// Create a JobObject and an associated completion port.
 ///
 /// If `kill_on_drop` is true, we opt into the `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` flag, which
@@ -149,24 +172,7 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 		"done SetInformationJobObject(completion)"
 	);
 
-	let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-
-	if kill_on_drop {
-		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-	}
-
-	unsafe {
-		SetInformationJobObject(
-			job.0,
-			JobObjectExtendedLimitInformation,
-			&info as *const _ as _,
-			std::mem::size_of_val(&info)
-				.try_into()
-				.expect("cannot safely cast to DWORD"),
-		)
-	}?;
-	#[cfg(feature = "tracing")]
-	debug!(?info, "done SetInformationJobObject(limit)");
+	set_job_kill_on_drop(JobHandle(job.0), kill_on_drop)?;
 
 	unsafe { AssignProcessToJobObject(job.0, process_handle) }?;
 	#[cfg(feature = "tracing")]

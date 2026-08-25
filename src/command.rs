@@ -9,6 +9,9 @@ use std::{
 	process::Stdio,
 };
 
+#[cfg(windows)]
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle};
+
 /// Blocking standard-library process frontend.
 #[doc(hidden)]
 #[derive(Debug)]
@@ -73,6 +76,21 @@ pub trait NativeCommand: fmt::Debug + Sized + 'static {
 	/// Configure standard error.
 	fn stderr(&mut self, stdio: Stdio);
 
+	/// Register a callback to run in the child after `fork`.
+	#[cfg(unix)]
+	unsafe fn pre_exec<F>(&mut self, callback: F)
+	where
+		F: FnMut() -> std::io::Result<()> + Send + Sync + 'static;
+
+	/// Configure whether dropping a child kills it, where the frontend supports that policy.
+	fn configure_kill_on_drop(&mut self, kill_on_drop: bool) {
+		debug_assert!(!kill_on_drop, "only Tokio commands support kill-on-drop");
+	}
+
+	/// Set Windows process creation flags.
+	#[cfg(windows)]
+	fn creation_flags(&mut self, flags: u32);
+
 	/// Get the program.
 	fn get_program(&self) -> &OsStr;
 
@@ -128,6 +146,22 @@ impl NativeCommand for std::process::Command {
 
 	fn stderr(&mut self, stdio: Stdio) {
 		self.stderr(stdio);
+	}
+
+	#[cfg(unix)]
+	unsafe fn pre_exec<F>(&mut self, callback: F)
+	where
+		F: FnMut() -> std::io::Result<()> + Send + Sync + 'static,
+	{
+		use std::os::unix::process::CommandExt;
+		// SAFETY: the caller accepts the native `pre_exec` contract.
+		unsafe { CommandExt::pre_exec(self, callback) };
+	}
+
+	#[cfg(windows)]
+	fn creation_flags(&mut self, flags: u32) {
+		use std::os::windows::process::CommandExt;
+		CommandExt::creation_flags(self, flags);
 	}
 
 	fn get_program(&self) -> &OsStr {
@@ -190,6 +224,24 @@ impl NativeCommand for tokio::process::Command {
 		self.stderr(stdio);
 	}
 
+	#[cfg(unix)]
+	unsafe fn pre_exec<F>(&mut self, callback: F)
+	where
+		F: FnMut() -> std::io::Result<()> + Send + Sync + 'static,
+	{
+		// SAFETY: the caller accepts the native `pre_exec` contract.
+		unsafe { self.pre_exec(callback) };
+	}
+
+	fn configure_kill_on_drop(&mut self, kill_on_drop: bool) {
+		self.kill_on_drop(kill_on_drop);
+	}
+
+	#[cfg(windows)]
+	fn creation_flags(&mut self, flags: u32) {
+		self.creation_flags(flags);
+	}
+
 	fn get_program(&self) -> &OsStr {
 		self.as_std().get_program()
 	}
@@ -207,15 +259,24 @@ impl NativeCommand for tokio::process::Command {
 	}
 }
 
-#[derive(Clone, Debug)]
-pub(crate) enum CommandArg {
+/// One losslessly tracked command-line argument.
+///
+/// [`Command::get_args`] and [`SpawnAttempt::get_args`] provide native-shaped value iterators. This
+/// type additionally preserves whether a Windows argument was supplied through `raw_arg`, which an
+/// alternate spawn provider needs in order to reproduce or reject the exact command line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandArg {
+	/// A regular argument which the transport must quote according to its command-line model.
 	Regular(OsString),
+	/// A raw Windows command-line fragment which the transport must not quote or escape.
 	#[cfg(windows)]
+	#[cfg_attr(docsrs, doc(cfg(windows)))]
 	Raw(OsString),
 }
 
 impl CommandArg {
-	fn value(&self) -> &OsStr {
+	/// Return the argument or raw fragment value.
+	pub fn value(&self) -> &OsStr {
 		match self {
 			Self::Regular(value) => value,
 			#[cfg(windows)]
@@ -463,6 +524,235 @@ impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
 	}
 }
 
+/// Cleanup and finalization owned by an alternate spawn provider.
+///
+/// A provider returns a fresh, armed transaction with every child it successfully creates. The
+/// transaction must own its cleanup resources independently of the child wrapper chain, because a
+/// failing child wrapper may already have consumed or dropped that chain.
+///
+/// Process-wrap calls [`commit`](SpawnTransaction::commit) only after every public post-spawn and
+/// child-wrapping hook succeeds. `commit` must disarm rollback resources on success. If it returns an
+/// error or panics, the transaction must remain rollbackable; process-wrap then makes one best-effort
+/// [`rollback`](SpawnTransaction::rollback) call. A rollback error or panic is suppressed so the
+/// original error or panic is preserved. After a successful commit, process-wrap drops the transaction
+/// and does not roll it back if a later internal child-finalization phase fails.
+///
+/// Until a provider returns its `ProviderProduct`, cleanup for errors or panics in its own `spawn`
+/// implementation remains the provider's responsibility.
+pub trait SpawnTransaction: fmt::Debug + Send + 'static {
+	/// Finalize the successful spawn and disarm rollback resources.
+	fn commit(&mut self) -> std::io::Result<()>;
+
+	/// Undo an uncommitted spawn.
+	fn rollback(&mut self) -> std::io::Result<()>;
+}
+
+#[cfg(windows)]
+const CREATE_SUSPENDED_FLAG: u32 = 0x0000_0004;
+
+/// Portable Windows process-creation policy for one spawn attempt.
+///
+/// Alternate providers use this policy to preserve creation flags and compose with `JobObject` and
+/// Tokio `KillOnDrop` without inspecting an opaque native command.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WindowsSpawnPolicy {
+	user_creation_flags: u32,
+	spawn_creation_flags: u32,
+	has_creation_flags: bool,
+	has_job_object: bool,
+	kill_on_drop: bool,
+}
+
+#[cfg(windows)]
+impl WindowsSpawnPolicy {
+	/// Return the flags explicitly requested through `CreationFlags`.
+	pub fn user_creation_flags(self) -> u32 {
+		self.user_creation_flags
+	}
+
+	/// Return the complete flags the transport must use when creating the process.
+	///
+	/// This includes process-wrap's temporary `CREATE_SUSPENDED` flag when a job object must be
+	/// assigned before the process starts running.
+	pub fn spawn_creation_flags(self) -> u32 {
+		self.spawn_creation_flags
+	}
+
+	/// Return whether `CreationFlags` configured this attempt.
+	pub fn has_creation_flags(self) -> bool {
+		self.has_creation_flags
+	}
+
+	/// Return whether this attempt must assign the child to a job object.
+	pub fn has_job_object(self) -> bool {
+		self.has_job_object
+	}
+
+	/// Return whether the caller explicitly requested `CREATE_SUSPENDED`.
+	pub fn is_explicitly_suspended(self) -> bool {
+		self.user_creation_flags & CREATE_SUSPENDED_FLAG != 0
+	}
+
+	/// Return whether process-wrap added temporary suspension for job-object assignment.
+	pub fn is_temporarily_suspended(self) -> bool {
+		self.has_job_object && !self.is_explicitly_suspended()
+	}
+
+	/// Return whether the child starts suspended for either reason.
+	pub fn starts_suspended(self) -> bool {
+		self.spawn_creation_flags & CREATE_SUSPENDED_FLAG != 0
+	}
+
+	/// Return whether dropping the direct Tokio child must terminate it.
+	pub fn kills_on_drop(self) -> bool {
+		self.kill_on_drop
+	}
+
+	#[cfg(any(feature = "creation-flags", test))]
+	fn set_creation_flags(&mut self, flags: u32) {
+		self.user_creation_flags = flags;
+		self.has_creation_flags = true;
+		self.recompute_spawn_flags();
+	}
+
+	#[cfg(any(feature = "job-object", test))]
+	fn set_job_object(&mut self) {
+		self.has_job_object = true;
+		self.recompute_spawn_flags();
+	}
+
+	#[cfg(any(all(feature = "tokio1", feature = "kill-on-drop"), test))]
+	fn set_kill_on_drop(&mut self, kill_on_drop: bool) {
+		self.kill_on_drop = kill_on_drop;
+	}
+
+	#[cfg(any(feature = "creation-flags", feature = "job-object", test))]
+	fn recompute_spawn_flags(&mut self) {
+		self.spawn_creation_flags = self.user_creation_flags;
+		if self.has_job_object {
+			self.spawn_creation_flags |= CREATE_SUSPENDED_FLAG;
+		}
+	}
+
+	fn applies_creation_flags(self) -> bool {
+		self.has_creation_flags || self.has_job_object
+	}
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+	fn TerminateProcess(process: *mut std::ffi::c_void, exit_code: u32) -> i32;
+	fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
+}
+
+#[cfg(windows)]
+const WAIT_FAILED: u32 = u32::MAX;
+#[cfg(windows)]
+const WAIT_INFINITE: u32 = u32::MAX;
+
+#[cfg(windows)]
+pub(crate) fn terminate_process_and_wait(process: BorrowedHandle<'_>) -> std::io::Result<()> {
+	let raw = process.as_raw_handle();
+	// SAFETY: `raw` is a live process handle for both calls and remains borrowed until they finish.
+	if unsafe { TerminateProcess(raw, 1) } == 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	// SAFETY: the process handle remains live for the duration of this call.
+	if unsafe { WaitForSingleObject(raw, WAIT_INFINITE) } == WAIT_FAILED {
+		Err(std::io::Error::last_os_error())
+	} else {
+		Ok(())
+	}
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct WindowsSpawnCleanup {
+	process: OwnedHandle,
+	armed: bool,
+}
+
+#[cfg(windows)]
+impl WindowsSpawnCleanup {
+	pub(crate) fn new(process: BorrowedHandle<'_>) -> std::io::Result<Self> {
+		Ok(Self {
+			process: process.try_clone_to_owned()?,
+			armed: true,
+		})
+	}
+
+	pub(crate) fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+#[cfg(windows)]
+impl Drop for WindowsSpawnCleanup {
+	fn drop(&mut self) {
+		if self.armed {
+			let _ = terminate_process_and_wait(self.process.as_handle());
+		}
+	}
+}
+
+enum AttemptState<N> {
+	Tracked {
+		intent: CommandIntent,
+		native: Option<N>,
+	},
+	NativeOnly(N),
+}
+
+impl<N: fmt::Debug> fmt::Debug for AttemptState<N> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Tracked { intent, native } => f
+				.debug_struct("Tracked")
+				.field("intent", intent)
+				.field("native", native)
+				.finish(),
+			Self::NativeOnly(command) => f.debug_tuple("NativeOnly").field(command).finish(),
+		}
+	}
+}
+
+#[derive(Clone, Debug, Default)]
+struct PlatformCommandState {
+	#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+	unix: crate::unix::CommandState,
+}
+
+/// The command configuration for one spawn attempt.
+///
+/// Each call to a spawn method creates a fresh attempt. Hooks may modify an attempt copied from a
+/// tracked base [`Command`] without changing that base. A native-only command instead lends its exact
+/// native command to the attempt and retains hook mutations when the command is restored afterward.
+/// Explicit native mutation makes a tracked attempt native-only, which alternate portable spawn
+/// providers reject rather than reconstructing or partially applying.
+pub struct SpawnAttempt<B: Backend> {
+	state: AttemptState<B::NativeCommand>,
+	#[cfg_attr(not(unix), allow(dead_code))]
+	platform: PlatformCommandState,
+	#[cfg_attr(not(unix), allow(dead_code))]
+	native_only_base: bool,
+	kill_on_drop: Option<bool>,
+	#[cfg(windows)]
+	windows_policy: WindowsSpawnPolicy,
+	#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+	unix_policy: crate::unix::SpawnPolicy,
+	backend: PhantomData<fn() -> B>,
+}
+
+impl<B: Backend> fmt::Debug for SpawnAttempt<B> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("SpawnAttempt")
+			.field("state", &self.state)
+			.finish()
+	}
+}
+
 /// A configurable process command with composable wrappers.
 ///
 /// The backend type is normally selected through `process_wrap::std::Command` or
@@ -471,6 +761,7 @@ impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
 pub struct Command<B: Backend> {
 	state: CommandState<B::NativeCommand>,
 	wrappers: Box<dyn Any + Send + Sync>,
+	platform: PlatformCommandState,
 	backend: PhantomData<fn() -> B>,
 }
 
@@ -488,6 +779,7 @@ impl<B: Backend> Command<B> {
 		Self {
 			state: CommandState::Tracked(CommandIntent::new(program)),
 			wrappers: B::new_registry(),
+			platform: PlatformCommandState::default(),
 			backend: PhantomData,
 		}
 	}
@@ -648,6 +940,17 @@ impl<B: Backend> Command<B> {
 		}
 	}
 
+	/// Get the losslessly tracked portable arguments in command-line order.
+	///
+	/// Unlike [`get_args`](Self::get_args), this preserves regular versus raw Windows arguments. Returns
+	/// `None` for a native-only command because its native API cannot recover that distinction.
+	pub fn get_portable_args(&self) -> Option<&[CommandArg]> {
+		match &self.state {
+			CommandState::Tracked(intent) => Some(&intent.args),
+			CommandState::NativeOnly(_) => None,
+		}
+	}
+
 	/// Get explicitly configured environment changes.
 	pub fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
 		match &self.state {
@@ -656,6 +959,17 @@ impl<B: Backend> Command<B> {
 				Some(command) => command.get_envs(),
 				None => command.view.get_envs(),
 			},
+		}
+	}
+
+	/// Return whether this portable command inherits the parent environment.
+	///
+	/// Returns `Some(true)` for normal inheritance, `Some(false)` after `env_clear`, and `None` for a
+	/// native-only command because native command APIs do not expose that state.
+	pub fn inherits_environment(&self) -> Option<bool> {
+		match &self.state {
+			CommandState::Tracked(intent) => Some(!intent.env_clear),
+			CommandState::NativeOnly(_) => None,
 		}
 	}
 
@@ -673,12 +987,22 @@ impl<B: Backend> Command<B> {
 	/// Mutably access the frontend's native command.
 	///
 	/// Calling this permanently makes the command native-only. Alternate portable transports cannot
-	/// recover exact portable intent after arbitrary native mutation.
+	/// recover exact portable intent after arbitrary native mutation. On Unix, process-wrap reinstalls
+	/// any built-in child setup when it next spawns the command, so replacing the native value does not
+	/// discard that setup.
+	///
+	/// On Unix, every mutable native escape must conservatively invalidate process-wrap's installed
+	/// child-setup callback because the native API does not reveal whether a callback was added or the
+	/// command was moved out. Repeated escapes from the same native-only command can therefore retain
+	/// inactive callbacks; use the tracked facade methods and wrappers for reusable configuration.
 	pub fn native_mut(&mut self) -> &mut B::NativeCommand {
 		if let CommandState::Tracked(intent) = &self.state {
 			let command = intent.materialize::<B::NativeCommand>();
 			self.state = CommandState::NativeOnly(NativeOnlyCommand::new(command));
 		}
+
+		#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+		self.platform.unix.invalidate();
 
 		match &mut self.state {
 			CommandState::NativeOnly(command) => command.command_mut(),
@@ -698,6 +1022,7 @@ impl<B: Backend> Command<B> {
 		Self {
 			state: CommandState::NativeOnly(NativeOnlyCommand::new(command)),
 			wrappers: B::new_registry(),
+			platform: PlatformCommandState::default(),
 			backend: PhantomData,
 		}
 	}
@@ -714,20 +1039,64 @@ impl<B: Backend> Command<B> {
 			.expect("the backend always creates its matching wrapper registry")
 	}
 
-	pub(crate) fn with_native<T>(
+	/// Return whether this command contains opaque native-only state.
+	pub fn is_native_only(&self) -> bool {
+		matches!(self.state, CommandState::NativeOnly(_))
+	}
+
+	pub(crate) fn with_spawn_attempt<T>(
 		&mut self,
-		invoke: impl FnOnce(&mut Self, &mut B::NativeCommand) -> std::io::Result<T>,
+		invoke: impl FnOnce(&mut Self, &mut SpawnAttempt<B>) -> std::io::Result<T>,
 	) -> std::io::Result<T> {
+		let platform = self.platform.clone();
 		match &mut self.state {
 			CommandState::Tracked(intent) => {
-				let mut native = intent.materialize::<B::NativeCommand>();
-				invoke(self, &mut native)
+				let mut attempt = SpawnAttempt {
+					state: AttemptState::Tracked {
+						intent: intent.clone(),
+						native: None,
+					},
+					platform,
+					native_only_base: false,
+					kill_on_drop: None,
+					#[cfg(windows)]
+					windows_policy: WindowsSpawnPolicy::default(),
+					#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+					unix_policy: crate::unix::SpawnPolicy::default(),
+					backend: PhantomData,
+				};
+				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+					invoke(self, &mut attempt)
+				}));
+				attempt.disarm_platform();
+				match result {
+					Ok(result) => result,
+					Err(payload) => std::panic::resume_unwind(payload),
+				}
 			}
 			CommandState::NativeOnly(command) => {
-				let mut native = command.take();
+				let native = command.take();
+				let mut attempt = SpawnAttempt {
+					state: AttemptState::NativeOnly(native),
+					platform,
+					native_only_base: true,
+					kill_on_drop: None,
+					#[cfg(windows)]
+					windows_policy: WindowsSpawnPolicy::default(),
+					#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+					unix_policy: crate::unix::SpawnPolicy::default(),
+					backend: PhantomData,
+				};
 				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-					invoke(self, &mut native)
+					invoke(self, &mut attempt)
 				}));
+				attempt.disarm_platform();
+				let native = match attempt.state {
+					AttemptState::NativeOnly(native) => native,
+					AttemptState::Tracked { .. } => {
+						unreachable!("a native-only spawn attempt cannot become tracked")
+					}
+				};
 				match &mut self.state {
 					CommandState::NativeOnly(command) => command.restore(native),
 					CommandState::Tracked(_) => {
@@ -740,6 +1109,494 @@ impl<B: Backend> Command<B> {
 				}
 			}
 		}
+	}
+}
+
+impl<B: Backend> SpawnAttempt<B> {
+	/// Add an argument for this spawn attempt.
+	pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		let arg = arg.as_ref();
+		match &mut self.state {
+			AttemptState::Tracked { intent, .. } => {
+				intent.args.push(CommandArg::Regular(arg.to_owned()))
+			}
+			AttemptState::NativeOnly(command) => command.arg(arg),
+		}
+		self
+	}
+
+	/// Add multiple arguments for this spawn attempt.
+	pub fn args<I, S>(&mut self, args: I) -> &mut Self
+	where
+		I: IntoIterator<Item = S>,
+		S: AsRef<OsStr>,
+	{
+		for arg in args {
+			self.arg(arg);
+		}
+		self
+	}
+
+	/// Add a raw command-line fragment without quoting or escaping.
+	///
+	/// This method is only available on Windows.
+	#[cfg(windows)]
+	pub fn raw_arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		let arg = arg.as_ref();
+		match &mut self.state {
+			AttemptState::Tracked { intent, .. } => {
+				intent.args.push(CommandArg::Raw(arg.to_owned()))
+			}
+			AttemptState::NativeOnly(command) => command.raw_arg(arg),
+		}
+		self
+	}
+
+	/// Set an environment variable for this spawn attempt.
+	pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
+		let key = key.as_ref();
+		let value = value.as_ref();
+		match &mut self.state {
+			AttemptState::Tracked { intent, .. } => intent
+				.env
+				.push(EnvChange::Set(key.to_owned(), value.to_owned())),
+			AttemptState::NativeOnly(command) => command.env(key, value),
+		}
+		self
+	}
+
+	/// Set multiple environment variables for this spawn attempt.
+	pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
+	where
+		I: IntoIterator<Item = (K, V)>,
+		K: AsRef<OsStr>,
+		V: AsRef<OsStr>,
+	{
+		for (key, value) in vars {
+			self.env(key, value);
+		}
+		self
+	}
+
+	/// Remove an environment variable for this spawn attempt.
+	pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
+		let key = key.as_ref();
+		match &mut self.state {
+			AttemptState::Tracked { intent, .. } => intent.env_remove(key),
+			AttemptState::NativeOnly(command) => command.env_remove(key),
+		}
+		self
+	}
+
+	/// Clear configured variables and prevent inheritance for this spawn attempt.
+	pub fn env_clear(&mut self) -> &mut Self {
+		match &mut self.state {
+			AttemptState::Tracked { intent, .. } => {
+				intent.env_clear = true;
+				intent.env.clear();
+			}
+			AttemptState::NativeOnly(command) => command.env_clear(),
+		}
+		self
+	}
+
+	/// Set the child process's current directory for this spawn attempt.
+	pub fn current_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
+		let dir = dir.as_ref();
+		match &mut self.state {
+			AttemptState::Tracked { intent, .. } => intent.current_dir = Some(dir.to_owned()),
+			AttemptState::NativeOnly(command) => command.current_dir(dir),
+		}
+		self
+	}
+
+	/// Configure standard input and make this spawn attempt native-only.
+	pub fn stdin(&mut self, stdio: Stdio) -> &mut Self {
+		self.native_mut().stdin(stdio);
+		self
+	}
+
+	/// Configure standard output and make this spawn attempt native-only.
+	pub fn stdout(&mut self, stdio: Stdio) -> &mut Self {
+		self.native_mut().stdout(stdio);
+		self
+	}
+
+	/// Configure standard error and make this spawn attempt native-only.
+	pub fn stderr(&mut self, stdio: Stdio) -> &mut Self {
+		self.native_mut().stderr(stdio);
+		self
+	}
+
+	/// Get the configured program for this spawn attempt.
+	pub fn get_program(&self) -> &OsStr {
+		match &self.state {
+			AttemptState::Tracked { intent, .. } => &intent.program,
+			AttemptState::NativeOnly(command) => command.get_program(),
+		}
+	}
+
+	/// Get the configured arguments for this spawn attempt.
+	pub fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
+		match &self.state {
+			AttemptState::Tracked { intent, .. } => {
+				Box::new(intent.args.iter().map(CommandArg::value))
+			}
+			AttemptState::NativeOnly(command) => command.get_args(),
+		}
+	}
+
+	/// Get the losslessly tracked portable arguments in command-line order.
+	///
+	/// Unlike [`get_args`](Self::get_args), this preserves regular versus raw Windows arguments. Returns
+	/// `None` for a native-only attempt. Process-wrap performs that rejection before a provider's
+	/// `validate_attempt` callback, so providers receive `Some` there.
+	pub fn get_portable_args(&self) -> Option<&[CommandArg]> {
+		match &self.state {
+			AttemptState::Tracked { intent, .. } => Some(&intent.args),
+			AttemptState::NativeOnly(_) => None,
+		}
+	}
+
+	/// Get explicitly configured environment changes for this spawn attempt.
+	pub fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+		match &self.state {
+			AttemptState::Tracked { intent, .. } => Box::new(intent.get_envs()),
+			AttemptState::NativeOnly(command) => command.get_envs(),
+		}
+	}
+
+	/// Return whether this portable attempt inherits the parent environment.
+	///
+	/// Returns `Some(true)` for normal inheritance, `Some(false)` after `env_clear`, and `None` for a
+	/// native-only attempt. Process-wrap performs that rejection before a provider's `validate_attempt`
+	/// callback, so providers receive `Some` there.
+	pub fn inherits_environment(&self) -> Option<bool> {
+		match &self.state {
+			AttemptState::Tracked { intent, .. } => Some(!intent.env_clear),
+			AttemptState::NativeOnly(_) => None,
+		}
+	}
+
+	/// Get the configured current directory for this spawn attempt.
+	pub fn get_current_dir(&self) -> Option<&Path> {
+		match &self.state {
+			AttemptState::Tracked { intent, .. } => intent.current_dir.as_deref(),
+			AttemptState::NativeOnly(command) => command.get_current_dir(),
+		}
+	}
+
+	/// Return whether dropping the direct child must terminate it.
+	///
+	/// This is currently a Tokio policy. Alternate Tokio providers use it to preserve the behavior of
+	/// the `KillOnDrop` wrapper without requiring a native Tokio command.
+	pub fn kills_on_drop(&self) -> bool {
+		self.kill_on_drop.unwrap_or(false)
+	}
+
+	/// Return the portable Windows creation policy for this attempt.
+	#[cfg(windows)]
+	pub fn windows_spawn_policy(&self) -> WindowsSpawnPolicy {
+		self.windows_policy
+	}
+
+	#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
+	pub(crate) fn set_kill_on_drop(&mut self, kill_on_drop: bool) {
+		self.kill_on_drop = Some(kill_on_drop);
+		#[cfg(windows)]
+		self.windows_policy.set_kill_on_drop(kill_on_drop);
+	}
+
+	#[cfg(all(windows, feature = "creation-flags"))]
+	pub(crate) fn set_windows_creation_flags(&mut self, flags: u32) {
+		self.windows_policy.set_creation_flags(flags);
+	}
+
+	#[cfg(all(windows, feature = "job-object"))]
+	pub(crate) fn set_job_object(&mut self) {
+		self.windows_policy.set_job_object();
+	}
+
+	#[cfg(windows)]
+	pub(crate) fn starts_suspended(&self) -> bool {
+		self.windows_policy.starts_suspended()
+	}
+
+	/// Return the process-group setup requested for this attempt.
+	///
+	/// Alternate spawn providers use this to apply process-group intent without making the attempt
+	/// native-only. This method remains available when the `process-group` wrapper feature is disabled
+	/// and returns `None` in that configuration.
+	#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+	pub fn process_group_target(&self) -> Option<crate::ProcessGroupTarget> {
+		self.unix_policy.process_group
+	}
+
+	/// Return whether this attempt must create a new process session.
+	///
+	/// This method remains available when the `process-session` wrapper feature is disabled and returns
+	/// `false` in that configuration.
+	#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+	pub fn creates_process_session(&self) -> bool {
+		self.unix_policy.process_session
+	}
+
+	/// Return whether this attempt must reset the child signal mask.
+	///
+	/// This method remains available when the `reset-sigmask` wrapper feature is disabled and returns
+	/// `false` in that configuration.
+	#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+	pub fn resets_sigmask(&self) -> bool {
+		self.unix_policy.reset_sigmask
+	}
+
+	#[cfg(all(
+		unix,
+		any(feature = "std", feature = "tokio1"),
+		feature = "process-group"
+	))]
+	pub(crate) fn set_process_group(
+		&mut self,
+		target: crate::unix::ProcessGroupTarget,
+	) -> std::io::Result<()> {
+		self.unix_policy.set_process_group(target)
+	}
+
+	#[cfg(all(
+		unix,
+		any(feature = "std", feature = "tokio1"),
+		feature = "process-session"
+	))]
+	pub(crate) fn set_process_session(&mut self) -> std::io::Result<()> {
+		self.unix_policy.set_process_session()
+	}
+
+	#[cfg(all(
+		unix,
+		any(feature = "std", feature = "tokio1"),
+		feature = "reset-sigmask"
+	))]
+	pub(crate) fn set_reset_sigmask(&mut self) {
+		self.unix_policy.reset_sigmask = true;
+	}
+
+	fn prepare_platform(&mut self) {
+		let kill_on_drop = self.kill_on_drop;
+		#[cfg(windows)]
+		let windows_policy = self.windows_policy;
+		{
+			let command = match &mut self.state {
+				AttemptState::NativeOnly(command) => command,
+				AttemptState::Tracked { native, .. } => native
+					.as_mut()
+					.expect("the attempt is materialized before platform setup"),
+			};
+			if let Some(kill_on_drop) = kill_on_drop {
+				command.configure_kill_on_drop(kill_on_drop);
+			}
+			#[cfg(windows)]
+			if windows_policy.applies_creation_flags() {
+				command.creation_flags(windows_policy.spawn_creation_flags());
+			}
+		}
+
+		#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+		{
+			let policy = self.unix_policy;
+			let native_only_base = self.native_only_base;
+			let command = match &mut self.state {
+				AttemptState::NativeOnly(command) => command,
+				AttemptState::Tracked { native, .. } => native
+					.as_mut()
+					.expect("the attempt is materialized before platform setup"),
+			};
+			self.platform
+				.unix
+				.prepare(command, native_only_base, policy);
+		}
+	}
+
+	fn disarm_platform(&mut self) {
+		#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+		self.platform.unix.disarm();
+	}
+
+	fn materialize_native(&mut self) {
+		if let AttemptState::Tracked { intent, native } = &mut self.state {
+			if native.is_none() {
+				*native = Some(intent.materialize::<B::NativeCommand>());
+			}
+		}
+	}
+
+	fn make_native_only(&mut self) {
+		self.materialize_native();
+		let native = match &mut self.state {
+			AttemptState::Tracked { native, .. } => native
+				.take()
+				.expect("the tracked attempt was materialized above"),
+			AttemptState::NativeOnly(_) => return,
+		};
+		self.state = AttemptState::NativeOnly(native);
+	}
+
+	fn native_command_mut(&mut self) -> &mut B::NativeCommand {
+		match &mut self.state {
+			AttemptState::Tracked { native, .. } => native
+				.as_mut()
+				.expect("the tracked attempt was materialized before native access"),
+			AttemptState::NativeOnly(command) => command,
+		}
+	}
+
+	fn invalidate_platform(&mut self) {
+		#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+		self.platform.unix.invalidate();
+	}
+
+	pub(crate) fn native_for_spawn(&mut self) -> &mut B::NativeCommand {
+		self.materialize_native();
+		self.prepare_platform();
+		self.native_command_mut()
+	}
+
+	pub(crate) fn native_for_explicit_spawn(&mut self) -> &mut B::NativeCommand {
+		self.make_native_only();
+		self.prepare_platform();
+		self.native_command_mut()
+	}
+
+	/// Mutably access the frontend's native command for this spawn attempt.
+	///
+	/// Calling this makes only this attempt native-only. An alternate portable provider rejects that
+	/// attempt because it cannot recover exact portable intent after arbitrary native mutation. On
+	/// Unix, built-in child setup is installed after all pre-spawn hooks have run, so replacing the
+	/// native value here does not discard that setup.
+	///
+	/// Each Unix native escape conservatively invalidates any dispatcher callback retained from an
+	/// earlier attempt because process-wrap cannot observe native callback insertion or ownership
+	/// changes. A wrapper which does this on every reuse of a native-only command can therefore leave
+	/// inactive callbacks attached; prefer portable attempt methods for recurring configuration.
+	pub fn native_mut(&mut self) -> &mut B::NativeCommand {
+		self.make_native_only();
+		self.invalidate_platform();
+		self.native_command_mut()
+	}
+
+	/// Return whether this spawn attempt contains opaque native-only state.
+	pub fn is_native_only(&self) -> bool {
+		matches!(self.state, AttemptState::NativeOnly(_))
+	}
+}
+
+#[cfg(all(feature = "std", unix))]
+impl SpawnAttempt<Blocking> {
+	/// Set the child process's user ID and make this spawn attempt native-only.
+	pub fn uid(&mut self, id: u32) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::uid(self.native_mut(), id);
+		self
+	}
+
+	/// Set the child process's group ID and make this spawn attempt native-only.
+	pub fn gid(&mut self, id: u32) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::gid(self.native_mut(), id);
+		self
+	}
+
+	/// Set the child process's `argv[0]` and make this spawn attempt native-only.
+	pub fn arg0(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::arg0(self.native_mut(), arg);
+		self
+	}
+
+	/// Set the child process's process group and make this spawn attempt native-only.
+	pub fn process_group(&mut self, pgroup: i32) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::process_group(self.native_mut(), pgroup);
+		self
+	}
+
+	/// Register a callback to run in the child after `fork` and make this attempt native-only.
+	///
+	/// # Safety
+	///
+	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
+	/// operations which are valid in that constrained environment.
+	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
+	where
+		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
+	{
+		use ::std::os::unix::process::CommandExt;
+		// SAFETY: the caller accepts the native `pre_exec` contract documented above.
+		unsafe { CommandExt::pre_exec(self.native_mut(), f) };
+		self
+	}
+}
+
+#[cfg(all(feature = "std", windows))]
+impl SpawnAttempt<Blocking> {
+	/// Set Windows process creation flags and make this spawn attempt native-only.
+	pub fn creation_flags(&mut self, flags: u32) -> &mut Self {
+		use ::std::os::windows::process::CommandExt;
+		CommandExt::creation_flags(self.native_mut(), flags);
+		self
+	}
+}
+
+#[cfg(feature = "tokio1")]
+impl SpawnAttempt<Tokio1> {
+	/// Configure whether dropping the Tokio child kills it and make this attempt native-only.
+	pub fn kill_on_drop(&mut self, kill_on_drop: bool) -> &mut Self {
+		self.native_mut().kill_on_drop(kill_on_drop);
+		self
+	}
+}
+
+#[cfg(all(feature = "tokio1", unix))]
+impl SpawnAttempt<Tokio1> {
+	/// Set the child process's user ID and make this spawn attempt native-only.
+	pub fn uid(&mut self, id: u32) -> &mut Self {
+		self.native_mut().uid(id);
+		self
+	}
+
+	/// Set the child process's group ID and make this spawn attempt native-only.
+	pub fn gid(&mut self, id: u32) -> &mut Self {
+		self.native_mut().gid(id);
+		self
+	}
+
+	/// Set the child process's `argv[0]` and make this spawn attempt native-only.
+	pub fn arg0(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		self.native_mut().arg0(arg);
+		self
+	}
+
+	/// Register a callback to run in the child after `fork` and make this attempt native-only.
+	///
+	/// # Safety
+	///
+	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
+	/// operations which are valid in that constrained environment.
+	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
+	where
+		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
+	{
+		// SAFETY: the caller accepts the native `pre_exec` contract documented above.
+		unsafe { self.native_mut().pre_exec(f) };
+		self
+	}
+}
+
+#[cfg(all(feature = "tokio1", windows))]
+impl SpawnAttempt<Tokio1> {
+	/// Set Windows process creation flags and make this spawn attempt native-only.
+	pub fn creation_flags(&mut self, flags: u32) -> &mut Self {
+		self.native_mut().creation_flags(flags);
+		self
 	}
 }
 
@@ -810,20 +1667,6 @@ impl Command<Tokio1> {
 	}
 }
 
-#[cfg(all(feature = "tokio1", feature = "process-group", unix))]
-pub(crate) fn tokio_process_group(command: &mut tokio::process::Command, pgroup: i32) {
-	let set_process_group = move || {
-		// SAFETY: `setpgid` is called in the child with its own PID and does not retain pointers.
-		if unsafe { nix::libc::setpgid(0, pgroup) } == -1 {
-			Err(::std::io::Error::last_os_error())
-		} else {
-			Ok(())
-		}
-	};
-	// SAFETY: the callback only invokes `setpgid`, which is valid between `fork` and `exec`.
-	unsafe { command.pre_exec(set_process_group) };
-}
-
 #[cfg(all(feature = "tokio1", unix))]
 impl Command<Tokio1> {
 	/// Set the child process's user ID and make the command native-only.
@@ -879,7 +1722,9 @@ mod windows_tests {
 		process::Stdio,
 	};
 
-	use super::{CommandArg, CommandIntent, NativeCommand};
+	use super::{
+		CREATE_SUSPENDED_FLAG, CommandArg, CommandIntent, NativeCommand, WindowsSpawnPolicy,
+	};
 
 	#[derive(Debug, Eq, PartialEq)]
 	enum RecordedArg {
@@ -922,6 +1767,8 @@ mod windows_tests {
 		fn stdout(&mut self, _stdio: Stdio) {}
 
 		fn stderr(&mut self, _stdio: Stdio) {}
+
+		fn creation_flags(&mut self, _flags: u32) {}
 
 		fn get_program(&self) -> &OsStr {
 			&self.program
@@ -968,5 +1815,51 @@ mod windows_tests {
 				RecordedArg::Regular(regular_surrogate),
 			]
 		);
+	}
+
+	#[test]
+	fn windows_policy_preserves_flags_without_a_job() {
+		let flags = 0x0000_0200 | 0x0800_0000;
+		let mut policy = WindowsSpawnPolicy::default();
+		policy.set_creation_flags(flags);
+
+		assert!(policy.has_creation_flags());
+		assert_eq!(policy.user_creation_flags(), flags);
+		assert_eq!(policy.spawn_creation_flags(), flags);
+		assert!(!policy.has_job_object());
+		assert!(!policy.is_explicitly_suspended());
+		assert!(!policy.is_temporarily_suspended());
+		assert!(!policy.starts_suspended());
+	}
+
+	#[test]
+	fn windows_policy_adds_only_temporary_job_suspension() {
+		let flags = 0x0000_0200 | 0x0800_0000;
+		let mut policy = WindowsSpawnPolicy::default();
+		policy.set_job_object();
+		policy.set_creation_flags(flags);
+
+		assert_eq!(policy.user_creation_flags(), flags);
+		assert_eq!(policy.spawn_creation_flags(), flags | CREATE_SUSPENDED_FLAG);
+		assert!(policy.has_job_object());
+		assert!(!policy.is_explicitly_suspended());
+		assert!(policy.is_temporarily_suspended());
+		assert!(policy.starts_suspended());
+	}
+
+	#[test]
+	fn windows_policy_preserves_explicit_suspension_and_kill_on_drop() {
+		let flags = 0x0800_0000 | CREATE_SUSPENDED_FLAG;
+		let mut policy = WindowsSpawnPolicy::default();
+		policy.set_creation_flags(flags);
+		policy.set_job_object();
+		policy.set_kill_on_drop(true);
+
+		assert_eq!(policy.user_creation_flags(), flags);
+		assert_eq!(policy.spawn_creation_flags(), flags);
+		assert!(policy.is_explicitly_suspended());
+		assert!(!policy.is_temporarily_suspended());
+		assert!(policy.starts_suspended());
+		assert!(policy.kills_on_drop());
 	}
 }

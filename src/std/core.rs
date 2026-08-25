@@ -94,10 +94,53 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	/// default implementation.
 	///
 	/// Implementations returning `Some` must return a process handle, rather than another kind of
-	/// Windows object.
+	/// Windows object. A provider child used with `JobObject` must expose this capability; otherwise
+	/// process-wrap returns `Unsupported` and makes a best-effort attempt to terminate the child.
 	#[cfg(windows)]
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
 		None
+	}
+
+	/// Resume the exact thread which process-wrap temporarily suspended for job-object assignment.
+	///
+	/// This method is only available on Windows. A provider which creates the process temporarily
+	/// suspended according to `WindowsSpawnPolicy` should retain its primary-thread handle and return
+	/// `Some(result)` after attempting one exact resume. `Some(Err(_))` is authoritative and fails the
+	/// spawn lifecycle; process-wrap does not then try another resume mechanism. Return `None` only when
+	/// no exact capability exists, which lets `JobObject` use its process-wide thread-enumeration
+	/// compatibility fallback.
+	#[cfg(windows)]
+	fn resume_after_job_assignment(&mut self) -> Option<Result<()>> {
+		None
+	}
+
+	/// Finalize Windows spawn state owned by this child layer.
+	///
+	/// Process-wrap invokes this internal lifecycle hook after all child wrappers have been installed.
+	/// Implementations act only on their own layer; process-wrap traverses the complete chain.
+	#[doc(hidden)]
+	#[cfg(windows)]
+	fn finalize_spawn_layer(&mut self) -> Result<()> {
+		Ok(())
+	}
+
+	/// Disarm Windows cleanup state owned by this child layer.
+	///
+	/// Process-wrap invokes this internal hook only after every ordinary spawn finalizer succeeds, so
+	/// cleanup remains armed if any earlier finalizer errors or panics.
+	#[doc(hidden)]
+	#[cfg(windows)]
+	fn disarm_spawn_cleanup_layer(&mut self) -> Result<()> {
+		Ok(())
+	}
+
+	/// Disarm the JobObject cleanup state owned by this child layer.
+	///
+	/// This process-wrap-internal phase runs after every other fallible finalizer and cleanup disarm.
+	#[doc(hidden)]
+	#[cfg(windows)]
+	fn disarm_job_object_layer(&mut self) -> Result<()> {
+		Ok(())
 	}
 
 	/// Obtain a clone if possible.
@@ -296,6 +339,79 @@ impl dyn ChildWrapper + '_ {
 
 	fn is_raw_child(&self) -> bool {
 		self.downcast_ref::<Child>().is_some()
+	}
+
+	/// Find the first Windows process-handle capability in this wrapper chain.
+	///
+	/// Unlike [`ChildWrapper::process_handle`], this traverses legacy transparent layers which do not
+	/// explicitly delegate the capability. It returns `None` at a self-terminal custom child.
+	#[cfg(windows)]
+	pub fn try_process_handle(&self) -> Option<BorrowedHandle<'_>> {
+		let mut inner = self;
+		loop {
+			if let Some(handle) = inner.process_handle() {
+				return Some(handle);
+			}
+
+			let next = inner.inner();
+			if same_child(inner, next) {
+				return None;
+			}
+			inner = next;
+		}
+	}
+
+	/// Try the first exact post-assignment resume capability in this wrapper chain.
+	///
+	/// Returns `None` only when no layer owns an exact primary-thread resume operation, allowing callers
+	/// to use a thread-enumeration compatibility fallback. A returned `Some(Err(_))` is authoritative
+	/// and must fail the lifecycle rather than fall back.
+	#[cfg(windows)]
+	pub fn try_resume_after_job_assignment(&mut self) -> Option<Result<()>> {
+		let mut inner = self;
+		loop {
+			if let Some(result) = inner.resume_after_job_assignment() {
+				return Some(result);
+			}
+
+			let inner_type = (&*inner as &dyn Any).type_id();
+			let inner_ptr = std::ptr::from_mut(inner);
+			let next = inner.inner_mut();
+			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
+				&& inner_type == (&*next as &dyn Any).type_id()
+			{
+				return None;
+			}
+			inner = next;
+		}
+	}
+
+	#[cfg(windows)]
+	fn visit_spawn_layers(
+		&mut self,
+		mut visit: impl FnMut(&mut dyn ChildWrapper) -> Result<()>,
+	) -> Result<()> {
+		let mut inner = self;
+		loop {
+			visit(inner)?;
+
+			let inner_type = (&*inner as &dyn Any).type_id();
+			let inner_ptr = std::ptr::from_mut(inner);
+			let next = inner.inner_mut();
+			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
+				&& inner_type == (&*next as &dyn Any).type_id()
+			{
+				return Ok(());
+			}
+			inner = next;
+		}
+	}
+
+	#[cfg(windows)]
+	pub(crate) fn finalize_spawn(&mut self) -> Result<()> {
+		self.visit_spawn_layers(|inner| inner.finalize_spawn_layer())?;
+		self.visit_spawn_layers(|inner| inner.disarm_spawn_cleanup_layer())?;
+		self.visit_spawn_layers(|inner| inner.disarm_job_object_layer())
 	}
 
 	/// Try to obtain a reference to the underlying native [`Child`].
