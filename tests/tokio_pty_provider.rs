@@ -17,7 +17,7 @@ use std::{
 	io,
 	panic::{AssertUnwindSafe, catch_unwind, panic_any},
 	sync::{Arc, Mutex},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use nix::libc;
@@ -77,6 +77,36 @@ impl CommandWrapper for Transparent {
 }
 
 #[derive(Debug)]
+struct SecondTransparentChild(Box<dyn ChildWrapper>);
+
+impl ChildWrapper for SecondTransparentChild {
+	fn inner(&self) -> &dyn ChildWrapper {
+		self.0.as_ref()
+	}
+
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+		self.0.as_mut()
+	}
+
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+		self.0
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SecondTransparent;
+
+impl CommandWrapper for SecondTransparent {
+	fn wrap_child(
+		&mut self,
+		child: Box<dyn ChildWrapper>,
+		_command: &Command,
+	) -> io::Result<Box<dyn ChildWrapper>> {
+		Ok(Box::new(SecondTransparentChild(child)))
+	}
+}
+
+#[derive(Debug)]
 struct TerminalChild;
 
 impl ChildWrapper for TerminalChild {
@@ -114,9 +144,15 @@ async fn controller_traversal_preserves_outer_wrappers_in_either_order() -> io::
 			command.args(["-c", "printf wrapped"]);
 		});
 		if pty_first {
-			command.wrap(Pty::default()).wrap(Transparent);
+			command
+				.wrap(Pty::default())
+				.wrap(Transparent)
+				.wrap(SecondTransparent);
 		} else {
-			command.wrap(Transparent).wrap(Pty::default());
+			command
+				.wrap(Transparent)
+				.wrap(SecondTransparent)
+				.wrap(Pty::default());
 		}
 
 		let mut child = command.spawn()?;
@@ -176,6 +212,80 @@ async fn controller_is_committed_after_post_spawn_hooks() -> io::Result<()> {
 	);
 	let controller = controller(&mut child);
 	assert_eq!(output(child.as_mut(), controller).await?, b"committed");
+	Ok(())
+}
+
+#[derive(Debug)]
+struct InspectWrap {
+	called: Arc<Mutex<bool>>,
+}
+
+impl CommandWrapper for InspectWrap {
+	fn wrap_child(
+		&mut self,
+		mut child: Box<dyn ChildWrapper>,
+		_command: &Command,
+	) -> io::Result<Box<dyn ChildWrapper>> {
+		assert!(child.take_pty_controller().is_none());
+		*self
+			.called
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+		Ok(child)
+	}
+}
+
+#[tokio::test]
+async fn controller_is_committed_after_child_wrapping_hooks() -> io::Result<()> {
+	let called = Arc::new(Mutex::new(false));
+	let mut command = Command::with_new("sh", |command| {
+		command.args(["-c", "printf wrapped-commit"]);
+	});
+	command.wrap(Pty::default()).wrap(InspectWrap {
+		called: Arc::clone(&called),
+	});
+
+	let mut child = command.spawn()?;
+	assert!(
+		*called
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+	);
+	let controller = controller(&mut child);
+	assert_eq!(output(child.as_mut(), controller).await?, b"wrapped-commit");
+	Ok(())
+}
+
+#[derive(Debug)]
+struct SpawnPostAttempt;
+
+impl CommandWrapper for SpawnPostAttempt {
+	fn post_spawn(
+		&mut self,
+		attempt: &mut SpawnAttempt,
+		_child: &mut dyn ChildWrapper,
+		_command: &Command,
+	) -> io::Result<()> {
+		let mut probe = attempt.native_mut().spawn()?;
+		loop {
+			if probe.try_wait()?.is_some() {
+				return Ok(());
+			}
+			std::thread::yield_now();
+		}
+	}
+}
+
+#[tokio::test]
+async fn provider_setup_is_absent_from_post_spawn_native_attempt() -> io::Result<()> {
+	let mut command = Command::with_new("sh", |command| {
+		command.args(["-c", "exit 0"]);
+	});
+	command.wrap(Pty::default()).wrap(SpawnPostAttempt);
+
+	let mut child = command.spawn()?;
+	let controller = controller(&mut child);
+	assert!(output(child.as_mut(), controller).await?.is_empty());
 	Ok(())
 }
 
@@ -344,6 +454,149 @@ fn assert_reaped(pid: u32) {
 		io::Error::last_os_error().raw_os_error(),
 		Some(libc::ECHILD)
 	);
+}
+
+#[derive(Debug)]
+struct ReapThenFail {
+	pid: Arc<Mutex<Option<u32>>>,
+}
+
+impl CommandWrapper for ReapThenFail {
+	fn post_spawn(
+		&mut self,
+		_attempt: &mut SpawnAttempt,
+		child: &mut dyn ChildWrapper,
+		_command: &Command,
+	) -> io::Result<()> {
+		*self
+			.pid
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner) = child.id();
+		loop {
+			if child.try_wait()?.is_some() {
+				return Err(io::Error::other("fail after reaping PTY child"));
+			}
+			std::thread::yield_now();
+		}
+	}
+}
+
+#[tokio::test]
+async fn transaction_observes_a_child_reaped_by_a_hook() {
+	let pid = Arc::new(Mutex::new(None));
+	let mut command = Command::with_new("sh", |command| {
+		command.args(["-c", "exit 0"]);
+	});
+	command.wrap(Pty::default()).wrap(ReapThenFail {
+		pid: Arc::clone(&pid),
+	});
+
+	assert_eq!(
+		command.spawn().unwrap_err().to_string(),
+		"fail after reaping PTY child"
+	);
+	let pid = pid
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.expect("the hook records the direct child before reaping it");
+	assert_reaped(pid);
+}
+
+#[derive(Debug)]
+struct FailAfterDescendantStarts {
+	pid_file: std::path::PathBuf,
+	direct_pid: Arc<Mutex<Option<u32>>>,
+	descendant_pid: Arc<Mutex<Option<i32>>>,
+}
+
+impl CommandWrapper for FailAfterDescendantStarts {
+	fn post_spawn(
+		&mut self,
+		_attempt: &mut SpawnAttempt,
+		child: &mut dyn ChildWrapper,
+		_command: &Command,
+	) -> io::Result<()> {
+		*self
+			.direct_pid
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner) = child.id();
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while !self.pid_file.exists() {
+			if Instant::now() >= deadline {
+				return Err(io::Error::new(
+					io::ErrorKind::TimedOut,
+					"PTY descendant did not report its PID",
+				));
+			}
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		let pid = std::fs::read_to_string(&self.pid_file)?
+			.trim()
+			.parse()
+			.map_err(io::Error::other)?;
+		*self
+			.descendant_pid
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pid);
+		Err(io::Error::other("fail with a live PTY descendant"))
+	}
+}
+
+fn assert_process_disappears(pid: i32) {
+	let deadline = Instant::now() + Duration::from_secs(5);
+	loop {
+		// SAFETY: signal zero only queries whether a process with this PID exists.
+		if unsafe { libc::kill(pid, 0) } == -1
+			&& io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+		{
+			return;
+		}
+		assert!(
+			Instant::now() < deadline,
+			"PTY descendant {pid} survived transaction rollback"
+		);
+		std::thread::sleep(Duration::from_millis(10));
+	}
+}
+
+#[tokio::test]
+async fn transaction_kills_the_live_pty_group_after_hook_failure() -> io::Result<()> {
+	let directory = tempfile::tempdir()?;
+	let pid_file = directory.path().join("descendant-pid");
+	let direct_pid = Arc::new(Mutex::new(None));
+	let descendant_pid = Arc::new(Mutex::new(None));
+	let mut command = Command::with_new("sh", |command| {
+		command
+			.args([
+				"-c",
+				"trap '' HUP TERM; sleep 30 & printf '%s' $! > \"$1\"; wait",
+				"pty-test",
+			])
+			.arg(&pid_file);
+	});
+	command
+		.wrap(Pty::default())
+		.wrap(FailAfterDescendantStarts {
+			pid_file,
+			direct_pid: Arc::clone(&direct_pid),
+			descendant_pid: Arc::clone(&descendant_pid),
+		});
+
+	assert_eq!(
+		command.spawn().unwrap_err().to_string(),
+		"fail with a live PTY descendant"
+	);
+	let direct_pid = direct_pid
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.expect("the hook records the direct child");
+	assert_reaped(direct_pid);
+	let descendant_pid = descendant_pid
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.expect("the hook records the descendant child");
+	assert_process_disappears(descendant_pid);
+	Ok(())
 }
 
 #[tokio::test]
