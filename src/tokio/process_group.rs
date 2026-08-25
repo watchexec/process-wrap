@@ -146,10 +146,10 @@ impl ChildWrapper for ProcessGroupChild {
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn start_kill(&mut self) -> Result<()> {
-		if matches!(self.exit_status, ChildExitStatus::Running)
-			&& let Some(status) = self.inner.try_wait()?
-		{
-			self.exit_status = ChildExitStatus::Exited(status);
+		if matches!(self.exit_status, ChildExitStatus::Running) {
+			if let Some(status) = self.inner.try_wait()? {
+				self.exit_status = ChildExitStatus::Exited(status);
+			}
 		}
 		self.signal_imp(Signal::SIGKILL)
 	}

@@ -335,10 +335,10 @@ fn terminate_and_reap(child: &Mutex<tokio::process::Child>) -> io::Result<()> {
 
 	// Kill the direct child independently in case process-group signalling was unavailable. Holding the
 	// only operational child lock keeps wait/kill state synchronized with every PTY child capability.
-	if let Err(error) = child.start_kill()
-		&& error.kind() != io::ErrorKind::InvalidInput
-	{
-		return Err(error);
+	if let Err(error) = child.start_kill() {
+		if error.kind() != io::ErrorKind::InvalidInput {
+			return Err(error);
+		}
 	}
 
 	loop {
