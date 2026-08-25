@@ -24,8 +24,6 @@ use std::{
 	task::{Context, Poll, ready},
 };
 
-#[cfg(target_os = "openbsd")]
-use nix::pty::openpty;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use nix::pty::ptsname_r;
 #[cfg(any(
@@ -68,6 +66,11 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, unix::AsyncFd};
 
 use super::{ControllerSlot, ProviderProduct, PtyChild, PtyController, PtySize, SpawnAttempt};
 use crate::SpawnTransaction;
+
+#[cfg(any(target_os = "openbsd", all(test, target_os = "linux")))]
+mod descriptor_pair;
+#[cfg(target_os = "openbsd")]
+mod openbsd;
 
 type Master = Arc<AsyncFd<OwnedFd>>;
 
@@ -353,11 +356,12 @@ fn terminate_and_reap(child: &Mutex<tokio::process::Child>) -> io::Result<()> {
 #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
 fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC)?;
-	set_close_on_exec(&master)?;
+	verify_close_on_exec(&master)?;
 	set_nonblocking(&master)?;
 	grantpt(&master)?;
 	unlockpt(&master)?;
 	let slave = open_slave(&master)?;
+	verify_close_on_exec(&slave)?;
 	// SAFETY: ownership moves from PtyMaster into exactly one OwnedFd.
 	let master = unsafe { OwnedFd::from_raw_fd(master.into_raw_fd()) };
 	set_size(&master, size)?;
@@ -371,7 +375,7 @@ fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 		OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC,
 		Mode::empty(),
 	)?;
-	set_close_on_exec(&master)?;
+	verify_close_on_exec(&master)?;
 	set_nonblocking(&master)?;
 	// SAFETY: the descriptor is an open PTY master and remains owned for both calls.
 	if unsafe { libc::grantpt(master.as_raw_fd()) } == -1
@@ -380,6 +384,7 @@ fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 		return Err(io::Error::last_os_error());
 	}
 	let slave = open_solarish_slave(&master)?;
+	verify_close_on_exec(&slave)?;
 	set_size(&master, size)?;
 	Ok((master, slave))
 }
@@ -398,11 +403,12 @@ fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 		}
 		Err(error) => return Err(io::Error::from(error)),
 	};
-	set_close_on_exec(&master)?;
+	verify_close_on_exec(&master)?;
 	set_nonblocking(&master)?;
 	grantpt(&master)?;
 	unlockpt(&master)?;
 	let slave = open_bsd_slave(&master)?;
+	verify_close_on_exec(&slave)?;
 	// SAFETY: ownership moves from PtyMaster into exactly one OwnedFd.
 	let master = unsafe { OwnedFd::from_raw_fd(master.into_raw_fd()) };
 	set_size(&master, size)?;
@@ -411,16 +417,16 @@ fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 
 #[cfg(target_os = "openbsd")]
 fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
-	let size = winsize(size);
-	let pair = openpty(Some(&size), None)?;
-	set_close_on_exec(&pair.master)?;
-	set_close_on_exec(&pair.slave)?;
-	set_nonblocking(&pair.master)?;
-	Ok((pair.master, pair.slave))
+	openbsd::open_pty(size)
 }
 
-fn set_close_on_exec(fd: &impl AsFd) -> io::Result<()> {
-	fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+fn verify_close_on_exec(fd: &impl AsFd) -> io::Result<()> {
+	let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD)?);
+	if !flags.contains(FdFlag::FD_CLOEXEC) {
+		return Err(io::Error::other(
+			"the PTY descriptor was not created close-on-exec",
+		));
+	}
 	Ok(())
 }
 
