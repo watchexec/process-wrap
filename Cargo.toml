@@ -60,6 +60,7 @@ pty = [
     "dep:windows",
     "windows/Win32_Globalization",
     "windows/Win32_System_Environment",
+    "windows/Win32_System_Threading",
 ]
 
 ## Wrapper: Creation Flags
