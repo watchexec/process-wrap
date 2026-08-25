@@ -1,16 +1,40 @@
 use std::{
 	io,
 	pin::Pin,
-	sync::{
-		Arc, Mutex,
-		atomic::{AtomicBool, Ordering},
-	},
 	task::{Context, Poll},
+};
+
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
+use std::sync::{
+	Arc, Mutex,
+	atomic::{AtomicBool, Ordering},
 };
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::{ChildWrapper, Command, CommandWrapper, ProviderProduct, SpawnAttempt, SpawnProvider};
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
+use super::ChildWrapper;
+use super::{Command, CommandWrapper, ProviderProduct, SpawnAttempt, SpawnProvider};
 
 #[cfg(any(
 	target_os = "android",
@@ -326,12 +350,34 @@ impl PtyController {
 	}
 }
 
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
 #[derive(Debug)]
 pub(super) struct ControllerSlot {
 	controller: Mutex<Option<PtyController>>,
 	committed: AtomicBool,
 }
 
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
 impl ControllerSlot {
 	pub(super) fn new(controller: PtyController) -> Self {
 		Self {
@@ -362,18 +408,51 @@ impl ControllerSlot {
 	}
 }
 
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
 #[derive(Debug)]
 pub(super) struct PtyChild {
 	inner: Box<dyn ChildWrapper>,
 	controller: Arc<ControllerSlot>,
 }
 
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
 impl PtyChild {
 	pub(super) fn new(inner: Box<dyn ChildWrapper>, controller: Arc<ControllerSlot>) -> Self {
 		Self { inner, controller }
 	}
 }
 
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
 impl ChildWrapper for PtyChild {
 	fn inner(&self) -> &dyn ChildWrapper {
 		self.inner.as_ref()

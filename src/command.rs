@@ -1464,7 +1464,20 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// platform setup or making the portable attempt opaque.
 	///
 	/// The provider must apply every accepted portable policy itself before spawning.
-	#[cfg(feature = "pty")]
+	#[cfg(all(
+		feature = "pty",
+		any(
+			target_os = "android",
+			target_os = "dragonfly",
+			target_os = "freebsd",
+			target_os = "illumos",
+			target_os = "linux",
+			target_os = "macos",
+			target_os = "netbsd",
+			target_os = "openbsd",
+			target_os = "solaris"
+		)
+	))]
 	pub(crate) fn native_for_provider_spawn(&mut self) -> &mut B::NativeCommand {
 		self.materialize_native();
 		self.native_command_mut()
