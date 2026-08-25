@@ -1,0 +1,972 @@
+#![cfg_attr(not(any(feature = "std", feature = "tokio1")), allow(dead_code))]
+
+use std::{
+	any::Any,
+	ffi::{OsStr, OsString},
+	fmt,
+	marker::PhantomData,
+	path::{Path, PathBuf},
+	process::Stdio,
+};
+
+/// Blocking standard-library process frontend.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Blocking;
+
+/// Asynchronous Tokio process frontend.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Tokio1;
+
+mod private {
+	pub trait Sealed {}
+
+	#[cfg(feature = "std")]
+	impl Sealed for super::Blocking {}
+
+	#[cfg(feature = "tokio1")]
+	impl Sealed for super::Tokio1 {}
+}
+
+/// Backend implementation detail for [`Command`].
+#[doc(hidden)]
+pub trait Backend: private::Sealed + 'static {
+	/// The frontend's native command type.
+	type NativeCommand: NativeCommand;
+
+	/// Create the frontend-specific wrapper registry.
+	fn new_registry() -> Box<dyn Any + Send + Sync>;
+}
+
+/// Native command operations shared by the supported frontends.
+#[doc(hidden)]
+pub trait NativeCommand: fmt::Debug + Sized + 'static {
+	/// Create a command for `program`.
+	fn new(program: &OsStr) -> Self;
+
+	/// Add a regular argument.
+	fn arg(&mut self, arg: &OsStr);
+
+	/// Add a raw Windows command-line fragment.
+	#[cfg(windows)]
+	fn raw_arg(&mut self, arg: &OsStr);
+
+	/// Set an environment variable.
+	fn env(&mut self, key: &OsStr, value: &OsStr);
+
+	/// Remove an environment variable.
+	fn env_remove(&mut self, key: &OsStr);
+
+	/// Clear explicitly configured and inherited environment variables.
+	fn env_clear(&mut self);
+
+	/// Set the current directory.
+	fn current_dir(&mut self, dir: &Path);
+
+	/// Configure standard input.
+	fn stdin(&mut self, stdio: Stdio);
+
+	/// Configure standard output.
+	fn stdout(&mut self, stdio: Stdio);
+
+	/// Configure standard error.
+	fn stderr(&mut self, stdio: Stdio);
+
+	/// Get the program.
+	fn get_program(&self) -> &OsStr;
+
+	/// Get the arguments.
+	fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_>;
+
+	/// Get explicitly configured environment changes.
+	fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_>;
+
+	/// Get the current directory.
+	fn get_current_dir(&self) -> Option<&Path>;
+}
+
+#[cfg(feature = "std")]
+impl NativeCommand for std::process::Command {
+	fn new(program: &OsStr) -> Self {
+		Self::new(program)
+	}
+
+	fn arg(&mut self, arg: &OsStr) {
+		self.arg(arg);
+	}
+
+	#[cfg(windows)]
+	fn raw_arg(&mut self, arg: &OsStr) {
+		use std::os::windows::process::CommandExt;
+		CommandExt::raw_arg(self, arg);
+	}
+
+	fn env(&mut self, key: &OsStr, value: &OsStr) {
+		self.env(key, value);
+	}
+
+	fn env_remove(&mut self, key: &OsStr) {
+		self.env_remove(key);
+	}
+
+	fn env_clear(&mut self) {
+		self.env_clear();
+	}
+
+	fn current_dir(&mut self, dir: &Path) {
+		self.current_dir(dir);
+	}
+
+	fn stdin(&mut self, stdio: Stdio) {
+		self.stdin(stdio);
+	}
+
+	fn stdout(&mut self, stdio: Stdio) {
+		self.stdout(stdio);
+	}
+
+	fn stderr(&mut self, stdio: Stdio) {
+		self.stderr(stdio);
+	}
+
+	fn get_program(&self) -> &OsStr {
+		self.get_program()
+	}
+
+	fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
+		Box::new(self.get_args())
+	}
+
+	fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+		Box::new(self.get_envs())
+	}
+
+	fn get_current_dir(&self) -> Option<&Path> {
+		self.get_current_dir()
+	}
+}
+
+#[cfg(feature = "tokio1")]
+impl NativeCommand for tokio::process::Command {
+	fn new(program: &OsStr) -> Self {
+		Self::new(program)
+	}
+
+	fn arg(&mut self, arg: &OsStr) {
+		self.arg(arg);
+	}
+
+	#[cfg(windows)]
+	fn raw_arg(&mut self, arg: &OsStr) {
+		self.raw_arg(arg);
+	}
+
+	fn env(&mut self, key: &OsStr, value: &OsStr) {
+		self.env(key, value);
+	}
+
+	fn env_remove(&mut self, key: &OsStr) {
+		self.env_remove(key);
+	}
+
+	fn env_clear(&mut self) {
+		self.env_clear();
+	}
+
+	fn current_dir(&mut self, dir: &Path) {
+		self.current_dir(dir);
+	}
+
+	fn stdin(&mut self, stdio: Stdio) {
+		self.stdin(stdio);
+	}
+
+	fn stdout(&mut self, stdio: Stdio) {
+		self.stdout(stdio);
+	}
+
+	fn stderr(&mut self, stdio: Stdio) {
+		self.stderr(stdio);
+	}
+
+	fn get_program(&self) -> &OsStr {
+		self.as_std().get_program()
+	}
+
+	fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
+		Box::new(self.as_std().get_args())
+	}
+
+	fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+		Box::new(self.as_std().get_envs())
+	}
+
+	fn get_current_dir(&self) -> Option<&Path> {
+		self.as_std().get_current_dir()
+	}
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum CommandArg {
+	Regular(OsString),
+	#[cfg(windows)]
+	Raw(OsString),
+}
+
+impl CommandArg {
+	fn value(&self) -> &OsStr {
+		match self {
+			Self::Regular(value) => value,
+			#[cfg(windows)]
+			Self::Raw(value) => value,
+		}
+	}
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum EnvChange {
+	Set(OsString, OsString),
+	Remove(OsString),
+}
+
+impl EnvChange {
+	fn key(&self) -> &OsStr {
+		match self {
+			Self::Set(key, _) | Self::Remove(key) => key,
+		}
+	}
+
+	fn value(&self) -> Option<&OsStr> {
+		match self {
+			Self::Set(_, value) => Some(value),
+			Self::Remove(_) => None,
+		}
+	}
+}
+
+#[cfg(not(windows))]
+fn env_keys_equal(left: &OsStr, right: &OsStr) -> bool {
+	left == right
+}
+
+#[cfg(windows)]
+fn env_keys_equal(left: &OsStr, right: &OsStr) -> bool {
+	use std::os::windows::ffi::OsStrExt;
+
+	#[link(name = "kernel32")]
+	unsafe extern "system" {
+		#[link_name = "CompareStringOrdinal"]
+		fn compare_string_ordinal(
+			string1: *const u16,
+			count1: i32,
+			string2: *const u16,
+			count2: i32,
+			ignore_case: i32,
+		) -> i32;
+	}
+
+	let left = left.encode_wide().collect::<Vec<_>>();
+	let right = right.encode_wide().collect::<Vec<_>>();
+	let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
+	else {
+		return false;
+	};
+
+	// SAFETY: both pointers remain valid for their explicit lengths during the call. The API does not
+	// require NUL termination when lengths are supplied.
+	unsafe { compare_string_ordinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == 2 }
+}
+
+struct EnvChanges<'a> {
+	changes: &'a [EnvChange],
+	index: usize,
+}
+
+impl<'a> Iterator for EnvChanges<'a> {
+	type Item = (&'a OsStr, Option<&'a OsStr>);
+
+	fn next(&mut self) -> Option<Self::Item> {
+		while let Some(change) = self.changes.get(self.index) {
+			self.index += 1;
+			if self.changes[self.index..]
+				.iter()
+				.any(|later| env_keys_equal(change.key(), later.key()))
+			{
+				continue;
+			}
+
+			return Some((change.key(), change.value()));
+		}
+
+		None
+	}
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CommandIntent {
+	pub(crate) program: OsString,
+	pub(crate) args: Vec<CommandArg>,
+	pub(crate) env_clear: bool,
+	pub(crate) env: Vec<EnvChange>,
+	pub(crate) current_dir: Option<PathBuf>,
+}
+
+impl CommandIntent {
+	fn new(program: impl AsRef<OsStr>) -> Self {
+		Self {
+			program: program.as_ref().to_owned(),
+			args: Vec::new(),
+			env_clear: false,
+			env: Vec::new(),
+			current_dir: None,
+		}
+	}
+
+	fn env_remove(&mut self, key: &OsStr) {
+		if self.env_clear {
+			self.env.retain(|change| !env_keys_equal(change.key(), key));
+		} else {
+			self.env.push(EnvChange::Remove(key.to_owned()));
+		}
+	}
+
+	fn get_envs(&self) -> EnvChanges<'_> {
+		EnvChanges {
+			changes: &self.env,
+			index: 0,
+		}
+	}
+
+	pub(crate) fn materialize<N: NativeCommand>(&self) -> N {
+		let mut command = N::new(&self.program);
+
+		for arg in &self.args {
+			match arg {
+				CommandArg::Regular(arg) => command.arg(arg),
+				#[cfg(windows)]
+				CommandArg::Raw(arg) => command.raw_arg(arg),
+			}
+		}
+
+		if self.env_clear {
+			command.env_clear();
+		}
+		for change in &self.env {
+			match change {
+				EnvChange::Set(key, value) => command.env(key, value),
+				EnvChange::Remove(key) => command.env_remove(key),
+			}
+		}
+
+		if let Some(dir) = &self.current_dir {
+			command.current_dir(dir);
+		}
+
+		command
+	}
+}
+
+#[derive(Debug)]
+struct NativeCommandView {
+	program: OsString,
+	args: Vec<OsString>,
+	env: Vec<(OsString, Option<OsString>)>,
+	current_dir: Option<PathBuf>,
+}
+
+impl NativeCommandView {
+	fn capture<N: NativeCommand>(command: &N) -> Self {
+		Self {
+			program: command.get_program().to_owned(),
+			args: command.get_args().map(OsStr::to_owned).collect(),
+			env: command
+				.get_envs()
+				.map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+				.collect(),
+			current_dir: command.get_current_dir().map(Path::to_owned),
+		}
+	}
+
+	fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
+		Box::new(self.args.iter().map(OsString::as_os_str))
+	}
+
+	fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+		Box::new(
+			self.env
+				.iter()
+				.map(|(key, value)| (key.as_os_str(), value.as_deref())),
+		)
+	}
+}
+
+struct NativeOnlyCommand<N> {
+	command: Option<N>,
+	view: NativeCommandView,
+}
+
+impl<N: NativeCommand> NativeOnlyCommand<N> {
+	fn new(command: N) -> Self {
+		Self {
+			view: NativeCommandView::capture(&command),
+			command: Some(command),
+		}
+	}
+
+	fn command_mut(&mut self) -> &mut N {
+		self.command
+			.as_mut()
+			.expect("native command access cannot occur while a spawn lifecycle is active")
+	}
+
+	fn take(&mut self) -> N {
+		let command = self
+			.command
+			.take()
+			.expect("a native-only command is present when its spawn lifecycle begins");
+		self.view = NativeCommandView::capture(&command);
+		command
+	}
+
+	fn restore(&mut self, command: N) {
+		debug_assert!(self.command.is_none());
+		self.command = Some(command);
+	}
+
+	fn into_command(self) -> N {
+		self.command
+			.expect("a command cannot be consumed while its spawn lifecycle is active")
+	}
+}
+
+impl<N: fmt::Debug> fmt::Debug for NativeOnlyCommand<N> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("NativeOnly")
+			.field("command", &self.command)
+			.field("view", &self.view)
+			.finish()
+	}
+}
+
+enum CommandState<N> {
+	Tracked(CommandIntent),
+	NativeOnly(NativeOnlyCommand<N>),
+}
+
+impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Tracked(intent) => f.debug_tuple("Tracked").field(intent).finish(),
+			Self::NativeOnly(command) => command.fmt(f),
+		}
+	}
+}
+
+/// A configurable process command with composable wrappers.
+///
+/// The backend type is normally selected through `process_wrap::std::Command` or
+/// `process_wrap::tokio::Command`. Command construction and configuration are shared; spawning and
+/// child behavior remain specific to the selected frontend.
+pub struct Command<B: Backend> {
+	state: CommandState<B::NativeCommand>,
+	wrappers: Box<dyn Any + Send + Sync>,
+	backend: PhantomData<fn() -> B>,
+}
+
+impl<B: Backend> fmt::Debug for Command<B> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Command")
+			.field("state", &self.state)
+			.finish_non_exhaustive()
+	}
+}
+
+impl<B: Backend> Command<B> {
+	/// Create a command for `program`.
+	pub fn new(program: impl AsRef<OsStr>) -> Self {
+		Self {
+			state: CommandState::Tracked(CommandIntent::new(program)),
+			wrappers: B::new_registry(),
+			backend: PhantomData,
+		}
+	}
+
+	/// Create a command and configure it with a closure.
+	pub fn with_new(program: impl AsRef<OsStr>, init: impl FnOnce(&mut Self)) -> Self {
+		let mut command = Self::new(program);
+		init(&mut command);
+		command
+	}
+
+	/// Get a compatibility view of this process-wrap command.
+	pub fn command(&self) -> &Self {
+		self
+	}
+
+	/// Get a mutable compatibility view of this process-wrap command.
+	pub fn command_mut(&mut self) -> &mut Self {
+		self
+	}
+
+	/// Discard all wrappers and return this process-wrap command.
+	pub fn into_command(mut self) -> Self {
+		self.wrappers = B::new_registry();
+		self
+	}
+
+	/// Add an argument.
+	pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		let arg = arg.as_ref();
+		match &mut self.state {
+			CommandState::Tracked(intent) => intent.args.push(CommandArg::Regular(arg.to_owned())),
+			CommandState::NativeOnly(command) => command.command_mut().arg(arg),
+		}
+		self
+	}
+
+	/// Add multiple arguments.
+	pub fn args<I, S>(&mut self, args: I) -> &mut Self
+	where
+		I: IntoIterator<Item = S>,
+		S: AsRef<OsStr>,
+	{
+		for arg in args {
+			self.arg(arg);
+		}
+		self
+	}
+
+	/// Add a raw command-line fragment without quoting or escaping.
+	///
+	/// This method is only available on Windows.
+	#[cfg(windows)]
+	pub fn raw_arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		let arg = arg.as_ref();
+		match &mut self.state {
+			CommandState::Tracked(intent) => intent.args.push(CommandArg::Raw(arg.to_owned())),
+			CommandState::NativeOnly(command) => command.command_mut().raw_arg(arg),
+		}
+		self
+	}
+
+	/// Set an environment variable.
+	pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
+		let key = key.as_ref();
+		let value = value.as_ref();
+		match &mut self.state {
+			CommandState::Tracked(intent) => intent
+				.env
+				.push(EnvChange::Set(key.to_owned(), value.to_owned())),
+			CommandState::NativeOnly(command) => command.command_mut().env(key, value),
+		}
+		self
+	}
+
+	/// Set multiple environment variables.
+	pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
+	where
+		I: IntoIterator<Item = (K, V)>,
+		K: AsRef<OsStr>,
+		V: AsRef<OsStr>,
+	{
+		for (key, value) in vars {
+			self.env(key, value);
+		}
+		self
+	}
+
+	/// Remove an environment variable from the child environment.
+	pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
+		let key = key.as_ref();
+		match &mut self.state {
+			CommandState::Tracked(intent) => intent.env_remove(key),
+			CommandState::NativeOnly(command) => command.command_mut().env_remove(key),
+		}
+		self
+	}
+
+	/// Clear explicitly configured variables and prevent inheriting the parent environment.
+	pub fn env_clear(&mut self) -> &mut Self {
+		match &mut self.state {
+			CommandState::Tracked(intent) => {
+				intent.env_clear = true;
+				intent.env.clear();
+			}
+			CommandState::NativeOnly(command) => command.command_mut().env_clear(),
+		}
+		self
+	}
+
+	/// Set the child process's current directory.
+	pub fn current_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
+		let dir = dir.as_ref();
+		match &mut self.state {
+			CommandState::Tracked(intent) => intent.current_dir = Some(dir.to_owned()),
+			CommandState::NativeOnly(command) => command.command_mut().current_dir(dir),
+		}
+		self
+	}
+
+	/// Configure standard input and make the command native-only.
+	pub fn stdin(&mut self, stdio: Stdio) -> &mut Self {
+		self.native_mut().stdin(stdio);
+		self
+	}
+
+	/// Configure standard output and make the command native-only.
+	pub fn stdout(&mut self, stdio: Stdio) -> &mut Self {
+		self.native_mut().stdout(stdio);
+		self
+	}
+
+	/// Configure standard error and make the command native-only.
+	pub fn stderr(&mut self, stdio: Stdio) -> &mut Self {
+		self.native_mut().stderr(stdio);
+		self
+	}
+
+	/// Get the configured program.
+	pub fn get_program(&self) -> &OsStr {
+		match &self.state {
+			CommandState::Tracked(intent) => &intent.program,
+			CommandState::NativeOnly(command) => match &command.command {
+				Some(command) => command.get_program(),
+				None => &command.view.program,
+			},
+		}
+	}
+
+	/// Get the configured arguments.
+	pub fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
+		match &self.state {
+			CommandState::Tracked(intent) => Box::new(intent.args.iter().map(CommandArg::value)),
+			CommandState::NativeOnly(command) => match &command.command {
+				Some(command) => command.get_args(),
+				None => command.view.get_args(),
+			},
+		}
+	}
+
+	/// Get explicitly configured environment changes.
+	pub fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+		match &self.state {
+			CommandState::Tracked(intent) => Box::new(intent.get_envs()),
+			CommandState::NativeOnly(command) => match &command.command {
+				Some(command) => command.get_envs(),
+				None => command.view.get_envs(),
+			},
+		}
+	}
+
+	/// Get the configured current directory.
+	pub fn get_current_dir(&self) -> Option<&Path> {
+		match &self.state {
+			CommandState::Tracked(intent) => intent.current_dir.as_deref(),
+			CommandState::NativeOnly(command) => match &command.command {
+				Some(command) => command.get_current_dir(),
+				None => command.view.current_dir.as_deref(),
+			},
+		}
+	}
+
+	/// Mutably access the frontend's native command.
+	///
+	/// Calling this permanently makes the command native-only. Alternate portable transports cannot
+	/// recover exact portable intent after arbitrary native mutation.
+	pub fn native_mut(&mut self) -> &mut B::NativeCommand {
+		if let CommandState::Tracked(intent) = &self.state {
+			let command = intent.materialize::<B::NativeCommand>();
+			self.state = CommandState::NativeOnly(NativeOnlyCommand::new(command));
+		}
+
+		match &mut self.state {
+			CommandState::NativeOnly(command) => command.command_mut(),
+			CommandState::Tracked(_) => unreachable!("tracked command was materialized above"),
+		}
+	}
+
+	/// Consume this command and return the frontend's native command.
+	pub fn into_native(self) -> B::NativeCommand {
+		match self.state {
+			CommandState::Tracked(intent) => intent.materialize::<B::NativeCommand>(),
+			CommandState::NativeOnly(command) => command.into_command(),
+		}
+	}
+
+	pub(crate) fn from_native(command: B::NativeCommand) -> Self {
+		Self {
+			state: CommandState::NativeOnly(NativeOnlyCommand::new(command)),
+			wrappers: B::new_registry(),
+			backend: PhantomData,
+		}
+	}
+
+	pub(crate) fn registry<R: Any>(&self) -> &R {
+		self.wrappers
+			.downcast_ref()
+			.expect("the backend always creates its matching wrapper registry")
+	}
+
+	pub(crate) fn registry_mut<R: Any>(&mut self) -> &mut R {
+		self.wrappers
+			.downcast_mut()
+			.expect("the backend always creates its matching wrapper registry")
+	}
+
+	pub(crate) fn with_native<T>(
+		&mut self,
+		invoke: impl FnOnce(&mut Self, &mut B::NativeCommand) -> std::io::Result<T>,
+	) -> std::io::Result<T> {
+		match &mut self.state {
+			CommandState::Tracked(intent) => {
+				let mut native = intent.materialize::<B::NativeCommand>();
+				invoke(self, &mut native)
+			}
+			CommandState::NativeOnly(command) => {
+				let mut native = command.take();
+				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+					invoke(self, &mut native)
+				}));
+				match &mut self.state {
+					CommandState::NativeOnly(command) => command.restore(native),
+					CommandState::Tracked(_) => {
+						unreachable!("a spawn lifecycle cannot replace native-only command state")
+					}
+				}
+				match result {
+					Ok(result) => result,
+					Err(payload) => std::panic::resume_unwind(payload),
+				}
+			}
+		}
+	}
+}
+
+#[cfg(all(feature = "std", unix))]
+impl Command<Blocking> {
+	/// Set the child process's user ID and make the command native-only.
+	pub fn uid(&mut self, id: u32) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::uid(self.native_mut(), id);
+		self
+	}
+
+	/// Set the child process's group ID and make the command native-only.
+	pub fn gid(&mut self, id: u32) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::gid(self.native_mut(), id);
+		self
+	}
+
+	/// Set the child process's `argv[0]` and make the command native-only.
+	pub fn arg0(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::arg0(self.native_mut(), arg);
+		self
+	}
+
+	/// Set the child process's process group and make the command native-only.
+	pub fn process_group(&mut self, pgroup: i32) -> &mut Self {
+		use ::std::os::unix::process::CommandExt;
+		CommandExt::process_group(self.native_mut(), pgroup);
+		self
+	}
+
+	/// Register a callback to run in the child after `fork` and make the command native-only.
+	///
+	/// # Safety
+	///
+	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
+	/// operations which are valid in that constrained environment. In particular, allocating or
+	/// acquiring locks can be unsound when another thread held the corresponding state across `fork`.
+	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
+	where
+		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
+	{
+		use ::std::os::unix::process::CommandExt;
+		// SAFETY: the caller accepts the native `pre_exec` contract documented above.
+		unsafe { CommandExt::pre_exec(self.native_mut(), f) };
+		self
+	}
+}
+
+#[cfg(all(feature = "std", windows))]
+impl Command<Blocking> {
+	/// Set Windows process creation flags and make the command native-only.
+	pub fn creation_flags(&mut self, flags: u32) -> &mut Self {
+		use ::std::os::windows::process::CommandExt;
+		CommandExt::creation_flags(self.native_mut(), flags);
+		self
+	}
+}
+
+#[cfg(feature = "tokio1")]
+impl Command<Tokio1> {
+	/// Configure whether dropping the Tokio child kills it and make the command native-only.
+	pub fn kill_on_drop(&mut self, kill_on_drop: bool) -> &mut Self {
+		self.native_mut().kill_on_drop(kill_on_drop);
+		self
+	}
+}
+
+#[cfg(all(feature = "tokio1", feature = "process-group", unix))]
+pub(crate) fn tokio_process_group(command: &mut tokio::process::Command, pgroup: i32) {
+	let set_process_group = move || {
+		// SAFETY: `setpgid` is called in the child with its own PID and does not retain pointers.
+		if unsafe { nix::libc::setpgid(0, pgroup) } == -1 {
+			Err(::std::io::Error::last_os_error())
+		} else {
+			Ok(())
+		}
+	};
+	// SAFETY: the callback only invokes `setpgid`, which is valid between `fork` and `exec`.
+	unsafe { command.pre_exec(set_process_group) };
+}
+
+#[cfg(all(feature = "tokio1", unix))]
+impl Command<Tokio1> {
+	/// Set the child process's user ID and make the command native-only.
+	pub fn uid(&mut self, id: u32) -> &mut Self {
+		self.native_mut().uid(id);
+		self
+	}
+
+	/// Set the child process's group ID and make the command native-only.
+	pub fn gid(&mut self, id: u32) -> &mut Self {
+		self.native_mut().gid(id);
+		self
+	}
+
+	/// Set the child process's `argv[0]` and make the command native-only.
+	pub fn arg0(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
+		self.native_mut().arg0(arg);
+		self
+	}
+
+	/// Register a callback to run in the child after `fork` and make the command native-only.
+	///
+	/// # Safety
+	///
+	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
+	/// operations which are valid in that constrained environment. In particular, allocating or
+	/// acquiring locks can be unsound when another thread held the corresponding state across `fork`.
+	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
+	where
+		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
+	{
+		// SAFETY: the caller accepts the native `pre_exec` contract documented above.
+		unsafe { self.native_mut().pre_exec(f) };
+		self
+	}
+}
+
+#[cfg(all(feature = "tokio1", windows))]
+impl Command<Tokio1> {
+	/// Set Windows process creation flags and make the command native-only.
+	pub fn creation_flags(&mut self, flags: u32) -> &mut Self {
+		self.native_mut().creation_flags(flags);
+		self
+	}
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+	use std::{
+		ffi::{OsStr, OsString},
+		os::windows::ffi::OsStringExt,
+		path::Path,
+		process::Stdio,
+	};
+
+	use super::{CommandArg, CommandIntent, NativeCommand};
+
+	#[derive(Debug, Eq, PartialEq)]
+	enum RecordedArg {
+		Regular(OsString),
+		Raw(OsString),
+	}
+
+	#[derive(Debug)]
+	struct RecordedCommand {
+		program: OsString,
+		args: Vec<RecordedArg>,
+	}
+
+	impl NativeCommand for RecordedCommand {
+		fn new(program: &OsStr) -> Self {
+			Self {
+				program: program.to_owned(),
+				args: Vec::new(),
+			}
+		}
+
+		fn arg(&mut self, arg: &OsStr) {
+			self.args.push(RecordedArg::Regular(arg.to_owned()));
+		}
+
+		fn raw_arg(&mut self, arg: &OsStr) {
+			self.args.push(RecordedArg::Raw(arg.to_owned()));
+		}
+
+		fn env(&mut self, _key: &OsStr, _value: &OsStr) {}
+
+		fn env_remove(&mut self, _key: &OsStr) {}
+
+		fn env_clear(&mut self) {}
+
+		fn current_dir(&mut self, _dir: &Path) {}
+
+		fn stdin(&mut self, _stdio: Stdio) {}
+
+		fn stdout(&mut self, _stdio: Stdio) {}
+
+		fn stderr(&mut self, _stdio: Stdio) {}
+
+		fn get_program(&self) -> &OsStr {
+			&self.program
+		}
+
+		fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
+			Box::new(self.args.iter().map(|arg| match arg {
+				RecordedArg::Regular(value) | RecordedArg::Raw(value) => value.as_os_str(),
+			}))
+		}
+
+		fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
+			Box::new(std::iter::empty())
+		}
+
+		fn get_current_dir(&self) -> Option<&Path> {
+			None
+		}
+	}
+
+	#[test]
+	fn materialization_preserves_raw_argument_kinds_and_wtf16() {
+		let raw = OsString::from_wide(&[b' ' as u16, 0xd800, b' ' as u16]);
+		let regular_surrogate = OsString::from_wide(&[0xdfff]);
+		let intent = CommandIntent {
+			program: OsString::from("tool"),
+			args: vec![
+				CommandArg::Regular(OsString::from("regular")),
+				CommandArg::Raw(raw.clone()),
+				CommandArg::Regular(regular_surrogate.clone()),
+			],
+			env_clear: false,
+			env: Vec::new(),
+			current_dir: None,
+		};
+
+		let command = intent.materialize::<RecordedCommand>();
+
+		assert_eq!(
+			command.args,
+			[
+				RecordedArg::Regular(OsString::from("regular")),
+				RecordedArg::Raw(raw),
+				RecordedArg::Regular(regular_surrogate),
+			]
+		);
+	}
+}

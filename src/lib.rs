@@ -1,4 +1,4 @@
-//! Composable wrappers over process::Command.
+//! Composable process command wrappers.
 //!
 //! # Quick start
 //!
@@ -11,7 +11,7 @@
 //! # fn main() -> std::io::Result<()> {
 //! use process_wrap::std::*;
 //!
-//! let mut command = CommandWrap::with_new("watch", |command| { command.arg("ls"); });
+//! let mut command = Command::with_new("watch", |command| { command.arg("ls"); });
 //! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
 //! #[cfg(windows)] { command.wrap(JobObject); }
 //! let mut child = command.spawn()?;
@@ -27,42 +27,55 @@
 //!
 //! # Overview
 //!
-//! This crate provides a composable set of wrappers over `process::Command` (either from std or
-//! from Tokio). It is a more flexible and composable successor to the `command-group` crate, and is
-//! meant to be adaptable to additional use cases: for example spawning processes in PTYs currently
-//! requires a different crate (such as `pty-process`) which won't function with `command-group`.
-//! Implementing a PTY wrapper for `process-wrap` would instead keep the same API and be composable
-//! with the existing process group/session implementations.
+//! This crate provides a composable process-wrap-owned [`Command`] configuration shared by the std
+//! and Tokio frontends. It is a more flexible and composable successor to the `command-group` crate,
+//! and is meant to be adaptable to additional use cases: for example spawning processes in PTYs
+//! currently requires a different crate (such as `pty-process`) which won't function with
+//! `command-group`. Implementing a PTY wrapper for `process-wrap` would instead keep the same API and
+//! be composable with the existing process group/session implementations.
 //!
 //! # Usage
 //!
-//! The core API is [`CommandWrap`](std::CommandWrap) and [`CommandWrap`](tokio::CommandWrap),
-//! which can be constructed either directly from an existing `process::Command`:
+//! The core APIs are `process_wrap::std::Command` and `process_wrap::tokio::Command`. Both are
+//! aliases for one backend-typed command family: construction and configuration are shared, while
+//! spawning and child behavior use the selected frontend. `CommandWrap` remains an alias in both
+//! modules for compatibility.
 //!
 //! ```rust
 //! use process_wrap::std::*;
-//! use std::process::Command;
 //! let mut command = Command::new("ls");
 //! command.arg("-l");
-//! let mut command = CommandWrap::from(command);
 //! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
 //! #[cfg(windows)] { command.wrap(JobObject); }
 //! ```
 //!
-//! ...or with a somewhat more ergonomic closure pattern:
+//! The closure constructor remains available, and its inferred argument is now process-wrap's
+//! command:
 //!
 //! ```rust
 //! use process_wrap::std::*;
-//! let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
+//! let mut command = Command::with_new("ls", |command| { command.arg("-l"); });
 //! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
 //! #[cfg(windows)] { command.wrap(JobObject); }
 //! ```
+//!
+//! Existing native commands can still be converted with `Command::from`. They retain exact native
+//! behavior but are native-only: alternate portable transports cannot reconstruct arbitrary native
+//! state. `native_mut()` is the explicit mutable escape hatch, and `into_native()` consumes the
+//! process-wrap command when the rest of its lifecycle belongs to the native API. Stable native
+//! configuration methods remain on the facade where their behavior can be preserved and make the
+//! command native-only. The standard library's supplementary-groups setter remains unstable and is
+//! not mirrored by the facade. Tokio's process-group setter is likewise omitted at the declared Tokio
+//! floor because it cannot exactly replace process-group state already stored in a native-only Tokio
+//! command. Use `ProcessGroup` for tracked Tokio commands, or configure a `std::process::Command`
+//! before converting it into Tokio and process-wrap. An immutable Tokio `as_std()` view requires the
+//! explicit `native_mut().as_std()` transition; Tokio 1.38.2 has no mutable inner-std accessor.
 //!
 //! If targetting a single platform, then a fluent style is possible:
 //!
 //! ```rust
 //! use process_wrap::std::*;
-//! CommandWrap::with_new("ls", |command| { command.arg("-l"); })
+//! Command::with_new("ls", |command| { command.arg("-l"); })
 //!    .wrap(ProcessGroup::leader());
 //! ```
 //!
@@ -89,7 +102,7 @@
 //!
 //! ```rust
 //! use process_wrap::tokio::*;
-//! let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
+//! let mut command = Command::with_new("ls", |command| { command.arg("-l"); });
 //! command.wrap(KillOnDrop);
 //! ```
 //!
@@ -97,7 +110,7 @@
 //!
 //! ```rust,ignore
 //! use process_wrap::std::*;
-//! let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
+//! let mut command = Command::with_new("ls", |command| { command.arg("-l"); });
 //! command.wrap(CreationFlags(CREATE_NO_WINDOW));
 //! ```
 //!
@@ -109,12 +122,12 @@
 //! # Extension
 //!
 //! The crate is designed to be extensible, and new wrappers can be added by implementing the
-//! required traits. The std and Tokio sides are completely separate, due to the different
-//! underlying APIs. Of course you can (and should) re-use/share code wherever possible if
-//! implementing both.
+//! required traits. Command configuration is shared, but std and Tokio wrapper traits remain
+//! separate because their spawn and child APIs differ. Re-use shared policy code when implementing
+//! both frontends.
 //!
-//! At minimum, you must implement [`CommandWrapper`](crate::std::CommandWrapper) and/or
-//! [`CommandWrapper`](crate::tokio::CommandWrapper). These provide the same functionality
+//! At minimum, you must implement `process_wrap::std::CommandWrapper` and/or
+//! `process_wrap::tokio::CommandWrapper`. These provide the same functionality
 //! (and indeed internally are generated using a common macro), but differ in the exact types used.
 //! Here's the most basic impl (shown for Tokio):
 //!
@@ -132,19 +145,19 @@
 //!   incorporate all or part of the second, concretely typed wrapper. By default, this does nothing
 //!   (that is, only the first registered wrapper instance of a type applies).
 //!
-//! - **`fn pre_spawn(&mut self, command: &mut Command, core: &CommandWrap)`** is called before
-//!   the command is spawned, and gives mutable access to it. It also gives mutable access to the
-//!   wrapper instance, so state can be stored if needed. The `core` reference gives access to data
-//!   from other wrappers; for example, that's how `CreationFlags` on Windows works along with
-//!   `JobObject`. By default does nothing.
+//! - **`fn pre_spawn(&mut self, command: &mut tokio::process::Command, core: &Command)`** is called
+//!   before the command is spawned, and gives mutable access to that attempt's native command. It
+//!   also gives mutable access to the wrapper instance, so state can be stored if needed. The `core`
+//!   reference gives access to data from other wrappers; for example, that's how `CreationFlags` on
+//!   Windows works along with `JobObject`. By default does nothing.
 //!
-//! - **`fn post_spawn(&mut self, child: &mut tokio::process::Child, core: &CommandWrap)`** is
-//!   called after spawn, and should be used for any necessary cleanups. It is offered for
+//! - **`fn post_spawn(&mut self, command: &mut tokio::process::Command, child: &mut tokio::process::Child, core: &Command)`**
+//!   is called after spawn, and should be used for any necessary cleanups. It is offered for
 //!   completeness but is expected to be less used than `wrap_child()`. By default does nothing.
 //!
-//! - **`fn wrap_child(&mut self, child: Box<dyn TokioChildWrapper>, core: &CommandWrap)`** is
+//! - **`fn wrap_child(&mut self, child: Box<dyn ChildWrapper>, core: &Command)`** is
 //!   called after all `post_spawn()`s have run. If your wrapper needs to override the methods on
-//!   Child, then it should create an instance of its own type implementing `TokioChildWrapper` and
+//!   Child, then it should create an instance of its own type implementing `ChildWrapper` and
 //!   return it here. Child wraps are _in order_: you may end up with a `Foo(Bar(Child))` or a
 //!   `Bar(Foo(Child))` depending on if `.wrap(Foo).wrap(Bar)` or `.wrap(Bar).wrap(Foo)` was called.
 //!   If your functionality is order-dependent, make sure to specify so in your documentation! By
@@ -193,7 +206,7 @@
 //! when calling `.wait()` on the `ChildWrapper`.
 //!
 //! ```rust
-//! # use process_wrap::std::{ChildWrapper, CommandWrap, CommandWrapper};
+//! # use process_wrap::std::{ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper};
 //! # use std::{
 //! #     fs::File,
 //! #     io, mem,
@@ -280,56 +293,22 @@
 //! }
 //! ```
 //!
-//! Now we're cleaning up after ourselves, but there is one last issue: if you actually call
-//! `.wait()`, then your program will deadlock! This is because `io::copy` copies data until `rx`
-//! returns an EOF, but that only happens after *all* copies of `tx` are dropped. Currently, our
-//! `Command` is holding onto `tx` even after calling `.spawn()`, so unless we manually drop the
-//! `Command` (freeing both copies of `tx`) before calling `.wait()`, our program will deadlock!
-//! We can fix this by telling `Command` to drop `tx` right after spawning the child — by this
-//! point, the `ChildWrapper` will have already inherited the copies of `tx` that it needs, so
-//! dropping `tx` from `Command` should be totally safe. We'll get `Command` to "drop" `tx` by
-//! setting its `stdin` and `stdout` to `Stdio::null()` in `CommandWrapper::post_spawn()`.
-//!
-//! ```rust
-//! # use process_wrap::std::{CommandWrap, CommandWrapper};
-//! # use std::{
-//! #     io,
-//! #     path::PathBuf,
-//! #     process::{Child, Command, Stdio},
-//! #     thread::JoinHandle,
-//! # };
-//! # #[derive(Debug)]
-//! # struct LogFile {
-//! #     path: PathBuf,
-//! #     thread: Option<JoinHandle<()>>,
-//! # }
-//! #
-//! impl CommandWrapper for LogFile {
-//!     // ... snip ...
-//!     fn post_spawn(
-//!         &mut self,
-//!         command: &mut Command,
-//!         _child: &mut Child,
-//!         _core: &CommandWrap,
-//!     ) -> io::Result<()> {
-//!         command.stdout(Stdio::null()).stderr(Stdio::null());
-//!
-//!         Ok(())
-//!     }
-//!     // ... snip ...
-//! }
-//! ```
+//! The tracked process-wrap command does not retain the `tx` handles from this hook. Each spawn uses
+//! a fresh native attempt command, and that attempt is dropped before `spawn()` returns. The child has
+//! already inherited the descriptors it needs, so the background reader sees EOF once the child and
+//! its descendants release their copies. Native-only commands retain their native command state by
+//! definition; wrappers which install one-attempt resources should therefore use tracked commands.
 //!
 //! Finally, we can test that our new command-wrapper works:
 //!
 //! ```rust
-//! # use process_wrap::std::{ChildWrapper, CommandWrap, CommandWrapper};
+//! # use process_wrap::std::{ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper};
 //! # use std::{
 //! #     error::Error,
 //! #     fs::{self, File},
 //! #     io, mem,
 //! #     path::PathBuf,
-//! #     process::{Child, Command, ExitStatus, Stdio},
+//! #     process::{Child, Command, ExitStatus},
 //! #     thread::{self, JoinHandle},
 //! # };
 //! # use tempfile::NamedTempFile;
@@ -358,17 +337,6 @@
 //! #         }));
 //! #
 //! #         command.stdout(tx.try_clone()?).stderr(tx);
-//! #         Ok(())
-//! #     }
-//! #
-//! #     fn post_spawn(
-//! #         &mut self,
-//! #         command: &mut Command,
-//! #         _child: &mut Child,
-//! #         _core: &CommandWrap,
-//! #     ) -> io::Result<()> {
-//! #         command.stdout(Stdio::null()).stderr(Stdio::null());
-//! #
 //! #         Ok(())
 //! #     }
 //! #
@@ -424,11 +392,11 @@
 //! #
 //! fn main() -> Result<(), Box<dyn Error>> {
 //!     #[cfg(windows)]
-//!     let mut command = CommandWrap::with_new("cmd", |command| {
+//!     let mut command = WrappedCommand::with_new("cmd", |command| {
 //!         command.args(["/c", "echo Hello && echo World 1>&2"]);
 //!     });
 //!     #[cfg(unix)]
-//!     let mut command = CommandWrap::with_new("sh", |command| {
+//!     let mut command = WrappedCommand::with_new("sh", |command| {
 //!         command.args(["-c", "echo Hello && echo World 1>&2"]);
 //!     });
 //!
@@ -472,7 +440,12 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
+mod command;
 pub(crate) mod generic_wrap;
+
+pub use command::Command;
+#[doc(hidden)]
+pub use command::{Backend, Blocking, NativeCommand, Tokio1};
 
 #[cfg(feature = "std")]
 pub mod std;
