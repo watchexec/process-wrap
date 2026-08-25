@@ -372,6 +372,30 @@ async fn kill_and_start_kill_preserve_repeated_waits() -> io::Result<()> {
 	Ok(())
 }
 
+#[tokio::test]
+async fn cancelling_wait_preserves_child_ownership() -> io::Result<()> {
+	let mut command = Command::new("sh");
+	command.args(["-c", "stty -echo; printf ready; sleep 30"]);
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
+	let (input, mut output, _resize) = controller.into_parts();
+	let mut ready = [0; 5];
+	timeout(Duration::from_secs(5), output.read_exact(&mut ready)).await??;
+	assert_eq!(&ready, b"ready");
+	drop(input);
+
+	assert!(
+		timeout(Duration::from_millis(50), child.wait())
+			.await
+			.is_err()
+	);
+	child.start_kill()?;
+	let status = timeout(Duration::from_secs(5), child.wait()).await??;
+	assert_eq!(child.try_wait()?, Some(status));
+	let mut bytes = Vec::new();
+	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
+	Ok(())
+}
+
 #[cfg(any(feature = "process-group", feature = "process-session"))]
 #[derive(Debug)]
 struct ReapBeforeChildWrapping;
