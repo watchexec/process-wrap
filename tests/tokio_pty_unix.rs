@@ -112,6 +112,23 @@ async fn passes_bidirectional_control_bytes_unchanged() -> io::Result<()> {
 }
 
 #[tokio::test]
+async fn terminal_veof_ends_canonical_input() -> io::Result<()> {
+	let mut command = Command::new("sh");
+	command.args(["-c", "stty -echo; printf ready; cat; printf eof"]);
+
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
+	let (mut input, mut output, _resize) = controller.into_parts();
+	let mut ready = [0; 5];
+	timeout(Duration::from_secs(5), output.read_exact(&mut ready)).await??;
+	assert_eq!(&ready, b"ready");
+	input.write_all(b"payload\n\x04").await?;
+	let (status, bytes) = wait_and_drain(child.as_mut(), &mut output).await?;
+	assert!(status.success());
+	assert_eq!(bytes, b"payload\r\neof");
+	Ok(())
+}
+
+#[tokio::test]
 async fn preserves_tracked_command_intent() -> io::Result<()> {
 	let directory = tempfile::tempdir()?;
 	let expected_directory = directory.path().canonicalize()?;
