@@ -76,6 +76,9 @@ mod unix;
 	target_os = "solaris"
 )))]
 mod unsupported;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod windows;
 #[cfg(any(
 	target_os = "android",
 	target_os = "dragonfly",
