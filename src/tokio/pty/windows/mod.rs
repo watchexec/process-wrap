@@ -15,6 +15,7 @@ use environment::{PreparedEnvironment, prepare_environment};
 mod api;
 pub(super) mod command;
 pub(super) mod environment;
+mod pipe;
 mod program;
 
 #[derive(Debug, Eq, PartialEq)]
