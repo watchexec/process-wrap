@@ -115,6 +115,17 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 		None
 	}
 
+	/// Return the original PID retained by this exact provider-child layer.
+	///
+	/// This internal capability lets a wrapper finish installation after an earlier post-spawn hook
+	/// observed and reaped a fast provider child. Ordinary child operations must continue to use
+	/// [`ChildWrapper::id`] so they never act on a recycled PID.
+	#[doc(hidden)]
+	#[cfg(all(unix, feature = "pty"))]
+	fn spawned_id_layer(&self) -> Option<u32> {
+		None
+	}
+
 	/// Take the PTY controller owned by this exact child layer.
 	#[doc(hidden)]
 	#[cfg(feature = "pty")]
@@ -345,6 +356,22 @@ impl dyn ChildWrapper + '_ {
 
 	fn is_raw_child(&self) -> bool {
 		self.downcast_ref::<Child>().is_some()
+	}
+
+	#[cfg(all(unix, feature = "pty"))]
+	pub(crate) fn try_spawned_id(&self) -> Option<u32> {
+		let mut inner = self;
+		loop {
+			if let Some(pid) = inner.spawned_id_layer() {
+				return Some(pid);
+			}
+
+			let next = inner.inner();
+			if same_child(inner, next) {
+				return None;
+			}
+			inner = next;
+		}
 	}
 
 	/// Take the controller installed by a PTY spawn.

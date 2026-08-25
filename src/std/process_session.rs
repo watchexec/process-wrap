@@ -1,4 +1,4 @@
-use std::io::Result;
+use std::io::{Error, Result};
 
 use nix::unistd::Pid;
 #[cfg(feature = "tracing")]
@@ -30,13 +30,16 @@ impl CommandWrapper for ProcessSession {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
-		inner: Box<dyn super::core::ChildWrapper>,
+		mut inner: Box<dyn super::core::ChildWrapper>,
 		_core: &CommandWrap,
 	) -> Result<Box<dyn super::core::ChildWrapper>> {
-		let direct_pid = Pid::from_raw(i32::try_from(inner.id()).expect("Command PID > i32::MAX"));
+		let direct_pid = Pid::from_raw(i32::try_from(inner.id()).map_err(Error::other)?);
+		let exit_status = inner.try_wait()?;
 
 		Ok(Box::new(super::ProcessGroupChild::new(
-			inner, direct_pid, direct_pid,
+			inner,
+			direct_pid,
+			exit_status,
 		)))
 	}
 }

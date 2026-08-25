@@ -436,6 +436,7 @@ impl ControllerSlot {
 #[derive(Debug)]
 pub(super) struct PtyChild {
 	child: Arc<Mutex<Child>>,
+	pid: u32,
 	controller: Arc<ControllerSlot>,
 	stdin: Option<ChildStdin>,
 	stdout: Option<ChildStdout>,
@@ -454,9 +455,14 @@ pub(super) struct PtyChild {
 	target_os = "solaris"
 ))]
 impl PtyChild {
-	pub(super) fn new(child: Arc<Mutex<Child>>, controller: Arc<ControllerSlot>) -> Self {
+	pub(super) fn new(
+		child: Arc<Mutex<Child>>,
+		pid: u32,
+		controller: Arc<ControllerSlot>,
+	) -> Self {
 		Self {
 			child,
+			pid,
 			controller,
 			stdin: None,
 			stdout: None,
@@ -533,6 +539,10 @@ impl ChildWrapper for PtyChild {
 	#[cfg(unix)]
 	fn signal(&self, sig: i32) -> io::Result<()> {
 		ChildWrapper::signal(&*self.lock_child(), sig)
+	}
+
+	fn spawned_id_layer(&self) -> Option<u32> {
+		Some(self.pid)
 	}
 
 	fn take_pty_controller_layer(&mut self) -> Option<PtyController> {

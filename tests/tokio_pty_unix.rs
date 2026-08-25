@@ -32,6 +32,8 @@ use process_wrap::tokio::ProcessSession;
 #[cfg(feature = "reset-sigmask")]
 use process_wrap::tokio::ResetSigmask;
 use process_wrap::tokio::{ChildWrapper, Command, Pty, PtyController, PtyOutput, PtySize};
+#[cfg(any(feature = "process-group", feature = "process-session"))]
+use process_wrap::tokio::{CommandWrapper, SpawnAttempt};
 #[cfg(feature = "process-group")]
 use process_wrap::tokio::{ProcessGroup, ProcessGroupChild};
 #[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
@@ -353,6 +355,71 @@ async fn kill_and_start_kill_preserve_repeated_waits() -> io::Result<()> {
 		let mut bytes = Vec::new();
 		timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
 	}
+	Ok(())
+}
+
+#[cfg(any(feature = "process-group", feature = "process-session"))]
+#[derive(Debug)]
+struct ReapBeforeChildWrapping;
+
+#[cfg(any(feature = "process-group", feature = "process-session"))]
+impl CommandWrapper for ReapBeforeChildWrapping {
+	fn post_spawn(
+		&mut self,
+		_attempt: &mut SpawnAttempt,
+		child: &mut dyn ChildWrapper,
+		_command: &Command,
+	) -> io::Result<()> {
+		loop {
+			if child.try_wait()?.is_some() {
+				return Ok(());
+			}
+			std::thread::yield_now();
+		}
+	}
+}
+
+#[cfg(feature = "process-group")]
+#[tokio::test]
+async fn process_group_wraps_a_pty_child_reaped_by_a_post_spawn_hook() -> io::Result<()> {
+	let mut command = Command::with_new("sh", |command| {
+		command.args(["-c", "exit 23"]);
+	});
+	command
+		.wrap(ProcessGroup::leader())
+		.wrap(Pty::default())
+		.wrap(ReapBeforeChildWrapping);
+
+	let mut child = command.spawn()?;
+	let controller = child
+		.take_pty_controller()
+		.expect("a successful PTY spawn installs one controller");
+	drop(controller);
+	let status = child.wait().await?;
+	assert_eq!(status.code(), Some(23));
+	assert_eq!(child.try_wait()?, Some(status));
+	Ok(())
+}
+
+#[cfg(feature = "process-session")]
+#[tokio::test]
+async fn process_session_wraps_a_pty_child_reaped_by_a_post_spawn_hook() -> io::Result<()> {
+	let mut command = Command::with_new("sh", |command| {
+		command.args(["-c", "exit 29"]);
+	});
+	command
+		.wrap(ProcessSession)
+		.wrap(Pty::default())
+		.wrap(ReapBeforeChildWrapping);
+
+	let mut child = command.spawn()?;
+	let controller = child
+		.take_pty_controller()
+		.expect("a successful PTY spawn installs one controller");
+	drop(controller);
+	let status = child.wait().await?;
+	assert_eq!(status.code(), Some(29));
+	assert_eq!(child.try_wait()?, Some(status));
 	Ok(())
 }
 

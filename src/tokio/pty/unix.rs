@@ -170,9 +170,12 @@ pub(super) fn spawn(attempt: &mut SpawnAttempt, size: PtySize) -> io::Result<Pro
 		Ok(child) => child?,
 		Err(payload) => resume_unwind(payload),
 	};
+	let pid = child
+		.id()
+		.expect("Tokio reports a process ID for a newly spawned child");
 	let child = Arc::new(Mutex::new(child));
 	let transaction = PtyTransaction::new(Arc::clone(&child), Arc::clone(&controller));
-	let child = PtyChild::new(child, controller);
+	let child = PtyChild::new(child, pid, controller);
 
 	Ok(ProviderProduct::new(Box::new(child), Box::new(transaction)))
 }
