@@ -54,7 +54,7 @@ async fn wait_and_drain(
 	Ok((status, bytes))
 }
 
-fn spawn_pty(
+fn spawn_with_terminal(
 	command: &mut Command,
 	size: PtySize,
 ) -> io::Result<(Box<dyn ChildWrapper>, PtyController)> {
@@ -74,7 +74,7 @@ async fn spawns_with_terminal_fds_and_merged_output() -> io::Result<()> {
 		"test -t 0 && printf stdin-tty; test -t 1 && printf stdout-tty; test -t 2 && printf stderr-tty >&2; printf stdout; printf stderr >&2",
 	]);
 
-	let (mut child, controller) = spawn_pty(&mut command, PtySize::default())?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
 	let (status, bytes) = wait_and_drain(child.as_mut(), &mut output).await?;
@@ -91,7 +91,7 @@ async fn passes_bidirectional_control_bytes_unchanged() -> io::Result<()> {
 		"stty raw -echo; printf ready; dd bs=1 count=4 2>/dev/null",
 	]);
 
-	let (mut child, controller) = spawn_pty(&mut command, PtySize::default())?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (mut input, mut output, _resize) = controller.into_parts();
 	let mut ready = [0; 5];
 	timeout(Duration::from_secs(5), output.read_exact(&mut ready)).await??;
@@ -130,7 +130,7 @@ async fn preserves_tracked_command_intent() -> io::Result<()> {
 		.env_remove("REMOVE")
 		.current_dir(directory.path());
 
-	let (mut child, controller) = spawn_pty(&mut command, PtySize::default())?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
 	let (status, bytes) = wait_and_drain(child.as_mut(), &mut output).await?;
@@ -154,7 +154,7 @@ async fn reports_initial_size_and_sigwinch_resize() -> io::Result<()> {
 		"stty -echo; stty size; trap 'stty size; exit 0' WINCH; printf ready; while :; do sleep 1; done",
 	]);
 
-	let (mut child, controller) = spawn_pty(&mut command, initial)?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, initial)?;
 	let (input, mut output, resize) = controller.into_parts();
 	let mut initial_output = [0; 12];
 	timeout(
@@ -194,7 +194,7 @@ async fn shutting_down_input_does_not_hang_up_while_output_exists() -> io::Resul
 	let mut command = Command::new("sh");
 	command.args(["-c", "stty -echo; printf ready; IFS= read -r line"]);
 
-	let (mut child, controller) = spawn_pty(&mut command, PtySize::default())?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (mut input, mut output, resize) = controller.into_parts();
 	let mut ready = [0; 5];
 	timeout(Duration::from_secs(5), output.read_exact(&mut ready)).await??;
@@ -223,7 +223,7 @@ async fn dropping_output_does_not_hang_up_while_input_exists() -> io::Result<()>
 	let mut command = Command::new("sh");
 	command.args(["-c", "stty -echo; printf ready; IFS= read -r line"]);
 
-	let (mut child, controller) = spawn_pty(&mut command, PtySize::default())?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (input, mut output, resize) = controller.into_parts();
 	let mut ready = [0; 5];
 	timeout(Duration::from_secs(5), output.read_exact(&mut ready)).await??;
@@ -264,7 +264,7 @@ async fn direct_child_wait_is_independent_from_descendant_output_eof() -> io::Re
 		])
 		.arg(&release);
 
-	let (mut child, controller) = spawn_pty(&mut command, PtySize::default())?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
 	let mut ready = [0; 5];
@@ -295,7 +295,7 @@ async fn failed_spawn_leaves_command_reusable() -> io::Result<()> {
 	let program = directory.path().join("created-after-first-spawn");
 	let mut command = Command::new(&program);
 	assert_eq!(
-		spawn_pty(&mut command, PtySize::default())
+		spawn_with_terminal(&mut command, PtySize::default())
 			.unwrap_err()
 			.kind(),
 		io::ErrorKind::NotFound
@@ -303,7 +303,7 @@ async fn failed_spawn_leaves_command_reusable() -> io::Result<()> {
 
 	std::fs::write(&program, "#!/bin/sh\nprintf reused")?;
 	std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
-	let (mut child, controller) = spawn_pty(&mut command, PtySize::default())?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
 	let (status, bytes) = wait_and_drain(child.as_mut(), &mut output).await?;
@@ -317,7 +317,7 @@ async fn kill_and_start_kill_preserve_repeated_waits() -> io::Result<()> {
 	for wait_in_kill in [false, true] {
 		let mut command = Command::new("sh");
 		command.args(["-c", "stty -echo; printf ready; while :; do sleep 1; done"]);
-		let (mut child, controller) = spawn_pty(&mut command, PtySize::default())?;
+		let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 		let (input, mut output, _resize) = controller.into_parts();
 		let mut ready = [0; 5];
 		timeout(Duration::from_secs(5), output.read_exact(&mut ready)).await??;
@@ -345,7 +345,7 @@ async fn assert_group_signal(mut command: Command) -> io::Result<()> {
 		"-c",
 		"stty -echo; trap '' HUP; trap 'exit 0' TERM; sleep 30 & printf ready; wait",
 	]);
-	let (mut child, controller) = spawn_pty(&mut command, PtySize::default())?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	assert_eq!(child.as_ref().type_id(), TypeId::of::<ProcessGroupChild>());
 	assert!(child.try_wait()?.is_none());
 
@@ -378,7 +378,7 @@ async fn process_group_leader_preserves_pty_group_supervision() -> io::Result<()
 async fn process_group_try_wait_keeps_native_child_synchronized() -> io::Result<()> {
 	let mut command = Command::new("sh");
 	command.args(["-c", "exit 17"]).wrap(ProcessGroup::leader());
-	let (mut child, controller) = spawn_pty(&mut command, PtySize::default())?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
 
@@ -407,7 +407,7 @@ async fn process_group_composes_when_registered_after_first_spawn() -> io::Resul
 	let mut command = Command::new("sh");
 	command.args(["-c", "printf reused"]);
 
-	let (mut child, controller) = spawn_pty(&mut command, PtySize::default())?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
 	let (status, bytes) = wait_and_drain(child.as_mut(), &mut output).await?;
@@ -415,7 +415,7 @@ async fn process_group_composes_when_registered_after_first_spawn() -> io::Resul
 	assert_eq!(bytes, b"reused");
 
 	command.wrap(ProcessGroup::leader());
-	let (mut child, controller) = spawn_pty(&mut command, PtySize::default())?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	assert_eq!(child.as_ref().type_id(), TypeId::of::<ProcessGroupChild>());
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
@@ -440,7 +440,7 @@ async fn rejects_attaching_a_pty_to_an_existing_group() {
 		let mut command = Command::new("sh");
 		command.args(["-c", "exit 0"]).wrap(group);
 		assert_eq!(
-			spawn_pty(&mut command, PtySize::default())
+			spawn_with_terminal(&mut command, PtySize::default())
 				.unwrap_err()
 				.kind(),
 			io::ErrorKind::InvalidInput
@@ -460,7 +460,7 @@ async fn rejects_explicit_group_and_session_in_either_order() {
 			command.wrap(ProcessGroup::leader()).wrap(ProcessSession);
 		}
 		assert_eq!(
-			spawn_pty(&mut command, PtySize::default())
+			spawn_with_terminal(&mut command, PtySize::default())
 				.unwrap_err()
 				.kind(),
 			io::ErrorKind::InvalidInput
@@ -482,7 +482,7 @@ async fn reset_sigmask_unblocks_signals_before_pty_setup() -> io::Result<()> {
 	command
 		.args(["-c", "test -t 0 || exit 2; kill -USR1 $$; printf survived"])
 		.wrap(ResetSigmask);
-	let spawned = spawn_pty(&mut command, PtySize::default());
+	let spawned = spawn_with_terminal(&mut command, PtySize::default());
 	sigprocmask(SigmaskHow::SIG_SETMASK, Some(&previous), None)?;
 	let (mut child, controller) = spawned?;
 
@@ -541,7 +541,7 @@ async fn kill_on_drop_remains_direct_child_only_with_a_pty_session() -> io::Resu
 		.arg(&acknowledged)
 		.wrap(ProcessSession)
 		.wrap(KillOnDrop);
-	let (child, controller) = spawn_pty(&mut command, PtySize::default())?;
+	let (child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (input, output, _resize) = controller.into_parts();
 	let mut output = BufReader::new(output);
 	let mut line = String::new();
@@ -613,7 +613,7 @@ fn validates_initial_size_before_opening_a_pty() {
 		pixel_height: 0,
 	};
 	assert_eq!(
-		spawn_pty(&mut command, size).unwrap_err().kind(),
+		spawn_with_terminal(&mut command, size).unwrap_err().kind(),
 		io::ErrorKind::InvalidInput
 	);
 }
