@@ -14,6 +14,7 @@ use environment::{PreparedEnvironment, prepare_environment};
 
 mod api;
 mod attributes;
+mod child;
 pub(super) mod command;
 mod console;
 pub(super) mod environment;
