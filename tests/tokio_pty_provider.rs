@@ -76,6 +76,37 @@ impl CommandWrapper for Transparent {
 	}
 }
 
+#[derive(Debug)]
+struct TerminalChild;
+
+impl ChildWrapper for TerminalChild {
+	fn inner(&self) -> &dyn ChildWrapper {
+		self
+	}
+
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+		self
+	}
+
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+		self
+	}
+}
+
+#[tokio::test]
+async fn non_pty_children_have_no_controller() -> io::Result<()> {
+	let mut command = Command::with_new("sh", |command| {
+		command.args(["-c", "exit 0"]);
+	});
+	let mut child = command.spawn()?;
+	assert!(child.take_pty_controller().is_none());
+	assert!(child.wait().await?.success());
+
+	let mut child = Box::new(TerminalChild) as Box<dyn ChildWrapper>;
+	assert!(child.take_pty_controller().is_none());
+	Ok(())
+}
+
 #[tokio::test]
 async fn controller_traversal_preserves_outer_wrappers_in_either_order() -> io::Result<()> {
 	for pty_first in [false, true] {
