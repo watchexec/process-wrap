@@ -89,8 +89,8 @@ dbg!(status);
 ### or in a pseudo-terminal
 
 The non-default `pty` feature enables Tokio PTY transport on Linux, Android, macOS, FreeBSD,
-NetBSD, OpenBSD, DragonFly BSD, illumos, and Solaris. It implies `tokio1`, selecting the Tokio
-frontend and its terminal dependencies explicitly.
+NetBSD 10 and newer, OpenBSD, DragonFly BSD, illumos, and Solaris. It implies `tokio1`, selecting
+the Tokio frontend and its terminal dependencies explicitly.
 
 ```toml
 [dependencies]

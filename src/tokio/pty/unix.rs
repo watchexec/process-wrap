@@ -1,6 +1,18 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "macos",
+	target_os = "netbsd"
+))]
 use std::ffi::CStr;
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "dragonfly", target_os = "illumos", target_os = "solaris"))]
+use std::ffi::CString;
+#[cfg(any(
+	target_os = "android",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "solaris"
+))]
 use std::path::Path;
 use std::{
 	io,
@@ -12,29 +24,45 @@ use std::{
 	task::{Context, Poll, ready},
 };
 
-#[cfg(any(
-	target_os = "dragonfly",
-	target_os = "freebsd",
-	target_os = "illumos",
-	target_os = "netbsd",
-	target_os = "openbsd",
-	target_os = "solaris"
-))]
+#[cfg(target_os = "openbsd")]
 use nix::pty::openpty;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use nix::pty::ptsname_r;
-#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
-use nix::{
-	fcntl::open,
-	pty::{PtyMaster, grantpt, posix_openpt, unlockpt},
-	sys::stat::Mode,
-};
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd"
+))]
+use nix::pty::{PtyMaster, grantpt, posix_openpt, unlockpt};
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+use nix::sys::stat::fstat;
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "solaris"
+))]
+use nix::{fcntl::open, sys::stat::Mode};
 use nix::{
 	fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
 	libc,
 	pty::Winsize,
 };
-#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd"
+))]
 use std::os::fd::IntoRawFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, unix::AsyncFd};
 
@@ -126,7 +154,41 @@ impl Resize {
 }
 
 pub(super) fn check_available() -> io::Result<()> {
+	#[cfg(target_os = "netbsd")]
+	check_netbsd_version()?;
 	Ok(())
+}
+
+#[cfg(target_os = "netbsd")]
+fn check_netbsd_version() -> io::Result<()> {
+	let mut name = std::mem::MaybeUninit::<libc::utsname>::uninit();
+	// SAFETY: uname initializes the complete utsname value when it succeeds.
+	if unsafe { libc::uname(name.as_mut_ptr()) } == -1 {
+		return Err(io::Error::last_os_error());
+	}
+	// SAFETY: uname succeeded, and utsname release is a NUL-terminated character array.
+	let name = unsafe { name.assume_init() };
+	let release = unsafe { CStr::from_ptr(name.release.as_ptr()) }.to_bytes();
+	let digits = release.iter().copied().take_while(u8::is_ascii_digit);
+	let mut major = None;
+	for digit in digits {
+		major = Some(
+			major
+				.unwrap_or(0_u32)
+				.checked_mul(10)
+				.and_then(|value| value.checked_add(u32::from(digit - b'0')))
+				.ok_or_else(|| {
+					io::Error::new(io::ErrorKind::InvalidData, "invalid NetBSD release")
+				})?,
+		);
+	}
+	if major.is_some_and(|major| major >= 10) {
+		return Ok(());
+	}
+	Err(io::Error::new(
+		io::ErrorKind::Unsupported,
+		"atomic PTY descriptors require NetBSD 10 or newer",
+	))
 }
 
 pub(super) fn spawn(attempt: &mut SpawnAttempt, size: PtySize) -> io::Result<ProviderProduct> {
@@ -151,20 +213,14 @@ pub(super) fn spawn(attempt: &mut SpawnAttempt, size: PtySize) -> io::Result<Pro
 	let mut command = attempt.take_native_for_provider_spawn();
 	command.kill_on_drop(kill_on_drop);
 	let spawned = catch_unwind(AssertUnwindSafe(|| {
-		with_slave_stdio(
-			&mut command,
-			slave_stdin,
-			slave_stdout,
-			slave,
-			|command| {
-				// SAFETY: the callback only invokes async-signal-safe libc functions and reports the
-				// operating system's error without accessing shared process state.
-				unsafe {
-					command.pre_exec(move || setup_child(reset_sigmask));
-				}
-				command.spawn()
-			},
-		)
+		with_slave_stdio(&mut command, slave_stdin, slave_stdout, slave, |command| {
+			// SAFETY: the callback only invokes async-signal-safe libc functions and reports the
+			// operating system's error without accessing shared process state.
+			unsafe {
+				command.pre_exec(move || setup_child(reset_sigmask));
+			}
+			command.spawn()
+		})
 	}));
 	let child = match spawned {
 		Ok(child) => child?,
@@ -214,10 +270,7 @@ struct PtyTransaction {
 }
 
 impl PtyTransaction {
-	fn new(
-		child: Arc<Mutex<tokio::process::Child>>,
-		controller: Arc<ControllerSlot>,
-	) -> Self {
+	fn new(child: Arc<Mutex<tokio::process::Child>>, controller: Arc<ControllerSlot>) -> Self {
 		Self {
 			child,
 			controller,
@@ -299,7 +352,7 @@ fn terminate_and_reap(child: &Mutex<tokio::process::Child>) -> io::Result<()> {
 
 #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
 fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
-	let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)?;
+	let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC)?;
 	set_close_on_exec(&master)?;
 	set_nonblocking(&master)?;
 	grantpt(&master)?;
@@ -311,14 +364,52 @@ fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	Ok((master, slave))
 }
 
-#[cfg(any(
-	target_os = "dragonfly",
-	target_os = "freebsd",
-	target_os = "illumos",
-	target_os = "netbsd",
-	target_os = "openbsd",
-	target_os = "solaris"
-))]
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
+	let master = open(
+		Path::new("/dev/ptmx"),
+		OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC,
+		Mode::empty(),
+	)?;
+	set_close_on_exec(&master)?;
+	set_nonblocking(&master)?;
+	// SAFETY: the descriptor is an open PTY master and remains owned for both calls.
+	if unsafe { libc::grantpt(master.as_raw_fd()) } == -1
+		|| unsafe { libc::unlockpt(master.as_raw_fd()) } == -1
+	{
+		return Err(io::Error::last_os_error());
+	}
+	let slave = open_solarish_slave(&master)?;
+	set_size(&master, size)?;
+	Ok((master, slave))
+}
+
+#[cfg(any(target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd"))]
+fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
+	let flags = OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC;
+	let master = match posix_openpt(flags) {
+		Ok(master) => master,
+		#[cfg(target_os = "netbsd")]
+		Err(nix::errno::Errno::EINVAL) => {
+			return Err(io::Error::new(
+				io::ErrorKind::Unsupported,
+				"atomic PTY descriptors require NetBSD 10 or newer",
+			));
+		}
+		Err(error) => return Err(io::Error::from(error)),
+	};
+	set_close_on_exec(&master)?;
+	set_nonblocking(&master)?;
+	grantpt(&master)?;
+	unlockpt(&master)?;
+	let slave = open_bsd_slave(&master)?;
+	// SAFETY: ownership moves from PtyMaster into exactly one OwnedFd.
+	let master = unsafe { OwnedFd::from_raw_fd(master.into_raw_fd()) };
+	set_size(&master, size)?;
+	Ok((master, slave))
+}
+
+#[cfg(target_os = "openbsd")]
 fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	let size = winsize(size);
 	let pair = openpty(Some(&size), None)?;
@@ -345,7 +436,16 @@ fn duplicate(fd: &OwnedFd) -> io::Result<OwnedFd> {
 	Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
-#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "solaris"
+))]
 fn slave_flags() -> OFlag {
 	OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC
 }
@@ -373,6 +473,84 @@ fn open_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
 	let name = CStr::from_bytes_until_nul(&name)
 		.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 	open(name, slave_flags(), Mode::empty()).map_err(io::Error::from)
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+fn open_bsd_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
+	let mut name = [0 as libc::c_char; 1024];
+	// SAFETY: name is writable for its full reported length and master is an open PTY descriptor.
+	let result = unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+	if result != 0 {
+		return Err(if result > 0 {
+			io::Error::from_raw_os_error(result)
+		} else {
+			io::Error::last_os_error()
+		});
+	}
+	// SAFETY: ptsname_r succeeded and therefore wrote a NUL-terminated path into name.
+	let name = unsafe { CStr::from_ptr(name.as_ptr()) };
+	open(name, slave_flags(), Mode::empty()).map_err(io::Error::from)
+}
+
+#[cfg(target_os = "dragonfly")]
+fn open_bsd_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
+	// DragonFly's ptsname storage is thread-local. Copy it before making another libc call.
+	// SAFETY: master is an open, granted and unlocked PTY descriptor.
+	let name = unsafe { libc::ptsname(master.as_raw_fd()) };
+	if name.is_null() {
+		return Err(io::Error::last_os_error());
+	}
+	// SAFETY: a non-null result from ptsname points to a NUL-terminated path.
+	let name = CString::from(unsafe { CStr::from_ptr(name) });
+	open(name.as_c_str(), slave_flags(), Mode::empty()).map_err(io::Error::from)
+}
+
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+fn open_solarish_slave(master: &OwnedFd) -> io::Result<OwnedFd> {
+	let stat = fstat(master)?;
+	// SAFETY: st_rdev came from fstat on the open PTY master.
+	let device = unsafe { libc::minor(stat.st_rdev) };
+	let name = CString::new(format!("/dev/pts/{device}"))
+		.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+	let slave = open(name.as_c_str(), slave_flags(), Mode::empty())?;
+	setup_solarish_streams(&slave)?;
+	Ok(slave)
+}
+
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+fn setup_solarish_streams(slave: &OwnedFd) -> io::Result<()> {
+	let ldterm = c"ldterm";
+	// SAFETY: the descriptor is an open PTY slave and the module names are static C strings.
+	let present = unsafe { libc::ioctl(slave.as_raw_fd(), libc::I_FIND, ldterm.as_ptr()) };
+	if present == -1 {
+		return Err(io::Error::last_os_error());
+	}
+	if present != 0 {
+		return Ok(());
+	}
+
+	// __I_PUSH_NOCTTY is the Solarish variant of I_PUSH which deliberately skips controlling-terminal
+	// acquisition after ptem marks the stream as a terminal. This matters when the parent is a session
+	// leader without an existing controlling terminal.
+	// SAFETY: the descriptor is an open PTY slave and each argument is a static C string.
+	if unsafe { libc::ioctl(slave.as_raw_fd(), libc::__I_PUSH_NOCTTY, c"ptem".as_ptr()) } == -1
+		|| unsafe { libc::ioctl(slave.as_raw_fd(), libc::__I_PUSH_NOCTTY, ldterm.as_ptr()) } == -1
+	{
+		return Err(io::Error::last_os_error());
+	}
+	#[cfg(target_os = "solaris")]
+	// SAFETY: the descriptor is an open PTY slave and the argument is a static C string.
+	if unsafe {
+		libc::ioctl(
+			slave.as_raw_fd(),
+			libc::__I_PUSH_NOCTTY,
+			c"ttcompat".as_ptr(),
+		)
+	} == -1
+	{
+		return Err(io::Error::last_os_error());
+	}
+	Ok(())
 }
 
 fn winsize(size: PtySize) -> Winsize {

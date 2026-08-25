@@ -111,8 +111,8 @@
 //! # Pseudo-terminals
 //!
 //! The non-default `pty` feature selects the Tokio frontend and terminal dependencies. It provides
-//! native transport on Linux, Android, macOS, FreeBSD, NetBSD, OpenBSD, DragonFly BSD, illumos, and
-//! Solaris; unavailable platforms report `std::io::ErrorKind::Unsupported`.
+//! native transport on Linux, Android, macOS, FreeBSD, NetBSD 10 and newer, OpenBSD, DragonFly BSD,
+//! illumos, and Solaris; unavailable platforms report `std::io::ErrorKind::Unsupported`.
 //!
 //! ```rust,no_run
 //! # #[cfg(feature = "pty")]
