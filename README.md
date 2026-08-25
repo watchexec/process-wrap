@@ -94,7 +94,7 @@ the Tokio frontend and its terminal dependencies explicitly.
 
 ```toml
 [dependencies]
-process-wrap = { version = "11.0.0", features = ["pty"] }
+process-wrap = { version = "10.0.0", features = ["pty"] }
 ```
 
 ```rust
