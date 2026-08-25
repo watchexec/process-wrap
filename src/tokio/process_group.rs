@@ -27,8 +27,9 @@ use super::{ChildWrapper, CommandWrap, CommandWrapper, SpawnAttempt};
 /// placement in foreground or background, among other actions.
 ///
 /// With the `Pty` wrapper, [`leader`](Self::leader) leaves session and process-group creation to the
-/// terminal provider while retaining group-aware child supervision. A PTY must create a new session,
-/// so [`attach_to`](Self::attach_to) is invalid for that transport.
+/// terminal provider while retaining group-wide signalling until the direct child exits. Waiting
+/// still follows that child. A PTY must create a new session, so [`attach_to`](Self::attach_to) is
+/// invalid for that transport.
 ///
 /// This wrapper provides a child wrapper: [`ProcessGroupChild`].
 #[derive(Clone, Copy, Debug)]

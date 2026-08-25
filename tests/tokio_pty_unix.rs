@@ -261,8 +261,9 @@ async fn dropping_output_does_not_hang_up_while_input_exists() -> io::Result<()>
 }
 
 #[cfg(not(target_os = "macos"))]
-#[tokio::test]
-async fn direct_child_wait_is_independent_from_descendant_output_eof() -> io::Result<()> {
+async fn assert_direct_child_wait_is_independent_from_descendant_output_eof(
+	mut command: Command,
+) -> io::Result<()> {
 	struct ReleaseOnDrop(std::path::PathBuf);
 
 	impl Drop for ReleaseOnDrop {
@@ -274,7 +275,6 @@ async fn direct_child_wait_is_independent_from_descendant_output_eof() -> io::Re
 	let directory = tempfile::tempdir()?;
 	let release = directory.path().join("release-descendant");
 	let _release_on_drop = ReleaseOnDrop(release.clone());
-	let mut command = Command::new("sh");
 	command
 		.args([
 			"-c",
@@ -304,6 +304,20 @@ async fn direct_child_wait_is_independent_from_descendant_output_eof() -> io::Re
 	std::fs::File::create(&release)?;
 	timeout(Duration::from_secs(5), output.read_to_end(&mut bytes)).await??;
 	Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tokio::test]
+async fn direct_child_wait_is_independent_from_descendant_output_eof() -> io::Result<()> {
+	assert_direct_child_wait_is_independent_from_descendant_output_eof(Command::new("sh")).await
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "process-group"))]
+#[tokio::test]
+async fn process_group_wait_is_independent_from_descendant_output_eof() -> io::Result<()> {
+	let mut command = Command::new("sh");
+	command.wrap(ProcessGroup::leader());
+	assert_direct_child_wait_is_independent_from_descendant_output_eof(command).await
 }
 
 #[tokio::test]

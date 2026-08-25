@@ -19,8 +19,8 @@ use super::{CommandWrap, CommandWrapper, SpawnAttempt};
 /// This wrapper uses [the same child wrapper as `ProcessGroup`](super::ProcessGroupChild) and does
 /// the same setup (plus the session setup); using both together is unnecessary and may misbehave.
 /// With the `Pty` wrapper, the terminal provider performs the required session setup while this
-/// wrapper retains group-aware child supervision. Explicitly combining both supervision wrappers is
-/// invalid for that transport.
+/// wrapper retains group-wide signalling until the direct child exits. Waiting still follows that
+/// child. Explicitly combining both supervision wrappers is invalid for that transport.
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessSession;
 

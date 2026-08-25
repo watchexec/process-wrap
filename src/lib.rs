@@ -143,10 +143,11 @@
 //!
 //! The transport owns terminal bytes and resize, not parent-terminal raw mode, relaying, key handling,
 //! VT parsing, scrollback, or pager policy. A bare PTY creates its required session.
-//! `ProcessGroup::leader()` or `ProcessSession` may independently add group-aware supervision;
-//! attaching to an existing group or explicitly registering both is invalid. `ResetSigmask` composes,
-//! while Tokio `KillOnDrop` continues to target only the direct child. The returned boxed child keeps
-//! arbitrary outer wrappers, and `take_pty_controller()` traverses them and yields the controller once.
+//! `ProcessGroup::leader()` or `ProcessSession` may independently add group-wide signalling while the
+//! direct child is live; waiting continues to follow that child. Attaching to an existing group or
+//! explicitly registering both is invalid. `ResetSigmask` composes, while Tokio `KillOnDrop` continues
+//! to target only the direct child. The returned boxed child keeps arbitrary outer wrappers, and
+//! `take_pty_controller()` traverses them and yields the controller once.
 //!
 //! # KillOnDrop and CreationFlags
 //!

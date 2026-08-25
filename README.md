@@ -134,11 +134,11 @@ its descendants. The transport passes terminal bytes through without owning pare
 mode, relays, key handling, VT parsing, scrollback, or pager policy.
 
 A bare PTY creates the required session. `ProcessGroup::leader()` and `ProcessSession` each preserve
-their group-aware child supervision when used individually; `ProcessGroup::attach_to(...)` and
-explicitly registering both wrappers return `InvalidInput`. `ResetSigmask` composes normally.
-`KillOnDrop` remains Tokio's direct-child behavior—it does not promise to kill an entire group or
-session. Spawning returns the ordinary boxed Tokio child, and `take_pty_controller()` traverses any
-outer child wrappers and yields the controller once.
+group-wide signalling while the direct child is live; waiting still follows that direct child.
+`ProcessGroup::attach_to(...)` and explicitly registering both wrappers return `InvalidInput`.
+`ResetSigmask` composes normally. `KillOnDrop` remains Tokio's direct-child behavior—it does not
+promise to kill an entire group or session. Spawning returns the ordinary boxed Tokio child, and
+`take_pty_controller()` traverses any outer child wrappers and yields the controller once.
 
 ### or with std
 
