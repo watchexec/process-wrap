@@ -33,10 +33,9 @@
 //!
 //! This crate provides a composable process-wrap-owned [`Command`] configuration shared by the std
 //! and Tokio frontends. It is a more flexible and composable successor to the `command-group` crate,
-//! and is meant to be adaptable to additional use cases: for example spawning processes in PTYs
-//! currently requires a different crate (such as `pty-process`) which won't function with
-//! `command-group`. Implementing a PTY wrapper for `process-wrap` would instead keep the same API and
-//! be composable with the existing process group/session implementations.
+//! and is meant to be adaptable to additional use cases. The optional Tokio PTY provider demonstrates
+//! that adaptability by keeping terminal process creation in the same wrapper lifecycle as process
+//! groups, sessions, signal policy, and custom wrappers.
 //!
 //! # Usage
 //!
@@ -108,6 +107,46 @@
 //! The `spawn` method is used to spawn the process, after which the `Child` can be interacted with.
 //! Methods on `Child` mimic those on `process::Child`, but may be customised by the wrappers. For
 //! example, `kill` will send a signal to the process group if the `ProcessGroup` wrapper is used.
+//!
+//! # Pseudo-terminals
+//!
+//! The non-default `pty` feature selects the Tokio frontend and terminal dependencies. It provides
+//! native transport on Linux, Android, macOS, FreeBSD, NetBSD, OpenBSD, DragonFly BSD, illumos, and
+//! Solaris; unavailable platforms report `std::io::ErrorKind::Unsupported`.
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "pty")]
+//! # mod example {
+//! # fn run() -> std::io::Result<()> {
+//! use process_wrap::tokio::{Command, Pty};
+//!
+//! let mut command = Command::with_new("sh", |command| {
+//!     command.args(["-c", "printf terminal"]);
+//! });
+//! command.wrap(Pty::default());
+//! let mut child = command.spawn()?;
+//! let controller = child
+//!     .take_pty_controller()
+//!     .expect("a successful PTY spawn installs one controller");
+//! # drop(controller);
+//! # Ok(()) }
+//! # }
+//! # fn main() {}
+//! ```
+//!
+//! A terminal has one ordered output stream, so PTY standard output and standard error are merged.
+//! Input and output each strongly own the bidirectional master; resize handles are weak. Dropping one
+//! I/O side is not a half-close, and the terminal hangs up only after both are gone. Send VEOF when
+//! terminal input policy calls for end-of-file. Waiting for the direct child and draining terminal
+//! output are separate lifecycles because descendants may retain the slave. On macOS they should run
+//! concurrently while the kernel drains and revokes the terminal during session-leader teardown.
+//!
+//! The transport owns terminal bytes and resize, not parent-terminal raw mode, relaying, key handling,
+//! VT parsing, scrollback, or pager policy. A bare PTY creates its required session.
+//! `ProcessGroup::leader()` or `ProcessSession` may independently add group-aware supervision;
+//! attaching to an existing group or explicitly registering both is invalid. `ResetSigmask` composes,
+//! while Tokio `KillOnDrop` continues to target only the direct child. The returned boxed child keeps
+//! arbitrary outer wrappers, and `take_pty_controller()` traverses them and yields the controller once.
 //!
 //! # KillOnDrop and CreationFlags
 //!
@@ -527,6 +566,7 @@
 //! - `kill-on-drop`: **default**, enables the kill on drop wrapper (Tokio-only).
 //! - `process-group`: **default**, enables the process group wrapper (Unix-only).
 //! - `process-session`: **default**, enables the process session wrapper (Unix-only).
+//! - `pty`: enables Tokio pseudo-terminal transport and implies `tokio1`.
 //! - `reset-sigmask`: enables the sigmask reset wrapper (Unix-only).
 //!
 //! ## Diagnostics

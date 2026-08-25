@@ -64,8 +64,8 @@ use unsupported as imp;
 /// A pseudo-terminal spawn provider for Tokio commands.
 ///
 /// Register this like any other process wrapper. Spawning still returns the ordinary boxed Tokio
-/// child contract; call [`ChildWrapper::take_pty_controller`] on that child to take its terminal I/O
-/// and resize controller once.
+/// child contract; call `take_pty_controller()` on that child to take its terminal I/O and resize
+/// controller once.
 ///
 /// ```rust,no_run
 /// # use std::io;
