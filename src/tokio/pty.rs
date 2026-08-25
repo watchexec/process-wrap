@@ -1,6 +1,8 @@
 use std::{
+	future::Future,
 	io,
 	pin::Pin,
+	process::ExitStatus,
 	task::{Context, Poll},
 };
 
@@ -20,6 +22,18 @@ use std::sync::{
 	atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[cfg(any(
@@ -421,8 +435,11 @@ impl ControllerSlot {
 ))]
 #[derive(Debug)]
 pub(super) struct PtyChild {
-	inner: Box<dyn ChildWrapper>,
+	child: Arc<Mutex<Child>>,
 	controller: Arc<ControllerSlot>,
+	stdin: Option<ChildStdin>,
+	stdout: Option<ChildStdout>,
+	stderr: Option<ChildStderr>,
 }
 
 #[cfg(any(
@@ -437,8 +454,20 @@ pub(super) struct PtyChild {
 	target_os = "solaris"
 ))]
 impl PtyChild {
-	pub(super) fn new(inner: Box<dyn ChildWrapper>, controller: Arc<ControllerSlot>) -> Self {
-		Self { inner, controller }
+	pub(super) fn new(child: Arc<Mutex<Child>>, controller: Arc<ControllerSlot>) -> Self {
+		Self {
+			child,
+			controller,
+			stdin: None,
+			stdout: None,
+			stderr: None,
+		}
+	}
+
+	fn lock_child(&self) -> std::sync::MutexGuard<'_, Child> {
+		self.child
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
 	}
 }
 
@@ -455,15 +484,55 @@ impl PtyChild {
 ))]
 impl ChildWrapper for PtyChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		self.inner.as_ref()
+		self
 	}
 
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		self.inner.as_mut()
+		self
 	}
 
 	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-		self.inner
+		self
+	}
+
+	fn stdin(&mut self) -> &mut Option<ChildStdin> {
+		&mut self.stdin
+	}
+
+	fn stdout(&mut self) -> &mut Option<ChildStdout> {
+		&mut self.stdout
+	}
+
+	fn stderr(&mut self) -> &mut Option<ChildStderr> {
+		&mut self.stderr
+	}
+
+	fn id(&self) -> Option<u32> {
+		self.lock_child().id()
+	}
+
+	fn start_kill(&mut self) -> io::Result<()> {
+		self.lock_child().start_kill()
+	}
+
+	fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+		self.lock_child().try_wait()
+	}
+
+	fn wait(&mut self) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send + '_>> {
+		let child = Arc::clone(&self.child);
+		Box::pin(std::future::poll_fn(move |cx| {
+			let mut child = child
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner);
+			let mut wait = Box::pin(child.wait());
+			wait.as_mut().poll(cx)
+		}))
+	}
+
+	#[cfg(unix)]
+	fn signal(&self, sig: i32) -> io::Result<()> {
+		ChildWrapper::signal(&*self.lock_child(), sig)
 	}
 
 	fn take_pty_controller_layer(&mut self) -> Option<PtyController> {

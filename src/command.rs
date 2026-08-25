@@ -1460,8 +1460,12 @@ impl<B: Backend> SpawnAttempt<B> {
 		self.native_command_mut()
 	}
 
-	/// Materialize the fresh native command for an alternate provider without applying native
-	/// platform setup or making the portable attempt opaque.
+	/// Take the fresh native command for an alternate provider without applying native platform setup
+	/// or making the portable attempt opaque.
+	///
+	/// Removing the provider's command leaves the tracked intent intact. If a later lifecycle hook
+	/// requests native access, the attempt materializes a separate clean command which contains none of
+	/// the provider's private stdio or child-setup state.
 	///
 	/// The provider must apply every accepted portable policy itself before spawning.
 	#[cfg(all(
@@ -1478,9 +1482,16 @@ impl<B: Backend> SpawnAttempt<B> {
 			target_os = "solaris"
 		)
 	))]
-	pub(crate) fn native_for_provider_spawn(&mut self) -> &mut B::NativeCommand {
+	pub(crate) fn take_native_for_provider_spawn(&mut self) -> B::NativeCommand {
 		self.materialize_native();
-		self.native_command_mut()
+		match &mut self.state {
+			AttemptState::Tracked { native, .. } => native
+				.take()
+				.expect("the tracked provider attempt was materialized above"),
+			AttemptState::NativeOnly(_) => {
+				unreachable!("portable providers reject native-only attempts before spawning")
+			}
+		}
 	}
 
 	pub(crate) fn native_for_explicit_spawn(&mut self) -> &mut B::NativeCommand {

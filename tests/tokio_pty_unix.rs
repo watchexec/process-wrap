@@ -392,7 +392,7 @@ async fn process_group_leader_preserves_pty_group_supervision() -> io::Result<()
 
 #[cfg(feature = "process-group")]
 #[tokio::test]
-async fn process_group_try_wait_keeps_native_child_synchronized() -> io::Result<()> {
+async fn process_group_try_wait_supports_terminal_provider_child() -> io::Result<()> {
 	let mut command = Command::new("sh");
 	command.args(["-c", "exit 17"]).wrap(ProcessGroup::leader());
 	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
@@ -408,9 +408,7 @@ async fn process_group_try_wait_keeps_native_child_synchronized() -> io::Result<
 		}
 	})
 	.await??;
-	let native =
-		unsafe { child.try_inner_child_mut() }.expect("PTY group child must contain Tokio Child");
-	assert_eq!(native.try_wait()?, Some(status));
+	assert!(unsafe { child.try_inner_child_mut() }.is_none());
 	assert_eq!(child.try_wait()?, Some(status));
 	assert_eq!(child.wait().await?, status);
 	let mut bytes = Vec::new();

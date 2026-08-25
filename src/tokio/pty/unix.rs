@@ -8,7 +8,7 @@ use std::{
 	panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
 	pin::Pin,
 	process::Stdio,
-	sync::{Arc, Weak},
+	sync::{Arc, Mutex, Weak},
 	task::{Context, Poll, ready},
 };
 
@@ -148,27 +148,31 @@ pub(super) fn spawn(attempt: &mut SpawnAttempt, size: PtySize) -> io::Result<Pro
 		input, output, resize,
 	)));
 
-	let command = attempt.native_for_provider_spawn();
+	let mut command = attempt.take_native_for_provider_spawn();
 	command.kill_on_drop(kill_on_drop);
 	let spawned = catch_unwind(AssertUnwindSafe(|| {
-		with_slave_stdio(command, slave_stdin, slave_stdout, slave, |command| {
-			// SAFETY: the callback only invokes async-signal-safe libc functions and reports the
-			// operating system's error without accessing shared process state.
-			unsafe {
-				command.pre_exec(move || setup_child(reset_sigmask));
-			}
-			command.spawn()
-		})
+		with_slave_stdio(
+			&mut command,
+			slave_stdin,
+			slave_stdout,
+			slave,
+			|command| {
+				// SAFETY: the callback only invokes async-signal-safe libc functions and reports the
+				// operating system's error without accessing shared process state.
+				unsafe {
+					command.pre_exec(move || setup_child(reset_sigmask));
+				}
+				command.spawn()
+			},
+		)
 	}));
 	let child = match spawned {
 		Ok(child) => child?,
 		Err(payload) => resume_unwind(payload),
 	};
-	let pid = child
-		.id()
-		.expect("Tokio reports a process ID for a newly spawned child");
-	let transaction = PtyTransaction::new(pid, Arc::clone(&controller));
-	let child = PtyChild::new(Box::new(child), controller);
+	let child = Arc::new(Mutex::new(child));
+	let transaction = PtyTransaction::new(Arc::clone(&child), Arc::clone(&controller));
+	let child = PtyChild::new(child, controller);
 
 	Ok(ProviderProduct::new(Box::new(child), Box::new(transaction)))
 }
@@ -201,15 +205,18 @@ fn with_slave_stdio<T>(
 
 #[derive(Debug)]
 struct PtyTransaction {
-	pid: libc::pid_t,
+	child: Arc<Mutex<tokio::process::Child>>,
 	controller: Arc<ControllerSlot>,
 	armed: bool,
 }
 
 impl PtyTransaction {
-	fn new(pid: u32, controller: Arc<ControllerSlot>) -> Self {
+	fn new(
+		child: Arc<Mutex<tokio::process::Child>>,
+		controller: Arc<ControllerSlot>,
+	) -> Self {
 		Self {
-			pid: pid as libc::pid_t,
+			child,
 			controller,
 			armed: true,
 		}
@@ -220,7 +227,7 @@ impl PtyTransaction {
 			return Ok(());
 		}
 		self.controller.rollback();
-		terminate_and_reap(self.pid)
+		terminate_and_reap(&self.child)
 	}
 }
 
@@ -244,46 +251,46 @@ impl Drop for PtyTransaction {
 	}
 }
 
-fn terminate_and_reap(pid: libc::pid_t) -> io::Result<()> {
-	let mut status = 0;
-	loop {
-		// SAFETY: `status` points to writable storage and WNOHANG does not block. A zero result proves
-		// that `pid` remains this process's live, unreaped child before it is signalled below.
-		let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-		if waited == pid {
-			return Ok(());
-		}
-		if waited == 0 {
-			break;
-		}
-		let error = io::Error::last_os_error();
-		match error.raw_os_error() {
-			Some(libc::EINTR) => continue,
-			Some(libc::ECHILD) => return Ok(()),
-			_ => return Err(error),
-		}
+fn terminate_and_reap(child: &Mutex<tokio::process::Child>) -> io::Result<()> {
+	let mut child = child
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner);
+	if child.try_wait()?.is_some() {
+		return Ok(());
 	}
 
-	// SAFETY: the WNOHANG check above established that `pid` is still our unreaped child.
-	if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
+	let pid = child
+		.id()
+		.expect("an unreaped Tokio child retains its process ID");
+	let pid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+
+	// The PTY setup makes the direct child the leader of a fresh session and process group. While the
+	// child remains unreaped, its PID anchors that group identity, so signalling the negative PID cannot
+	// target a recycled group. This also cleans up descendants which are still present at rollback time.
+	// SAFETY: `pid` is positive and belongs to the live, unreaped child locked above.
+	let group_error = if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
 		let error = io::Error::last_os_error();
-		if error.raw_os_error() != Some(libc::ESRCH) {
-			return Err(error);
-		}
+		(error.raw_os_error() != Some(libc::ESRCH)).then_some(error)
+	} else {
+		None
+	};
+
+	// Kill the direct child independently in case process-group signalling was unavailable. Holding the
+	// only operational child lock keeps wait/kill state synchronized with every PTY child capability.
+	if let Err(error) = child.start_kill()
+		&& error.kind() != io::ErrorKind::InvalidInput
+	{
+		return Err(error);
 	}
 
 	loop {
-		// SAFETY: `status` remains writable and `pid` was established as our child above.
-		let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-		if waited == pid {
-			return Ok(());
+		if child.try_wait()?.is_some() {
+			return match group_error {
+				Some(error) => Err(error),
+				None => Ok(()),
+			};
 		}
-		let error = io::Error::last_os_error();
-		match error.raw_os_error() {
-			Some(libc::EINTR) => continue,
-			Some(libc::ECHILD) => return Ok(()),
-			_ => return Err(error),
-		}
+		std::thread::yield_now();
 	}
 }
 
