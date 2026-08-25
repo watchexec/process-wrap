@@ -21,6 +21,7 @@ mod controller;
 pub(super) mod environment;
 mod pipe;
 mod program;
+mod spawn;
 
 #[derive(Debug, Eq, PartialEq)]
 struct PreparedWindowsCommand {
