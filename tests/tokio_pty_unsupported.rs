@@ -9,7 +9,8 @@
 		target_os = "macos",
 		target_os = "netbsd",
 		target_os = "openbsd",
-		target_os = "solaris"
+		target_os = "solaris",
+		windows
 	))
 ))]
 
