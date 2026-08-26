@@ -3,13 +3,14 @@
 use std::{
 	env,
 	io::{self, Read, Write},
+	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Path, PathBuf},
 	process::ExitStatus,
 	sync::{
-		Arc,
+		Arc, Mutex,
 		atomic::{AtomicBool, Ordering},
 	},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 #[cfg(feature = "creation-flags")]
@@ -19,22 +20,30 @@ use process_wrap::tokio::JobObject;
 #[cfg(feature = "kill-on-drop")]
 use process_wrap::tokio::KillOnDrop;
 use process_wrap::tokio::{
-	ChildWrapper, Command, CommandWrapper, Pty, PtyController, PtyOutput, PtySize, SpawnAttempt,
+	ChildWrapper, Command, CommandWrapper, ProviderProduct, Pty, PtyController, PtyOutput, PtySize,
+	SpawnAttempt, SpawnProvider,
 };
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	time::timeout,
 };
 use windows::Win32::{
-	Foundation::HANDLE,
-	System::Console::{
-		ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-		ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle,
-		STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+	Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0},
+	System::{
+		Console::{
+			ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+			ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, GetConsoleScreenBufferInfo,
+			GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+		},
+		Threading::{
+			INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+			WaitForSingleObject,
+		},
 	},
 };
 
-#[cfg(feature = "job-object")]
+#[cfg(all(feature = "creation-flags", feature = "job-object"))]
+#[allow(dead_code)]
 #[path = "support/windows_thread.rs"]
 mod windows_thread;
 
@@ -84,6 +93,76 @@ struct ReleaseOnDrop(PathBuf);
 impl Drop for ReleaseOnDrop {
 	fn drop(&mut self) {
 		let _ = std::fs::File::create(&self.0);
+	}
+}
+
+#[derive(Debug)]
+struct ProcessExitGuard(Option<HANDLE>);
+
+// SAFETY: the guard uniquely owns a process-wide Windows handle. Moving it to another thread
+// transfers that ownership without exposing Rust memory or retaining an alias which could close it.
+unsafe impl Send for ProcessExitGuard {}
+
+impl ProcessExitGuard {
+	fn open(pid: u32) -> io::Result<Self> {
+		// SAFETY: the access mask is valid for process handles, the numeric PID carries no borrowed
+		// memory, and a successful call returns a new handle owned by this guard.
+		let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) }
+			.map_err(io::Error::other)?;
+		Ok(Self(Some(handle)))
+	}
+
+	fn has_exited(&self) -> io::Result<bool> {
+		// SAFETY: the guard still owns this live process handle for the duration of the nonblocking wait.
+		let wait = unsafe { WaitForSingleObject(self.handle(), 0) };
+		if wait == WAIT_FAILED {
+			Err(io::Error::last_os_error())
+		} else {
+			Ok(wait == WAIT_OBJECT_0)
+		}
+	}
+
+	fn disarm(mut self) -> io::Result<()> {
+		if let Some(handle) = self.0.take() {
+			// SAFETY: taking the handle removes the guard's only owner, so this closes it exactly once.
+			unsafe { CloseHandle(handle) }?;
+		}
+		Ok(())
+	}
+
+	fn handle(&self) -> HANDLE {
+		self.0
+			.expect("only ProcessExitGuard::disarm clears the handle, and it consumes the guard")
+	}
+}
+
+impl Drop for ProcessExitGuard {
+	fn drop(&mut self) {
+		if let Some(handle) = self.0.take() {
+			// SAFETY: taking the handle removes the guard's only owner. It remains live until the final
+			// CloseHandle below, and all three operations use it only as a process handle.
+			unsafe { TerminateProcess(handle, 1) }.ok();
+			// SAFETY: the uniquely owned process handle remains live until the following close.
+			unsafe { WaitForSingleObject(handle, INFINITE) };
+			// SAFETY: this is the sole remaining owner and no subsequent operation uses the handle.
+			unsafe { CloseHandle(handle) }.ok();
+		}
+	}
+}
+
+async fn wait_for_process_exit(guard: ProcessExitGuard) -> io::Result<()> {
+	let deadline = Instant::now() + TIMEOUT;
+	loop {
+		if guard.has_exited()? {
+			return guard.disarm();
+		}
+		if Instant::now() >= deadline {
+			return Err(io::Error::new(
+				io::ErrorKind::TimedOut,
+				"ConPTY process survived the failed spawn lifecycle",
+			));
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
 	}
 }
 
@@ -539,30 +618,39 @@ async fn job_object_composes_with_creation_flags_in_both_orders() -> io::Result<
 	use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
 	for reverse in [false, true] {
-		let mut command = helper("terminal")?;
-		if reverse {
-			command
-				.wrap(JobObject)
-				.wrap(CreationFlags(CREATE_NEW_PROCESS_GROUP));
-		} else {
-			command
-				.wrap(CreationFlags(CREATE_NEW_PROCESS_GROUP))
-				.wrap(JobObject);
+		for pty_first in [false, true] {
+			let mut command = helper("terminal")?;
+			if pty_first {
+				command.wrap(Pty::default());
+			}
+			if reverse {
+				command
+					.wrap(JobObject)
+					.wrap(CreationFlags(CREATE_NEW_PROCESS_GROUP));
+			} else {
+				command
+					.wrap(CreationFlags(CREATE_NEW_PROCESS_GROUP))
+					.wrap(JobObject);
+			}
+			if !pty_first {
+				command.wrap(Pty::default());
+			}
+			let mut child = command.spawn()?;
+			let controller = take_controller(child.as_mut());
+			let (input, mut output, _resize) = controller.into_parts();
+			drop(input);
+			let mut bytes = Vec::new();
+			assert!(
+				wait_and_drain(child.as_mut(), &mut output, &mut bytes)
+					.await?
+					.success()
+			);
+			assert!(
+				bytes
+					.windows(16)
+					.any(|window| window == b"PW-TERMINALS:111")
+			);
 		}
-		let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
-		let (input, mut output, _resize) = controller.into_parts();
-		drop(input);
-		let mut bytes = Vec::new();
-		assert!(
-			wait_and_drain(child.as_mut(), &mut output, &mut bytes)
-				.await?
-				.success()
-		);
-		assert!(
-			bytes
-				.windows(16)
-				.any(|window| window == b"PW-TERMINALS:111")
-		);
 	}
 	Ok(())
 }
@@ -637,41 +725,552 @@ async fn kill_on_drop_terminates_a_conpty_child() -> io::Result<()> {
 #[tokio::test]
 async fn job_object_composes_with_kill_on_drop_in_both_orders() -> io::Result<()> {
 	for reverse in [false, true] {
-		let directory = tempfile::tempdir()?;
-		let release = directory.path().join("release-descendant");
-		let pid_file = directory.path().join("descendant-pid");
-		let _release_on_drop = ReleaseOnDrop(release.clone());
-		let mut command = helper("tree")?;
-		command
-			.env("PW_RELEASE", &release)
-			.env("PW_DESCENDANT_PID", &pid_file);
-		if reverse {
-			command.wrap(JobObject).wrap(KillOnDrop);
-		} else {
-			command.wrap(KillOnDrop).wrap(JobObject);
-		}
-
-		let (child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
-		let (input, mut output, _resize) = controller.into_parts();
-		read_through(&mut output, b"PW-TREE-READY").await?;
-		let pid = std::fs::read_to_string(&pid_file)?
-			.parse::<u32>()
-			.map_err(io::Error::other)?;
-		let guard = windows_thread::ProcessGuard::open(pid)?;
-		drop(child);
-		timeout(TIMEOUT, async {
-			while !guard.has_exited()? {
-				tokio::time::sleep(Duration::from_millis(10)).await;
+		for pty_first in [false, true] {
+			let directory = tempfile::tempdir()?;
+			let release = directory.path().join("release-descendant");
+			let pid_file = directory.path().join("descendant-pid");
+			let _release_on_drop = ReleaseOnDrop(release.clone());
+			let mut command = helper("tree")?;
+			command
+				.env("PW_RELEASE", &release)
+				.env("PW_DESCENDANT_PID", &pid_file);
+			if pty_first {
+				command.wrap(Pty::default());
 			}
-			Ok::<(), io::Error>(())
-		})
-		.await
-		.map_err(io::Error::other)??;
-		guard.disarm()?;
+			if reverse {
+				command.wrap(JobObject).wrap(KillOnDrop);
+			} else {
+				command.wrap(KillOnDrop).wrap(JobObject);
+			}
+			if !pty_first {
+				command.wrap(Pty::default());
+			}
+
+			let mut child = command.spawn()?;
+			let controller = take_controller(child.as_mut());
+			let (input, mut output, _resize) = controller.into_parts();
+			read_through(&mut output, b"PW-TREE-READY").await?;
+			let pid = std::fs::read_to_string(&pid_file)?
+				.parse::<u32>()
+				.map_err(io::Error::other)?;
+			let guard = ProcessExitGuard::open(pid)?;
+			drop(child);
+			wait_for_process_exit(guard).await?;
+			drop(input);
+			let mut bytes = Vec::new();
+			timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+		}
+	}
+	Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LifecycleFailure {
+	Error,
+	Panic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleStage {
+	PostSpawn,
+	WrapChild,
+	FinalizeSpawn,
+	DisarmSpawnCleanup,
+	DisarmJobObject,
+}
+
+fn fail_lifecycle<T>(failure: LifecycleFailure) -> io::Result<T> {
+	match failure {
+		LifecycleFailure::Error => Err(io::Error::other("ConPTY lifecycle failed")),
+		LifecycleFailure::Panic => panic!("ConPTY lifecycle failed"),
+	}
+}
+
+#[derive(Debug)]
+struct FailFinalizationChild {
+	inner: Box<dyn ChildWrapper>,
+	failure: LifecycleFailure,
+	stage: LifecycleStage,
+}
+
+impl ChildWrapper for FailFinalizationChild {
+	fn inner(&self) -> &dyn ChildWrapper {
+		self.inner.as_ref()
+	}
+
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+		self.inner.as_mut()
+	}
+
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+		self.inner
+	}
+
+	fn finalize_spawn_layer(&mut self) -> io::Result<()> {
+		if self.stage == LifecycleStage::FinalizeSpawn {
+			fail_lifecycle(self.failure)
+		} else {
+			Ok(())
+		}
+	}
+
+	fn disarm_spawn_cleanup_layer(&mut self) -> io::Result<()> {
+		if self.stage == LifecycleStage::DisarmSpawnCleanup {
+			fail_lifecycle(self.failure)
+		} else {
+			Ok(())
+		}
+	}
+
+	fn disarm_job_object_layer(&mut self) -> io::Result<()> {
+		if self.stage == LifecycleStage::DisarmJobObject {
+			fail_lifecycle(self.failure)
+		} else {
+			Ok(())
+		}
+	}
+}
+
+#[derive(Debug)]
+struct FailLifecycleOnce {
+	failure: LifecycleFailure,
+	stage: LifecycleStage,
+	failed: bool,
+	process: Arc<Mutex<Option<ProcessExitGuard>>>,
+}
+
+impl FailLifecycleOnce {
+	fn capture(&self, child: &mut dyn ChildWrapper) -> io::Result<()> {
+		assert!(child.take_pty_controller().is_none());
+		let pid = child
+			.id()
+			.expect("a newly spawned ConPTY child exposes its process ID");
+		*self.process.lock().unwrap() = Some(ProcessExitGuard::open(pid)?);
+		Ok(())
+	}
+}
+
+impl CommandWrapper for FailLifecycleOnce {
+	fn post_spawn(
+		&mut self,
+		_attempt: &mut SpawnAttempt,
+		child: &mut dyn ChildWrapper,
+		_command: &Command,
+	) -> io::Result<()> {
+		if self.stage != LifecycleStage::PostSpawn || self.failed {
+			return Ok(());
+		}
+		self.capture(child)?;
+		self.failed = true;
+		fail_lifecycle(self.failure)
+	}
+
+	fn wrap_child(
+		&mut self,
+		mut child: Box<dyn ChildWrapper>,
+		_command: &Command,
+	) -> io::Result<Box<dyn ChildWrapper>> {
+		if self.failed || self.stage == LifecycleStage::PostSpawn {
+			return Ok(child);
+		}
+		self.capture(child.as_mut())?;
+		self.failed = true;
+		if self.stage == LifecycleStage::WrapChild {
+			fail_lifecycle(self.failure)
+		} else {
+			Ok(Box::new(FailFinalizationChild {
+				inner: child,
+				failure: self.failure,
+				stage: self.stage,
+			}))
+		}
+	}
+}
+
+#[cfg(feature = "job-object")]
+#[derive(Debug)]
+struct FailAfterDescendantOnce {
+	failure: LifecycleFailure,
+	stage: LifecycleStage,
+	failed: bool,
+	pid_file: PathBuf,
+	descendant: Arc<Mutex<Option<ProcessExitGuard>>>,
+}
+
+#[cfg(feature = "job-object")]
+impl FailAfterDescendantOnce {
+	fn capture_descendant(&self) -> io::Result<()> {
+		let deadline = Instant::now() + TIMEOUT;
+		let pid = loop {
+			if let Ok(pid) = std::fs::read_to_string(&self.pid_file)
+				.and_then(|pid| pid.trim().parse().map_err(io::Error::other))
+			{
+				break pid;
+			}
+			if Instant::now() >= deadline {
+				return Err(io::Error::new(
+					io::ErrorKind::TimedOut,
+					"ConPTY descendant did not report its process ID",
+				));
+			}
+			std::thread::sleep(Duration::from_millis(10));
+		};
+		*self.descendant.lock().unwrap() = Some(ProcessExitGuard::open(pid)?);
+		Ok(())
+	}
+}
+
+#[cfg(feature = "job-object")]
+impl CommandWrapper for FailAfterDescendantOnce {
+	fn post_spawn(
+		&mut self,
+		_attempt: &mut SpawnAttempt,
+		child: &mut dyn ChildWrapper,
+		_command: &Command,
+	) -> io::Result<()> {
+		if self.stage != LifecycleStage::PostSpawn || self.failed {
+			return Ok(());
+		}
+		assert!(child.take_pty_controller().is_none());
+		self.capture_descendant()?;
+		self.failed = true;
+		fail_lifecycle(self.failure)
+	}
+
+	fn wrap_child(
+		&mut self,
+		mut child: Box<dyn ChildWrapper>,
+		_command: &Command,
+	) -> io::Result<Box<dyn ChildWrapper>> {
+		if self.failed || self.stage == LifecycleStage::PostSpawn {
+			return Ok(child);
+		}
+		assert!(child.take_pty_controller().is_none());
+		self.capture_descendant()?;
+		self.failed = true;
+		if self.stage == LifecycleStage::WrapChild {
+			fail_lifecycle(self.failure)
+		} else {
+			Ok(Box::new(FailFinalizationChild {
+				inner: child,
+				failure: self.failure,
+				stage: self.stage,
+			}))
+		}
+	}
+}
+
+#[cfg(feature = "job-object")]
+#[tokio::test]
+async fn armed_job_reaps_descendants_after_later_conpty_failures() -> io::Result<()> {
+	for stage in [
+		LifecycleStage::PostSpawn,
+		LifecycleStage::WrapChild,
+		LifecycleStage::FinalizeSpawn,
+		LifecycleStage::DisarmSpawnCleanup,
+		LifecycleStage::DisarmJobObject,
+	] {
+		for failure in [LifecycleFailure::Error, LifecycleFailure::Panic] {
+			for job_outer in [false, true] {
+				let directory = tempfile::tempdir()?;
+				let release = directory.path().join("release-descendant");
+				let pid_file = directory.path().join("descendant-pid");
+				let _release_on_drop = ReleaseOnDrop(release.clone());
+				let descendant = Arc::new(Mutex::new(None));
+				let fail = FailAfterDescendantOnce {
+					failure,
+					stage,
+					failed: false,
+					pid_file: pid_file.clone(),
+					descendant: Arc::clone(&descendant),
+				};
+				let mut command = helper("tree")?;
+				command
+					.env("PW_RELEASE", &release)
+					.env("PW_DESCENDANT_PID", &pid_file)
+					.wrap(Pty::default());
+				if job_outer {
+					command.wrap(fail).wrap(JobObject);
+				} else {
+					command.wrap(JobObject).wrap(fail);
+				}
+
+				let result = catch_unwind(AssertUnwindSafe(|| command.spawn()));
+				match failure {
+					LifecycleFailure::Error => assert_eq!(
+						result.unwrap().unwrap_err().to_string(),
+						"ConPTY lifecycle failed"
+					),
+					LifecycleFailure::Panic => assert_eq!(
+						*result
+							.expect_err("the Windows lifecycle hook must panic")
+							.downcast::<&'static str>()
+							.unwrap(),
+						"ConPTY lifecycle failed"
+					),
+				}
+				let guard = descendant
+					.lock()
+					.unwrap()
+					.take()
+					.expect("the failing lifecycle hook captures the descendant process");
+				wait_for_process_exit(guard).await?;
+			}
+		}
+	}
+	Ok(())
+}
+
+#[tokio::test]
+async fn failed_windows_lifecycle_reaps_the_child_and_remains_reusable() -> io::Result<()> {
+	for stage in [
+		LifecycleStage::PostSpawn,
+		LifecycleStage::WrapChild,
+		LifecycleStage::FinalizeSpawn,
+		LifecycleStage::DisarmSpawnCleanup,
+		LifecycleStage::DisarmJobObject,
+	] {
+		for failure in [LifecycleFailure::Error, LifecycleFailure::Panic] {
+			let process = Arc::new(Mutex::new(None));
+			let mut command = helper("wait")?;
+			command.wrap(Pty::default()).wrap(FailLifecycleOnce {
+				failure,
+				stage,
+				failed: false,
+				process: Arc::clone(&process),
+			});
+
+			let result = catch_unwind(AssertUnwindSafe(|| command.spawn()));
+			match failure {
+				LifecycleFailure::Error => assert_eq!(
+					result.unwrap().unwrap_err().to_string(),
+					"ConPTY lifecycle failed"
+				),
+				LifecycleFailure::Panic => assert_eq!(
+					*result
+						.expect_err("the Windows lifecycle hook must panic")
+						.downcast::<&'static str>()
+						.unwrap(),
+					"ConPTY lifecycle failed"
+				),
+			}
+			let guard = process
+				.lock()
+				.unwrap()
+				.take()
+				.expect("the failing lifecycle hook captures the child process");
+			wait_for_process_exit(guard).await?;
+
+			let mut child = command.spawn()?;
+			let controller = take_controller(child.as_mut());
+			let (input, mut output, _resize) = controller.into_parts();
+			read_through(&mut output, b"PW-READY").await?;
+			child.start_kill()?;
+			timeout(TIMEOUT, child.wait()).await??;
+			drop(input);
+			timeout(TIMEOUT, output.read_to_end(&mut Vec::new())).await??;
+		}
+	}
+	Ok(())
+}
+
+#[derive(Debug)]
+struct OtherProvider;
+
+impl SpawnProvider for OtherProvider {
+	fn spawn(
+		&self,
+		_attempt: &mut SpawnAttempt,
+		_command: &Command,
+	) -> io::Result<ProviderProduct> {
+		panic!("provider conflicts are rejected before spawning")
+	}
+}
+
+impl CommandWrapper for OtherProvider {
+	fn spawn_provider(&self) -> Option<&dyn SpawnProvider> {
+		Some(self)
+	}
+}
+
+#[test]
+fn rejects_another_spawn_provider_before_callbacks() {
+	let mut command = Command::new("ignored");
+	command.wrap(Pty::default()).wrap(OtherProvider);
+	let error = command.spawn().unwrap_err();
+	assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+	assert_eq!(error.to_string(), "multiple spawn providers are registered");
+}
+
+#[derive(Debug)]
+struct MakeAttemptNative;
+
+impl CommandWrapper for MakeAttemptNative {
+	fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, _command: &Command) -> io::Result<()> {
+		let _ = attempt.native_mut();
+		Ok(())
+	}
+}
+
+#[test]
+fn rejects_opaque_base_and_attempt_state() {
+	let native = tokio::process::Command::new("ignored");
+	let mut command = Command::from(native);
+	command.wrap(Pty::default());
+	let error = command.spawn().unwrap_err();
+	assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+	assert_eq!(
+		error.to_string(),
+		"a spawn provider cannot use a native-only command"
+	);
+
+	let mut command = Command::new("ignored");
+	command.wrap(Pty::default()).wrap(MakeAttemptNative);
+	let error = command.spawn().unwrap_err();
+	assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+	assert_eq!(
+		error.to_string(),
+		"a spawn provider cannot use a native-only spawn attempt"
+	);
+}
+
+#[test]
+fn explicit_spawners_cannot_bypass_pty() {
+	let mut command = Command::new("ignored");
+	command.wrap(Pty::default());
+	let error = command
+		.spawn_with(|_| panic!("explicit spawner must not run"))
+		.unwrap_err();
+	assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+	let error = command
+		.spawn_with_child(|_| panic!("explicit child spawner must not run"))
+		.unwrap_err();
+	assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[tokio::test]
+async fn duplicate_pty_registration_uses_the_later_size() -> io::Result<()> {
+	let mut command = helper("size")?;
+	command
+		.wrap(Pty::new(PtySize::new(31, 97)?))
+		.wrap(Pty::new(PtySize::new(42, 113)?));
+
+	let mut child = command.spawn()?;
+	let controller = take_controller(child.as_mut());
+	let (mut input, mut output, _resize) = controller.into_parts();
+	read_through(&mut output, b"PW-SIZE:42x113").await?;
+	input.write_all(b"go\r").await?;
+	assert!(timeout(TIMEOUT, child.wait()).await??.success());
+	Ok(())
+}
+
+#[tokio::test]
+async fn provider_and_controller_are_reusable() -> io::Result<()> {
+	let mut command = helper("terminal")?;
+	command.wrap(Pty::default());
+
+	for _ in 0..3 {
+		let mut child = command.spawn()?;
+		let controller = take_controller(child.as_mut());
+		let (input, mut output, _resize) = controller.into_parts();
 		drop(input);
 		let mut bytes = Vec::new();
-		timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+		assert!(
+			wait_and_drain(child.as_mut(), &mut output, &mut bytes)
+				.await?
+				.success()
+		);
+		assert!(
+			bytes
+				.windows(16)
+				.any(|window| window == b"PW-TERMINALS:111")
+		);
 	}
+	Ok(())
+}
+
+#[tokio::test]
+async fn non_pty_children_have_no_controller() -> io::Result<()> {
+	let mut command = Command::with_new("cmd.exe", |command| {
+		command.args(["/D", "/S", "/C", "exit /b 0"]);
+	});
+	let mut child = command.spawn()?;
+	assert!(child.take_pty_controller().is_none());
+	assert!(timeout(TIMEOUT, child.wait()).await??.success());
+	Ok(())
+}
+
+#[derive(Debug)]
+struct TransparentChild(Box<dyn ChildWrapper>);
+
+impl ChildWrapper for TransparentChild {
+	fn inner(&self) -> &dyn ChildWrapper {
+		self.0.as_ref()
+	}
+
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+		self.0.as_mut()
+	}
+
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+		self.0
+	}
+}
+
+#[derive(Debug)]
+struct ObserveControllerLifecycle {
+	post_spawn: Arc<AtomicBool>,
+	wrap_child: Arc<AtomicBool>,
+}
+
+impl CommandWrapper for ObserveControllerLifecycle {
+	fn post_spawn(
+		&mut self,
+		_attempt: &mut SpawnAttempt,
+		child: &mut dyn ChildWrapper,
+		_command: &Command,
+	) -> io::Result<()> {
+		assert!(child.take_pty_controller().is_none());
+		self.post_spawn.store(true, Ordering::SeqCst);
+		Ok(())
+	}
+
+	fn wrap_child(
+		&mut self,
+		mut child: Box<dyn ChildWrapper>,
+		_command: &Command,
+	) -> io::Result<Box<dyn ChildWrapper>> {
+		assert!(child.take_pty_controller().is_none());
+		self.wrap_child.store(true, Ordering::SeqCst);
+		Ok(Box::new(TransparentChild(child)))
+	}
+}
+
+#[tokio::test]
+async fn controller_commits_after_hooks_and_traverses_outer_wrappers() -> io::Result<()> {
+	let post_spawn = Arc::new(AtomicBool::new(false));
+	let wrap_child = Arc::new(AtomicBool::new(false));
+	let mut command = helper("terminal")?;
+	command
+		.wrap(Pty::default())
+		.wrap(ObserveControllerLifecycle {
+			post_spawn: Arc::clone(&post_spawn),
+			wrap_child: Arc::clone(&wrap_child),
+		});
+
+	let mut child = command.spawn()?;
+	assert!(post_spawn.load(Ordering::SeqCst));
+	assert!(wrap_child.load(Ordering::SeqCst));
+	let controller = take_controller(child.as_mut());
+	let (input, mut output, _resize) = controller.into_parts();
+	drop(input);
+	let mut bytes = Vec::new();
+	assert!(
+		wait_and_drain(child.as_mut(), &mut output, &mut bytes)
+			.await?
+			.success()
+	);
 	Ok(())
 }
 
