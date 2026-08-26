@@ -13,8 +13,8 @@ use windows::{
 		System::Threading::{
 			CREATE_UNICODE_ENVIRONMENT, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
 			GetCurrentProcess, GetProcessIdOfThread, INFINITE, OpenProcess, PROCESS_CREATION_FLAGS,
-			PROCESS_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, STARTF_USESTDHANDLES,
-			STARTUPINFOEXW, TerminateProcess, WaitForSingleObject,
+			PROCESS_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, STARTUPINFOEXW,
+			TerminateProcess, WaitForSingleObject,
 		},
 	},
 	core::{PCWSTR, PWSTR},
@@ -50,9 +50,8 @@ pub(super) fn spawn(
 
 	// SAFETY: every pointer references live, NUL-terminated or explicitly bounded storage for the
 	// duration of the call. The command line is uniquely mutable, the startup attribute list owns its
-	// aligned backing storage, no handles are inherited, and STARTF_USESTDHANDLES with three null slots
-	// asks ConPTY to install its console handles. The process-information value is writable output
-	// storage.
+	// aligned backing storage, no native handles are inherited, and ConPTY installs the child console
+	// through the pseudoconsole attribute. The process-information value is writable output storage.
 	let created = unsafe {
 		CreateProcessW(
 			PCWSTR(command.application_name.as_ptr()),
@@ -82,10 +81,6 @@ pub(super) fn spawn(
 fn startup_info(attributes: &AttributeList) -> STARTUPINFOEXW {
 	let mut startup = STARTUPINFOEXW::default();
 	startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-	startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-	startup.StartupInfo.hStdInput = HANDLE::default();
-	startup.StartupInfo.hStdOutput = HANDLE::default();
-	startup.StartupInfo.hStdError = HANDLE::default();
 	startup.lpAttributeList = attributes.as_ptr();
 	startup
 }
@@ -249,10 +244,10 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn requests_conpty_replacement_for_all_standard_handles() {
+	fn leaves_standard_handle_replacement_to_conpty() {
 		let attributes = AttributeList::new(HPCON(42)).unwrap();
 		let startup = startup_info(&attributes);
-		assert_eq!(startup.StartupInfo.dwFlags, STARTF_USESTDHANDLES);
+		assert_eq!(startup.StartupInfo.dwFlags, Default::default());
 		assert_eq!(startup.StartupInfo.hStdInput, HANDLE::default());
 		assert_eq!(startup.StartupInfo.hStdOutput, HANDLE::default());
 		assert_eq!(startup.StartupInfo.hStdError, HANDLE::default());
