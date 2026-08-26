@@ -9,7 +9,10 @@ use std::{
 	},
 	pin::Pin,
 	process::ExitStatus,
-	sync::Arc,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 };
 
 use tokio::{
@@ -23,7 +26,7 @@ use windows::Win32::{
 		DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 	},
 	System::Threading::{
-		GetCurrentProcess, GetExitCodeProcess, INFINITE, TerminateProcess, WaitForSingleObject,
+		GetCurrentProcess, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
 	},
 };
 
@@ -34,7 +37,6 @@ use super::super::{ControllerSlot, PtyController};
 #[derive(Debug)]
 pub(super) struct ConPtyChild {
 	process: OwnedHandle,
-	#[cfg_attr(not(feature = "job-object"), allow(dead_code))]
 	primary_thread: Option<OwnedHandle>,
 	pid: u32,
 	kill_on_drop: bool,
@@ -42,6 +44,7 @@ pub(super) struct ConPtyChild {
 	controller: Option<Arc<ControllerSlot>>,
 	exit_status: ChildExitStatus,
 	wait_task: Option<JoinHandle<io::Result<ExitStatus>>>,
+	wait_cancel: Arc<AtomicBool>,
 	stdin: Option<ChildStdin>,
 	stdout: Option<ChildStdout>,
 	stderr: Option<ChildStderr>,
@@ -63,6 +66,7 @@ impl ConPtyChild {
 			controller: None,
 			exit_status: ChildExitStatus::Running,
 			wait_task: None,
+			wait_cancel: Arc::new(AtomicBool::new(false)),
 			stdin: None,
 			stdout: None,
 			stderr: None,
@@ -128,6 +132,7 @@ impl ChildWrapper for ConPtyChild {
 	}
 
 	fn disarm_job_object_layer(&mut self) -> io::Result<()> {
+		self.primary_thread.take();
 		self.cleanup_armed = false;
 		if let Some(controller) = &self.controller {
 			controller.commit();
@@ -185,10 +190,19 @@ impl ChildWrapper for ConPtyChild {
 
 			if self.wait_task.is_none() {
 				let process = duplicate_handle(&self.process)?;
+				let cancel = Arc::clone(&self.wait_cancel);
 				self.wait_task = Some(spawn_blocking(move || {
-					process_status(HANDLE(process.as_raw_handle()), INFINITE)?.ok_or_else(|| {
-						io::Error::other("infinite process wait returned without an exit status")
-					})
+					loop {
+						if cancel.load(Ordering::Acquire) {
+							return Err(io::Error::new(
+								io::ErrorKind::Interrupted,
+								"ConPTY process wait was canceled because the child was dropped",
+							));
+						}
+						if let Some(status) = process_status(HANDLE(process.as_raw_handle()), 50)? {
+							return Ok(status);
+						}
+					}
 				}));
 			}
 			let result = self
@@ -206,6 +220,7 @@ impl ChildWrapper for ConPtyChild {
 
 impl Drop for ConPtyChild {
 	fn drop(&mut self) {
+		self.wait_cancel.store(true, Ordering::Release);
 		if (self.cleanup_armed || self.kill_on_drop)
 			&& matches!(self.exit_status, ChildExitStatus::Running)
 			&& !matches!(process_status(self.raw_process_handle(), 0), Ok(Some(_)))
@@ -295,6 +310,7 @@ mod tests {
 			controller: None,
 			exit_status: ChildExitStatus::Running,
 			wait_task: None,
+			wait_cancel: Arc::new(AtomicBool::new(false)),
 			stdin: None,
 			stdout: None,
 			stderr: None,
@@ -396,6 +412,31 @@ mod tests {
 		assert_eq!(wait_native(&mut native), status);
 	}
 
+	#[tokio::test]
+	async fn dropping_after_a_canceled_wait_releases_the_blocking_task() {
+		let mut native = spawn_long_running();
+		let mut child = wrap(&native, false);
+		assert!(
+			tokio::time::timeout(Duration::from_millis(20), child.wait())
+				.await
+				.is_err()
+		);
+		let task = child
+			.wait_task
+			.take()
+			.expect("a canceled wait retains its blocking task");
+		drop(child);
+		let error = tokio::time::timeout(Duration::from_secs(5), task)
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap_err();
+		assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+		assert!(native.try_wait().unwrap().is_none());
+		native.kill().unwrap();
+		let _ = wait_native(&mut native);
+	}
+
 	#[test]
 	fn armed_spawn_cleanup_terminates_a_running_process() {
 		let mut native = spawn_long_running();
@@ -409,8 +450,10 @@ mod tests {
 	fn final_spawn_disarm_preserves_a_running_process() {
 		let mut native = spawn_long_running();
 		let mut child = wrap(&native, false);
+		child.primary_thread = Some(duplicate_process(&native));
 		child.cleanup_armed = true;
 		child.disarm_job_object_layer().unwrap();
+		assert!(child.primary_thread_handle().is_none());
 		drop(child);
 		assert!(native.try_wait().unwrap().is_none());
 		native.kill().unwrap();
