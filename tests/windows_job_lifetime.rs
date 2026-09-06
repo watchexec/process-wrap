@@ -179,7 +179,7 @@ async fn tokio_cancelled_wait_does_not_cache_the_leader_as_job_completion() -> i
 		directory.path(),
 	)?));
 	let mut child = command.wrap(JobObject).spawn()?;
-	let fixture = Fixture::attach(directory, child.id())?;
+	let fixture = Fixture::attach(directory, child.id().expect("leader is still running"))?;
 	assert!(child.try_wait()?.is_none());
 	assert!(
 		tokio::time::timeout(Duration::from_millis(200), child.wait())
