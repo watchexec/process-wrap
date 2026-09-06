@@ -180,33 +180,57 @@ impl ChildWrapper for JobObjectChild {
 				return Ok(*status);
 			}
 
-			const MAX_RETRY_ATTEMPT: usize = 10;
-
-			// always wait for parent to exit first, as by the time it does,
-			// it's likely that all its children have already exited.
 			let status = self.inner.wait().await?;
-			self.exit_status = ChildExitStatus::Exited(status);
-
-			// nevertheless, now try reaping all children a few times...
-			for _ in 1..MAX_RETRY_ATTEMPT {
-				if wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?.is_break() {
-					return Ok(status);
+			loop {
+				if wait_on_job(
+					self.job_port.job,
+					self.job_port.completion_port,
+					Some(Duration::ZERO),
+				)?
+				.is_break()
+				{
+					break;
+				}
+				// A cancelled future must not leave an unbounded waiter borrowing closed handles.
+				let owned = self.job_port.try_clone()?;
+				if spawn_blocking(move || {
+					let result = wait_on_job(
+						owned.job,
+						owned.completion_port,
+						Some(Duration::from_millis(10)),
+					);
+					drop(owned);
+					result
+				})
+				.await??
+				.is_break()
+				{
+					break;
 				}
 			}
-
-			// ...finally, if there are some that are still alive,
-			// block in the background to reap them fully.
-			let JobPort {
-				completion_port, ..
-			} = self.job_port;
-			let _ = spawn_blocking(move || wait_on_job(completion_port, None)).await??;
+			self.exit_status = ChildExitStatus::Exited(status);
 			Ok(status)
 		})
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		let _ = wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?;
-		self.inner.try_wait()
+		if let ChildExitStatus::Exited(status) = self.exit_status {
+			return Ok(Some(status));
+		}
+		if wait_on_job(
+			self.job_port.job,
+			self.job_port.completion_port,
+			Some(Duration::ZERO),
+		)?
+		.is_continue()
+		{
+			return Ok(None);
+		}
+		let status = self.inner.try_wait()?;
+		if let Some(status) = status {
+			self.exit_status = ChildExitStatus::Exited(status);
+		}
+		Ok(status)
 	}
 }

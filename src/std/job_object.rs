@@ -176,19 +176,35 @@ impl ChildWrapper for JobObjectChild {
 		// always wait for parent to exit first, as by the time it does,
 		// it's likely that all its children have already exited.
 		let status = self.inner.wait()?;
-		self.exit_status = ChildExitStatus::Exited(status);
 
 		// nevertheless, now wait and make sure we reap all children.
 		let JobPort {
-			completion_port, ..
+			job,
+			completion_port,
 		} = self.job_port;
-		let _ = wait_on_job(completion_port, None)?;
+		let _ = wait_on_job(job, completion_port, None)?;
+		self.exit_status = ChildExitStatus::Exited(status);
 		Ok(status)
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		let _ = wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?;
-		self.inner.try_wait()
+		if let ChildExitStatus::Exited(status) = self.exit_status {
+			return Ok(Some(status));
+		}
+		if wait_on_job(
+			self.job_port.job,
+			self.job_port.completion_port,
+			Some(Duration::ZERO),
+		)?
+		.is_continue()
+		{
+			return Ok(None);
+		}
+		let status = self.inner.try_wait()?;
+		if let Some(status) = status {
+			self.exit_status = ChildExitStatus::Exited(status);
+		}
+		Ok(status)
 	}
 }

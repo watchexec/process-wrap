@@ -3,14 +3,16 @@
 use std::{
 	io::{Error, Result},
 	ops::ControlFlow,
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 #[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
 use windows::{
 	Win32::{
-		Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE},
+		Foundation::{
+			CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+		},
 		System::{
 			Diagnostics::ToolHelp::{
 				CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
@@ -19,13 +21,14 @@ use windows::{
 			IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED},
 			JobObjects::{
 				AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-				JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-				JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
-				SetInformationJobObject, TerminateJobObject,
+				JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+				JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
+				JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+				QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 			},
 			Threading::{
-				CREATE_SUSPENDED, GetProcessId, INFINITE, OpenThread, PROCESS_CREATION_FLAGS,
-				ResumeThread, THREAD_SUSPEND_RESUME,
+				CREATE_SUSPENDED, GetProcessId, OpenThread, PROCESS_CREATION_FLAGS, ResumeThread,
+				THREAD_SUSPEND_RESUME,
 			},
 		},
 	},
@@ -104,6 +107,20 @@ unsafe impl Sync for PortHandle {}
 pub(crate) struct JobPort {
 	pub job: JobHandle,
 	pub completion_port: PortHandle,
+}
+
+#[cfg(feature = "tokio1")]
+impl JobPort {
+	pub(crate) fn try_clone(&self) -> Result<Self> {
+		use std::os::windows::io::{BorrowedHandle, IntoRawHandle};
+		let job = unsafe { BorrowedHandle::borrow_raw(self.job.0.0) }.try_clone_to_owned()?;
+		let port =
+			unsafe { BorrowedHandle::borrow_raw(self.completion_port.0.0) }.try_clone_to_owned()?;
+		Ok(Self {
+			job: JobHandle(HANDLE(job.into_raw_handle())),
+			completion_port: PortHandle(HANDLE(port.into_raw_handle())),
+		})
+	}
 }
 
 impl Drop for JobPort {
@@ -243,29 +260,63 @@ pub(crate) fn terminate_job(job: JobHandle, exit_code: u32) -> Result<()> {
 /// Wait for a job to complete.
 #[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 pub(crate) fn wait_on_job(
+	job: JobHandle,
 	completion_port: PortHandle,
 	timeout: Option<Duration>,
 ) -> Result<ControlFlow<()>> {
-	let mut code: u32 = 0;
-	let mut key: usize = 0;
-	let mut overlapped = OVERLAPPED::default();
-	let mut lp_overlapped = &mut overlapped as *mut OVERLAPPED;
-
-	let result = unsafe {
-		GetQueuedCompletionStatus(
-			completion_port.0,
-			&mut code,
-			&mut key,
-			&mut lp_overlapped as *mut _,
-			timeout.map_or(INFINITE, |d| d.as_millis().try_into().unwrap_or(INFINITE)),
-		)
-	};
-
-	// ignore timing out errors unless the timeout was specified to INFINITE
-	// https://docs.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getqueuedcompletionstatus
-	if timeout.is_some() && result.is_err() && lp_overlapped.is_null() {
-		return Ok(ControlFlow::Continue(()));
+	let started = Instant::now();
+	loop {
+		let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+		unsafe {
+			QueryInformationJobObject(
+				Some(job.0),
+				JobObjectBasicAccountingInformation,
+				&mut accounting as *mut _ as _,
+				std::mem::size_of_val(&accounting)
+					.try_into()
+					.expect("accounting information fits in a DWORD"),
+				None,
+			)
+		}?;
+		if accounting.ActiveProcesses == 0 {
+			return Ok(ControlFlow::Break(()));
+		}
+		let remaining = timeout.map(|timeout| timeout.saturating_sub(started.elapsed()));
+		if remaining == Some(Duration::ZERO) {
+			return Ok(ControlFlow::Continue(()));
+		}
+		// Job notifications can be unrelated or lost; accounting is the completion oracle.
+		let interval = remaining
+			.unwrap_or(Duration::from_millis(10))
+			.min(Duration::from_millis(10));
+		let mut code = 0;
+		let mut key = 0;
+		let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
+		let result = unsafe {
+			GetQueuedCompletionStatus(
+				completion_port.0,
+				&mut code,
+				&mut key,
+				&mut overlapped,
+				interval.as_millis().max(1) as u32,
+			)
+		};
+		match result {
+			Ok(()) => {}
+			Err(error) if error.code() == HRESULT::from_win32(WAIT_TIMEOUT.0) => {}
+			Err(error) => return Err(Error::other(error)),
+		}
 	}
+}
 
-	Ok(ControlFlow::Break(()))
+#[cfg(test)]
+mod wait_tests {
+	use super::*;
+
+	#[test]
+	fn invalid_job_is_an_error_even_for_nonblocking_wait() {
+		let job = JobHandle(INVALID_HANDLE_VALUE);
+		let port = PortHandle(INVALID_HANDLE_VALUE);
+		assert!(wait_on_job(job, port, Some(Duration::ZERO)).is_err());
+	}
 }
