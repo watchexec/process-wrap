@@ -56,7 +56,7 @@ tokio1 = ["dep:nix", "dep:futures", "dep:tokio"]
 creation-flags = ["dep:windows", "windows/Win32_System_Threading"]
 
 ## Wrapper: Job Object
-job-object = ["dep:windows", "windows/Win32_Security", "windows/Win32_System_Diagnostics_ToolHelp", "windows/Win32_System_IO", "windows/Win32_System_JobObjects", "windows/Win32_System_Threading"]
+job-object = ["dep:windows", "windows/Win32_Security", "windows/Win32_System_Diagnostics_ToolHelp", "windows/Win32_System_IO", "windows/Win32_System_JobObjects", "windows/Win32_System_SystemServices", "windows/Win32_System_Threading"]
 
 ## Wrapper: Kill on Drop
 kill-on-drop = []

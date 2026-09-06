@@ -24,12 +24,13 @@ use windows::{
 			IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED},
 			JobObjects::{
 				AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
-				JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_MSG_NEW_PROCESS,
+				JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 				JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
 				JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
 				JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
 				QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 			},
+			SystemServices::JOB_OBJECT_MSG_NEW_PROCESS,
 			Threading::{
 				CREATE_SUSPENDED, GetProcessId, OpenProcess, OpenThread, PROCESS_CREATION_FLAGS,
 				PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResumeThread,
