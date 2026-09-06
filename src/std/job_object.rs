@@ -10,10 +10,7 @@ use std::{
 
 #[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
-use windows::Win32::{
-	Foundation::{CloseHandle, HANDLE},
-	System::Threading::PROCESS_CREATION_FLAGS,
-};
+use windows::Win32::{Foundation::HANDLE, System::Threading::PROCESS_CREATION_FLAGS};
 
 use crate::{
 	ChildExitStatus,
@@ -150,11 +147,7 @@ impl ChildWrapper for JobObjectChild {
 		self.inner.as_mut()
 	}
 	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-		// manually drop the completion port
-		let its = std::mem::ManuallyDrop::new(self.job_port);
-		unsafe { CloseHandle(its.completion_port.0) }.ok();
-		// we leave the job handle unclosed, otherwise the Child is useless
-		// (as closing it will terminate the job)
+		self.job_port.detach();
 
 		self.inner
 	}
@@ -178,11 +171,7 @@ impl ChildWrapper for JobObjectChild {
 		let status = self.inner.wait()?;
 
 		// nevertheless, now wait and make sure we reap all children.
-		let JobPort {
-			job,
-			completion_port,
-		} = self.job_port;
-		let _ = wait_on_job(job, completion_port, None)?;
+		let _ = wait_on_job(&self.job_port, None)?;
 		self.exit_status = ChildExitStatus::Exited(status);
 		Ok(status)
 	}
@@ -192,13 +181,7 @@ impl ChildWrapper for JobObjectChild {
 		if let ChildExitStatus::Exited(status) = self.exit_status {
 			return Ok(Some(status));
 		}
-		if wait_on_job(
-			self.job_port.job,
-			self.job_port.completion_port,
-			Some(Duration::ZERO),
-		)?
-		.is_continue()
-		{
+		if wait_on_job(&self.job_port, Some(Duration::ZERO))?.is_continue() {
 			return Ok(None);
 		}
 		let status = self.inner.try_wait()?;

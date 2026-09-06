@@ -10,10 +10,7 @@ use std::{
 use tokio::{process::Command, task::spawn_blocking};
 #[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
-use windows::Win32::{
-	Foundation::{CloseHandle, HANDLE},
-	System::Threading::PROCESS_CREATION_FLAGS,
-};
+use windows::Win32::{Foundation::HANDLE, System::Threading::PROCESS_CREATION_FLAGS};
 
 use crate::{
 	ChildExitStatus,
@@ -156,11 +153,7 @@ impl ChildWrapper for JobObjectChild {
 		self.inner.as_mut()
 	}
 	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-		// manually drop the completion port
-		let its = std::mem::ManuallyDrop::new(self.job_port);
-		unsafe { CloseHandle(its.completion_port.0) }.ok();
-		// we leave the job handle unclosed, otherwise the Child is useless
-		// (as closing it will terminate the job)
+		self.job_port.detach();
 
 		self.inner
 	}
@@ -182,23 +175,13 @@ impl ChildWrapper for JobObjectChild {
 
 			let status = self.inner.wait().await?;
 			loop {
-				if wait_on_job(
-					self.job_port.job,
-					self.job_port.completion_port,
-					Some(Duration::ZERO),
-				)?
-				.is_break()
-				{
+				if wait_on_job(&self.job_port, Some(Duration::ZERO))?.is_break() {
 					break;
 				}
 				// A cancelled future must not leave an unbounded waiter borrowing closed handles.
 				let owned = self.job_port.try_clone()?;
 				if spawn_blocking(move || {
-					let result = wait_on_job(
-						owned.job,
-						owned.completion_port,
-						Some(Duration::from_millis(10)),
-					);
+					let result = wait_on_job(&owned, Some(Duration::from_millis(10)));
 					drop(owned);
 					result
 				})
@@ -218,13 +201,7 @@ impl ChildWrapper for JobObjectChild {
 		if let ChildExitStatus::Exited(status) = self.exit_status {
 			return Ok(Some(status));
 		}
-		if wait_on_job(
-			self.job_port.job,
-			self.job_port.completion_port,
-			Some(Duration::ZERO),
-		)?
-		.is_continue()
-		{
+		if wait_on_job(&self.job_port, Some(Duration::ZERO))?.is_continue() {
 			return Ok(None);
 		}
 		let status = self.inner.try_wait()?;

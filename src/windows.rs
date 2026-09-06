@@ -3,6 +3,8 @@
 use std::{
 	io::{Error, Result},
 	ops::ControlFlow,
+	os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle as ProcessHandle},
+	sync::{Arc, Mutex, TryLockError},
 	time::{Duration, Instant},
 };
 
@@ -11,7 +13,8 @@ use tracing::{debug, instrument};
 use windows::{
 	Win32::{
 		Foundation::{
-			CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+			CloseHandle, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, HANDLE,
+			INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 		},
 		System::{
 			Diagnostics::ToolHelp::{
@@ -20,15 +23,17 @@ use windows::{
 			},
 			IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED},
 			JobObjects::{
-				AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+				AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+				JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_MSG_NEW_PROCESS,
 				JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
 				JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
 				JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
 				QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 			},
 			Threading::{
-				CREATE_SUSPENDED, GetProcessId, OpenThread, PROCESS_CREATION_FLAGS, ResumeThread,
-				THREAD_SUSPEND_RESUME,
+				CREATE_SUSPENDED, GetProcessId, OpenProcess, OpenThread, PROCESS_CREATION_FLAGS,
+				PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResumeThread,
+				THREAD_SUSPEND_RESUME, WaitForSingleObject,
 			},
 		},
 	},
@@ -107,6 +112,14 @@ unsafe impl Sync for PortHandle {}
 pub(crate) struct JobPort {
 	pub job: JobHandle,
 	pub completion_port: PortHandle,
+	completion: Arc<Mutex<JobCompletion>>,
+}
+
+impl JobPort {
+	pub(crate) fn detach(mut self) {
+		// into_inner preserves the original job lifetime while releasing observation resources.
+		self.job = JobHandle(INVALID_HANDLE_VALUE);
+	}
 }
 
 #[cfg(feature = "tokio1")]
@@ -119,6 +132,7 @@ impl JobPort {
 		Ok(Self {
 			job: JobHandle(HANDLE(job.into_raw_handle())),
 			completion_port: PortHandle(HANDLE(port.into_raw_handle())),
+			completion: Arc::clone(&self.completion),
 		})
 	}
 }
@@ -189,7 +203,13 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 	#[cfg(feature = "tracing")]
 	debug!(?job, ?process_handle, "done AssignProcessToJobObject");
 
+	let completion = Arc::new(Mutex::new(JobCompletion {
+		key: job.0.0 as usize,
+		observed: 0,
+		pending: Vec::new(),
+	}));
 	Ok(JobPort {
+		completion,
 		job: JobHandle(job.into_raw()),
 		completion_port: PortHandle(completion_port.into_raw()),
 	})
@@ -257,15 +277,82 @@ pub(crate) fn terminate_job(job: JobHandle, exit_code: u32) -> Result<()> {
 	unsafe { TerminateJobObject(job.0, exit_code) }.map_err(Error::other)
 }
 
-/// Wait for a job to complete.
-#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
-pub(crate) fn wait_on_job(
-	job: JobHandle,
-	completion_port: PortHandle,
-	timeout: Option<Duration>,
-) -> Result<ControlFlow<()>> {
-	let started = Instant::now();
-	loop {
+#[derive(Debug, Default)]
+struct JobCompletion {
+	key: usize,
+	observed: u32,
+	pending: Vec<ProcessHandle>,
+}
+
+impl JobCompletion {
+	fn observe_process(&mut self, job: JobHandle, pid: usize) -> Result<()> {
+		let observed = self
+			.observed
+			.checked_add(1)
+			.ok_or_else(|| Error::other("job process census overflow"))?;
+		let pid = u32::try_from(pid).map_err(Error::other)?;
+		let handle = match unsafe {
+			OpenProcess(
+				PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+				false,
+				pid,
+			)
+		} {
+			Ok(handle) => unsafe { ProcessHandle::from_raw_handle(handle.0) },
+			Err(error) if error.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) => {
+				self.observed = observed;
+				return Ok(());
+			}
+			Err(error) => return Err(Error::other(error)),
+		};
+		let mut belongs = Default::default();
+		unsafe { IsProcessInJob(HANDLE(handle.as_raw_handle()), Some(job.0), &mut belongs) }?;
+		if belongs.as_bool() {
+			self.pending.push(handle);
+		}
+		self.observed = observed;
+		Ok(())
+	}
+
+	fn poll(&mut self, job: JobHandle, port: PortHandle) -> Result<ControlFlow<()>> {
+		let mut drained = false;
+		for _ in 0..64 {
+			let mut code = 0;
+			let mut key = 0;
+			let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
+			match unsafe {
+				GetQueuedCompletionStatus(port.0, &mut code, &mut key, &mut overlapped, 0)
+			} {
+				Ok(()) => {
+					if key != self.key {
+						return Err(Error::other("unexpected job completion key"));
+					}
+					if code == JOB_OBJECT_MSG_NEW_PROCESS {
+						self.observe_process(job, overlapped as usize)?;
+					}
+				}
+				Err(error) if error.code() == HRESULT::from_win32(WAIT_TIMEOUT.0) => {
+					drained = true;
+					break;
+				}
+				Err(error) => return Err(Error::other(error)),
+			}
+		}
+		if !drained {
+			return Ok(ControlFlow::Continue(()));
+		}
+		let mut index = 0;
+		while index < self.pending.len() {
+			match unsafe { WaitForSingleObject(HANDLE(self.pending[index].as_raw_handle()), 0) } {
+				WAIT_OBJECT_0 => {
+					self.pending.swap_remove(index);
+				}
+				WAIT_TIMEOUT => {
+					index += 1;
+				}
+				_ => return Err(Error::last_os_error()),
+			}
+		}
 		let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
 		unsafe {
 			QueryInformationJobObject(
@@ -278,34 +365,54 @@ pub(crate) fn wait_on_job(
 				None,
 			)
 		}?;
-		if accounting.ActiveProcesses == 0 {
-			return Ok(ControlFlow::Break(()));
+		if accounting.ActiveProcesses != 0 {
+			return Ok(ControlFlow::Continue(()));
+		}
+		// Job accounting can reach zero before termination finishes, and notifications can be lost.
+		if self.observed != accounting.TotalProcesses {
+			return Err(Error::other(
+				"cannot confirm job completion: process notification census is incomplete",
+			));
+		}
+		Ok(if self.pending.is_empty() {
+			ControlFlow::Break(())
+		} else {
+			ControlFlow::Continue(())
+		})
+	}
+}
+
+/// Wait for a job and its observed processes to complete.
+#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(job_port)))]
+pub(crate) fn wait_on_job(
+	job_port: &JobPort,
+	timeout: Option<Duration>,
+) -> Result<ControlFlow<()>> {
+	let started = Instant::now();
+	loop {
+		match job_port.completion.try_lock() {
+			Ok(mut completion) => {
+				if completion
+					.poll(job_port.job, job_port.completion_port)?
+					.is_break()
+				{
+					return Ok(ControlFlow::Break(()));
+				}
+			}
+			Err(TryLockError::WouldBlock) => {}
+			Err(TryLockError::Poisoned(_)) => {
+				return Err(Error::other("job completion state is poisoned"));
+			}
 		}
 		let remaining = timeout.map(|timeout| timeout.saturating_sub(started.elapsed()));
 		if remaining == Some(Duration::ZERO) {
 			return Ok(ControlFlow::Continue(()));
 		}
-		// Job notifications can be unrelated or lost; accounting is the completion oracle.
-		let interval = remaining
-			.unwrap_or(Duration::from_millis(10))
-			.min(Duration::from_millis(10));
-		let mut code = 0;
-		let mut key = 0;
-		let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
-		let result = unsafe {
-			GetQueuedCompletionStatus(
-				completion_port.0,
-				&mut code,
-				&mut key,
-				&mut overlapped,
-				interval.as_millis().max(1) as u32,
-			)
-		};
-		match result {
-			Ok(()) => {}
-			Err(error) if error.code() == HRESULT::from_win32(WAIT_TIMEOUT.0) => {}
-			Err(error) => return Err(Error::other(error)),
-		}
+		std::thread::sleep(
+			remaining
+				.unwrap_or(Duration::from_millis(10))
+				.min(Duration::from_millis(10)),
+		);
 	}
 }
 
@@ -314,9 +421,48 @@ mod wait_tests {
 	use super::*;
 
 	#[test]
+	fn incomplete_census_cannot_confirm_an_empty_job() -> Result<()> {
+		let job = OwnedHandle(unsafe { CreateJobObjectW(None, None) }?);
+		let port =
+			OwnedHandle(unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) }?);
+		let mut completion = JobCompletion {
+			observed: 1,
+			..Default::default()
+		};
+		for _ in 0..2 {
+			let error = completion
+				.poll(JobHandle(job.0), PortHandle(port.0))
+				.unwrap_err();
+			assert!(
+				error
+					.to_string()
+					.contains("process notification census is incomplete")
+			);
+		}
+		Ok(())
+	}
+
+	#[test]
+	fn process_census_overflow_does_not_advance_observation() {
+		let mut completion = JobCompletion {
+			observed: u32::MAX,
+			..Default::default()
+		};
+		assert!(
+			completion
+				.observe_process(JobHandle(INVALID_HANDLE_VALUE), 0)
+				.is_err()
+		);
+		assert_eq!(completion.observed, u32::MAX);
+	}
+
+	#[test]
 	fn invalid_job_is_an_error_even_for_nonblocking_wait() {
-		let job = JobHandle(INVALID_HANDLE_VALUE);
-		let port = PortHandle(INVALID_HANDLE_VALUE);
-		assert!(wait_on_job(job, port, Some(Duration::ZERO)).is_err());
+		let job_port = JobPort {
+			job: JobHandle(INVALID_HANDLE_VALUE),
+			completion_port: PortHandle(INVALID_HANDLE_VALUE),
+			completion: Arc::default(),
+		};
+		assert!(wait_on_job(&job_port, Some(Duration::ZERO)).is_err());
 	}
 }
