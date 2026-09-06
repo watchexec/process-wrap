@@ -140,8 +140,12 @@ impl JobPort {
 
 impl Drop for JobPort {
 	fn drop(&mut self) {
-		unsafe { CloseHandle(self.job.0) }.ok();
-		unsafe { CloseHandle(self.completion_port.0) }.ok();
+		if self.job.0 != INVALID_HANDLE_VALUE {
+			unsafe { CloseHandle(self.job.0) }.ok();
+		}
+		if self.completion_port.0 != INVALID_HANDLE_VALUE {
+			unsafe { CloseHandle(self.completion_port.0) }.ok();
+		}
 	}
 }
 
