@@ -3,9 +3,9 @@
 macro_rules! wrapper_hook_tests {
 	(
 		$module:ident,
-		$command:path,
 		$child:path,
 		$command_wrap:path,
+		$spawn_attempt:path,
 		$command_wrapper:path,
 		$child_wrapper:path,
 		$runtime:expr
@@ -21,9 +21,9 @@ macro_rules! wrapper_hook_tests {
 
 			use $child as Child;
 			use $child_wrapper as ChildWrapper;
-			use $command as Command;
 			use $command_wrap as CommandWrap;
 			use $command_wrapper as CommandWrapper;
+			use $spawn_attempt as SpawnAttempt;
 
 			const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -57,7 +57,7 @@ macro_rules! wrapper_hook_tests {
 			impl CommandWrapper for First {
 				fn pre_spawn(
 					&mut self,
-					_command: &mut Command,
+					_command: &mut SpawnAttempt,
 					core: &CommandWrap,
 				) -> io::Result<()> {
 					self.observe(Phase::Pre, core);
@@ -66,8 +66,8 @@ macro_rules! wrapper_hook_tests {
 
 				fn post_spawn(
 					&mut self,
-					_command: &mut Command,
-					_child: &mut Child,
+					_command: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
 					core: &CommandWrap,
 				) -> io::Result<()> {
 					self.observe(Phase::Post, core);
@@ -100,7 +100,7 @@ macro_rules! wrapper_hook_tests {
 			impl CommandWrapper for Second {
 				fn pre_spawn(
 					&mut self,
-					_command: &mut Command,
+					_command: &mut SpawnAttempt,
 					core: &CommandWrap,
 				) -> io::Result<()> {
 					self.observe(Phase::Pre, core);
@@ -109,8 +109,8 @@ macro_rules! wrapper_hook_tests {
 
 				fn post_spawn(
 					&mut self,
-					_command: &mut Command,
-					_child: &mut Child,
+					_command: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
 					core: &CommandWrap,
 				) -> io::Result<()> {
 					self.observe(Phase::Post, core);
@@ -174,7 +174,7 @@ macro_rules! wrapper_hook_tests {
 			impl CommandWrapper for FailOnce {
 				fn pre_spawn(
 					&mut self,
-					_command: &mut Command,
+					_command: &mut SpawnAttempt,
 					core: &CommandWrap,
 				) -> io::Result<()> {
 					self.visit(Phase::Pre, core)
@@ -182,8 +182,8 @@ macro_rules! wrapper_hook_tests {
 
 				fn post_spawn(
 					&mut self,
-					_command: &mut Command,
-					_child: &mut Child,
+					_command: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
 					core: &CommandWrap,
 				) -> io::Result<()> {
 					self.visit(Phase::Post, core)
@@ -215,7 +215,7 @@ macro_rules! wrapper_hook_tests {
 			impl CommandWrapper for Peer {
 				fn pre_spawn(
 					&mut self,
-					_command: &mut Command,
+					_command: &mut SpawnAttempt,
 					core: &CommandWrap,
 				) -> io::Result<()> {
 					self.observe(Phase::Pre, core);
@@ -224,8 +224,8 @@ macro_rules! wrapper_hook_tests {
 
 				fn post_spawn(
 					&mut self,
-					_command: &mut Command,
-					_child: &mut Child,
+					_command: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
 					core: &CommandWrap,
 				) -> io::Result<()> {
 					self.observe(Phase::Post, core);
@@ -422,9 +422,9 @@ macro_rules! wrapper_hook_tests {
 #[cfg(feature = "std")]
 wrapper_hook_tests!(
 	std_frontend,
-	std::process::Command,
 	std::process::Child,
 	process_wrap::std::CommandWrap,
+	process_wrap::std::SpawnAttempt,
 	process_wrap::std::CommandWrapper,
 	process_wrap::std::ChildWrapper,
 	None
@@ -433,9 +433,9 @@ wrapper_hook_tests!(
 #[cfg(feature = "tokio1")]
 wrapper_hook_tests!(
 	tokio_frontend,
-	tokio::process::Command,
 	tokio::process::Child,
 	process_wrap::tokio::CommandWrap,
+	process_wrap::tokio::SpawnAttempt,
 	process_wrap::tokio::CommandWrapper,
 	process_wrap::tokio::ChildWrapper,
 	Some(

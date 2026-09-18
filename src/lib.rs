@@ -8,16 +8,20 @@
 //! ```
 //!
 //! ```rust,no_run
-//! # fn main() -> std::io::Result<()> {
+//! # #[cfg(feature = "std")]
+//! # mod example {
+//! # fn run() -> std::io::Result<()> {
 //! use process_wrap::std::*;
 //!
 //! let mut command = Command::with_new("watch", |command| { command.arg("ls"); });
-//! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
-//! #[cfg(windows)] { command.wrap(JobObject); }
+//! #[cfg(all(unix, feature = "process-group"))] { command.wrap(ProcessGroup::leader()); }
+//! #[cfg(all(windows, feature = "job-object"))] { command.wrap(JobObject); }
 //! let mut child = command.spawn()?;
 //! let status = child.wait()?;
 //! dbg!(status);
 //! # Ok(()) }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! ## Migrating from command-group
@@ -42,21 +46,33 @@
 //! modules for compatibility.
 //!
 //! ```rust
+//! # #[cfg(feature = "std")]
+//! # mod example {
 //! use process_wrap::std::*;
+//! # fn run() {
 //! let mut command = Command::new("ls");
 //! command.arg("-l");
-//! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
-//! #[cfg(windows)] { command.wrap(JobObject); }
+//! #[cfg(all(unix, feature = "process-group"))] { command.wrap(ProcessGroup::leader()); }
+//! #[cfg(all(windows, feature = "job-object"))] { command.wrap(JobObject); }
+//! # }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! The closure constructor remains available, and its inferred argument is now process-wrap's
 //! command:
 //!
 //! ```rust
+//! # #[cfg(feature = "std")]
+//! # mod example {
 //! use process_wrap::std::*;
+//! # fn run() {
 //! let mut command = Command::with_new("ls", |command| { command.arg("-l"); });
-//! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
-//! #[cfg(windows)] { command.wrap(JobObject); }
+//! #[cfg(all(unix, feature = "process-group"))] { command.wrap(ProcessGroup::leader()); }
+//! #[cfg(all(windows, feature = "job-object"))] { command.wrap(JobObject); }
+//! # }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! Existing native commands can still be converted with `Command::from`. They retain exact native
@@ -74,9 +90,15 @@
 //! If targetting a single platform, then a fluent style is possible:
 //!
 //! ```rust
+//! # #[cfg(all(unix, feature = "std", feature = "process-group"))]
+//! # mod example {
 //! use process_wrap::std::*;
+//! # fn run() {
 //! Command::with_new("ls", |command| { command.arg("-l"); })
 //!    .wrap(ProcessGroup::leader());
+//! # }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! The `wrap` method can be called multiple times to add multiple wrappers. The order of the
@@ -89,21 +111,26 @@
 //!
 //! # KillOnDrop and CreationFlags
 //!
-//! The options set on an underlying `Command` are not queryable from library or user code. In most
-//! cases this is not an issue; however on Windows, the `JobObject` wrapper needs to know the value
-//! of `.kill_on_drop()` and any `.creation_flags()` set. The `KillOnDrop` and `CreationFlags` are
-//! "shims" that _should_ be used instead of the aforementioned methods on `Command`. They will
-//! internally set the values on the `Command` and also store them in the wrapper, so that wrappers
-//! are able to access them.
+//! Calling native `.kill_on_drop()` or `.creation_flags()` makes a command native-only: those
+//! settings cannot be queried or reconstructed by wrappers and alternate transports. `JobObject`
+//! and spawn providers nevertheless need those policies in order to compose correctly. The
+//! `KillOnDrop` and `CreationFlags` wrappers therefore record portable policy on each spawn attempt
+//! and _should_ be used instead of the native-only methods when composition is required.
 //!
 //! In practice:
 //!
 //! ## Instead of `.kill_on_drop(true)` (Tokio-only):
 //!
 //! ```rust
+//! # #[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
+//! # mod example {
 //! use process_wrap::tokio::*;
+//! # fn run() {
 //! let mut command = Command::with_new("ls", |command| { command.arg("-l"); });
 //! command.wrap(KillOnDrop);
+//! # }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! ## Instead of `.creation_flags(CREATE_NO_WINDOW)` (Windows-only):
@@ -132,10 +159,14 @@
 //! Here's the most basic impl (shown for Tokio):
 //!
 //! ```rust
+//! # #[cfg(feature = "tokio1")]
+//! # mod example {
 //! use process_wrap::tokio::*;
 //! #[derive(Debug)]
 //! pub struct YourWrapper;
 //! impl CommandWrapper for YourWrapper {}
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! The trait provides extension or hook points into the lifecycle of a `Command`:
@@ -145,23 +176,60 @@
 //!   incorporate all or part of the second, concretely typed wrapper. By default, this does nothing
 //!   (that is, only the first registered wrapper instance of a type applies).
 //!
-//! - **`fn pre_spawn(&mut self, command: &mut tokio::process::Command, core: &Command)`** is called
-//!   before the command is spawned, and gives mutable access to that attempt's native command. It
-//!   also gives mutable access to the wrapper instance, so state can be stored if needed. The `core`
-//!   reference gives access to data from other wrappers; for example, that's how `CreationFlags` on
-//!   Windows works along with `JobObject`. By default does nothing.
+//! - **`fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, command: &Command)`** is called before
+//!   spawning. It can record portable policy for this attempt and inspect peer wrappers through
+//!   `command`. Mutations copied from a tracked command apply to one attempt; native-only commands
+//!   retain native mutations. Calling `attempt.native_mut()` or `stdin`/`stdout`/`stderr` makes a
+//!   tracked attempt incompatible with a portable provider. By default does nothing.
 //!
-//! - **`fn post_spawn(&mut self, command: &mut tokio::process::Command, child: &mut tokio::process::Child, core: &Command)`**
-//!   is called after spawn, and should be used for any necessary cleanups. It is offered for
-//!   completeness but is expected to be less used than `wrap_child()`. By default does nothing.
+//! - **`fn post_spawn(&mut self, attempt: &mut SpawnAttempt, child: &mut dyn ChildWrapper, command: &Command)`**
+//!   is called after any transport creates its child. The child may be a terminal custom/provider
+//!   child with no native value. Changing command settings on `attempt` here cannot configure the
+//!   already-created child. By default does nothing.
 //!
-//! - **`fn wrap_child(&mut self, child: Box<dyn ChildWrapper>, core: &Command)`** is
-//!   called after all `post_spawn()`s have run. If your wrapper needs to override the methods on
-//!   Child, then it should create an instance of its own type implementing `ChildWrapper` and
-//!   return it here. Child wraps are _in order_: you may end up with a `Foo(Bar(Child))` or a
-//!   `Bar(Foo(Child))` depending on if `.wrap(Foo).wrap(Bar)` or `.wrap(Bar).wrap(Foo)` was called.
-//!   If your functionality is order-dependent, make sure to specify so in your documentation! By
-//!   default does nothing: no wrapping is performed and the input `child` is returned as-is.
+//! - **`fn wrap_child(&mut self, child: Box<dyn ChildWrapper>, command: &Command)`** is called after
+//!   all `post_spawn()` hooks. If your wrapper needs to override child methods, create and return its
+//!   own `ChildWrapper` layer. Child wraps run in registration order, so
+//!   `.wrap(Foo).wrap(Bar)` produces an outer `Bar(Foo(child))`. By default returns the input child.
+//!
+//! - **`fn spawn_provider(&self) -> Option<&dyn SpawnProvider>`** exposes an alternate transport owned
+//!   by this wrapper. A provider exposed during selection must remain available throughout the spawn
+//!   lifecycle, and only one registered wrapper may expose one. By default returns `None`.
+//!
+//! Pre-spawn, post-spawn, and child-wrapping hooks all run in registration order and stop at the first
+//! error or panic. The active wrapper remains registered but is temporarily unavailable through
+//! `get_wrap`; peer wrappers remain visible.
+//!
+//! ## Spawn providers
+//!
+//! A spawn provider replaces process creation while retaining the complete wrapper lifecycle, making
+//! custom transports such as PTYs composable with other wrappers. The provider path runs:
+//!
+//! 1. `check_available`
+//! 2. native-only base rejection
+//! 3. `validate_command`
+//! 4. every `pre_spawn` hook
+//! 5. native-only attempt rejection
+//! 6. `validate_attempt`
+//! 7. provider `spawn`
+//! 8. every `post_spawn` hook
+//! 9. every child wrapper
+//! 10. transaction `commit`
+//!
+//! Validation rejects unsupported portable policy before operating-system allocation. `spawn`
+//! returns a child satisfying the frontend's complete `ChildWrapper` contract and a fresh, armed
+//! `SpawnTransaction` which owns cleanup independently of the child chain. A later public hook,
+//! wrapper, or commit error/panic causes best-effort rollback while preserving the original failure.
+//! Cleanup before `spawn` returns that product remains the provider's responsibility.
+//!
+//! A command may register only one provider; conflicts are rejected before callbacks or allocation.
+//! Providers and wrapper state are reusable across repeated spawns. `spawn_with` and
+//! `spawn_with_child` reject a registered provider instead of bypassing it. On Unix, when wrappers
+//! request built-in child setup, a successful explicit spawner must create its returned child before
+//! replacing the native command. Whenever it replaces that command, including before returning an
+//! error or unwinding, the displaced command must be dropped before control leaves the spawner. A
+//! replacement is discarded with a tracked attempt or retained by a native-only base. Process-wrap
+//! cannot apply setup to a replacement which the closure creates and immediately spawns.
 //!
 //! ## An Example Logging Wrapper
 //!
@@ -171,8 +239,10 @@
 //! in.
 //!
 //! ```rust
-//! # use process_wrap::std::{CommandWrap, CommandWrapper};
-//! # use std::{fs::File, io, path::PathBuf, process::Command, thread};
+//! # #[cfg(feature = "std")]
+//! # mod example {
+//! # use process_wrap::std::{CommandWrap, CommandWrapper, SpawnAttempt};
+//! # use std::{fs::File, io, path::PathBuf, thread};
 //! #[derive(Debug)]
 //! struct LogFile {
 //!     path: PathBuf,
@@ -185,7 +255,7 @@
 //! }
 //!
 //! impl CommandWrapper for LogFile {
-//!     fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> io::Result<()> {
+//!     fn pre_spawn(&mut self, command: &mut SpawnAttempt, _core: &CommandWrap) -> io::Result<()> {
 //!         let mut logfile = File::create(&self.path)?;
 //!         let (mut rx, tx) = io::pipe()?;
 //!
@@ -193,10 +263,14 @@
 //!          io::copy(&mut rx, &mut logfile).unwrap();
 //!         });
 //!
-//!         command.stdout(tx.try_clone()?).stderr(tx);
+//!         command
+//!             .stdout(tx.try_clone()?.into())
+//!             .stderr(tx.into());
 //!         Ok(())
 //!     }
 //! }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! That's a great start, but it's actually introduced a resource leak: if the main thread of your
@@ -206,12 +280,16 @@
 //! when calling `.wait()` on the `ChildWrapper`.
 //!
 //! ```rust
-//! # use process_wrap::std::{ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper};
+//! # #[cfg(feature = "std")]
+//! # mod example {
+//! # use process_wrap::std::{
+//! #     ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper, SpawnAttempt,
+//! # };
 //! # use std::{
 //! #     fs::File,
 //! #     io, mem,
 //! #     path::PathBuf,
-//! #     process::{Command, ExitStatus},
+//! #     process::ExitStatus,
 //! #     thread::{self, JoinHandle},
 //! # };
 //! #[derive(Debug)]
@@ -230,7 +308,7 @@
 //! }
 //!
 //! impl CommandWrapper for LogFile {
-//!     fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> io::Result<()> {
+//!     fn pre_spawn(&mut self, command: &mut SpawnAttempt, _core: &CommandWrap) -> io::Result<()> {
 //!         let mut logfile = File::create(&self.path)?;
 //!         let (mut rx, tx) = io::pipe()?;
 //!
@@ -238,7 +316,9 @@
 //!          io::copy(&mut rx, &mut logfile).unwrap();
 //!         }));
 //!
-//!         command.stdout(tx.try_clone()?).stderr(tx);
+//!         command
+//!             .stdout(tx.try_clone()?.into())
+//!             .stderr(tx.into());
 //!         Ok(())
 //!     }
 //!
@@ -291,7 +371,13 @@
 //!         exit_status
 //!     }
 //! }
+//! # }
+//! # fn main() {}
 //! ```
+//!
+//! Calling `stdout` and `stderr` makes this attempt native-only, so this particular wrapper is for the
+//! native or explicit spawning paths. A registered portable provider rejects the opaque attempt before
+//! its validation or allocation callbacks.
 //!
 //! The tracked process-wrap command does not retain the `tx` handles from this hook. Each spawn uses
 //! a fresh native attempt command, and that attempt is dropped before `spawn()` returns. The child has
@@ -302,13 +388,17 @@
 //! Finally, we can test that our new command-wrapper works:
 //!
 //! ```rust
-//! # use process_wrap::std::{ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper};
+//! # #[cfg(feature = "std")]
+//! # mod example {
+//! # use process_wrap::std::{
+//! #     ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper, SpawnAttempt,
+//! # };
 //! # use std::{
 //! #     error::Error,
 //! #     fs::{self, File},
 //! #     io, mem,
 //! #     path::PathBuf,
-//! #     process::{Child, Command, ExitStatus},
+//! #     process::ExitStatus,
 //! #     thread::{self, JoinHandle},
 //! # };
 //! # use tempfile::NamedTempFile;
@@ -328,7 +418,7 @@
 //! # }
 //! #
 //! # impl CommandWrapper for LogFile {
-//! #     fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> io::Result<()> {
+//! #     fn pre_spawn(&mut self, command: &mut SpawnAttempt, _core: &CommandWrap) -> io::Result<()> {
 //! #         let mut logfile = File::create(&self.path)?;
 //! #         let (mut rx, tx) = io::pipe()?;
 //! #
@@ -336,7 +426,9 @@
 //! #          io::copy(&mut rx, &mut logfile).unwrap();
 //! #         }));
 //! #
-//! #         command.stdout(tx.try_clone()?).stderr(tx);
+//! #         command
+//! #             .stdout(tx.try_clone()?.into())
+//! #             .stderr(tx.into());
 //! #         Ok(())
 //! #     }
 //! #
@@ -413,6 +505,8 @@
 //!
 //!     Ok(())
 //! }
+//! # }
+//! # fn main() {}
 //! ```
 //!
 //! # Features
@@ -435,6 +529,10 @@
 //! - `process-session`: **default**, enables the process session wrapper (Unix-only).
 //! - `reset-sigmask`: enables the sigmask reset wrapper (Unix-only).
 //!
+//! ## Diagnostics
+//!
+//! - `tracing`: **default**, enables internal lifecycle diagnostics through the `tracing` crate.
+//!
 #![doc(html_favicon_url = "https://watchexec.github.io/logo:command-group.svg")]
 #![doc(html_logo_url = "https://watchexec.github.io/logo:command-group.svg")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -442,15 +540,25 @@
 
 mod command;
 pub(crate) mod generic_wrap;
+#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+pub(crate) mod unix;
+#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, any(feature = "std", feature = "tokio1")))))]
+pub use unix::ProcessGroupTarget;
 
-pub use command::Command;
+#[cfg(windows)]
+#[cfg_attr(docsrs, doc(cfg(windows)))]
+pub use command::WindowsSpawnPolicy;
 #[doc(hidden)]
 pub use command::{Backend, Blocking, NativeCommand, Tokio1};
+pub use command::{Command, CommandArg, SpawnAttempt, SpawnTransaction};
 
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod std;
 
 #[cfg(feature = "tokio1")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio1")))]
 pub mod tokio;
 
 #[cfg(all(
@@ -462,7 +570,7 @@ mod windows;
 
 /// Internal memoization of the exit status of a child process.
 #[allow(dead_code)] // easier than listing exactly which featuresets use it
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum ChildExitStatus {
 	Running,
 	Exited(::std::process::ExitStatus),

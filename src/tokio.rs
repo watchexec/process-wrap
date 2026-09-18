@@ -9,23 +9,44 @@
 //! ```
 
 #[doc(inline)]
-pub use core::{ChildWrapper, Command, CommandWrap, CommandWrapper};
+pub use crate::CommandArg;
+#[cfg(unix)]
+#[cfg_attr(docsrs, doc(cfg(unix)))]
+#[doc(inline)]
+pub use crate::ProcessGroupTarget;
+#[doc(inline)]
+pub use crate::SpawnTransaction;
+#[cfg(windows)]
+#[cfg_attr(docsrs, doc(cfg(windows)))]
+#[doc(inline)]
+pub use crate::WindowsSpawnPolicy;
+#[doc(inline)]
+pub use core::{
+	ChildWrapper, Command, CommandWrap, CommandWrapper, ProviderProduct, SpawnAttempt,
+	SpawnProvider,
+};
 #[cfg(all(windows, feature = "creation-flags"))]
+#[cfg_attr(docsrs, doc(cfg(all(windows, feature = "creation-flags"))))]
 #[doc(inline)]
 pub use creation_flags::CreationFlags;
 #[cfg(all(windows, feature = "job-object"))]
+#[cfg_attr(docsrs, doc(cfg(all(windows, feature = "job-object"))))]
 #[doc(inline)]
 pub use job_object::{JobObject, JobObjectChild};
 #[cfg(feature = "kill-on-drop")]
+#[cfg_attr(docsrs, doc(cfg(feature = "kill-on-drop")))]
 #[doc(inline)]
 pub use kill_on_drop::KillOnDrop;
 #[cfg(all(unix, feature = "process-group"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "process-group"))))]
 #[doc(inline)]
 pub use process_group::{ProcessGroup, ProcessGroupChild};
 #[cfg(all(unix, feature = "process-session"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "process-session"))))]
 #[doc(inline)]
 pub use process_session::ProcessSession;
 #[cfg(all(unix, feature = "reset-sigmask"))]
+#[cfg_attr(docsrs, doc(cfg(all(unix, feature = "reset-sigmask"))))]
 #[doc(inline)]
 pub use reset_sigmask::ResetSigmask;
 

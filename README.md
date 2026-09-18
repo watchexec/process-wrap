@@ -204,7 +204,9 @@ Command::with_new("watch", |command| { command.arg("ls"); })
 - Like command-group.
 - Feature: `creation-flags` (default)
 
-This is a shim to allow setting Windows process creation flags with this API, as otherwise they'd be overwritten.
+This wrapper records Windows creation flags as portable per-attempt policy. Calling the native-shaped
+`Command::creation_flags` method instead makes the command native-only because wrappers and alternate
+transports cannot query or reconstruct those flags.
 
 ```rust
 use windows::Win32::System::Threading::*;
@@ -224,7 +226,9 @@ after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
 - Like command-group.
 - Feature: `kill-on-drop` (default)
 
-This is a shim to allow wrappers to handle the kill-on-drop flag, as it can't be read from Command.
+This wrapper records kill-on-drop as portable per-attempt policy so `JobObject` and alternate spawn
+providers can preserve it. Calling the native-shaped `Command::kill_on_drop` method instead makes the
+command native-only because the setting cannot be queried afterward.
 
 ```rust
 let child = Command::with_new("watch", |command| { command.arg("ls"); })
@@ -258,25 +262,68 @@ The trait provides extension or hook points into the lifecycle of a `Command`:
   incorporate all or part of the second, concretely typed wrapper. By default, this does nothing
   (that is, only the first registered wrapper instance of a type applies).
 
-- **`fn pre_spawn(&mut self, command: &mut tokio::process::Command, core: &Command)`** is called
-  before the command is spawned, and gives mutable access to that attempt's native command. It also
-  gives mutable access to the wrapper instance, so state can be stored if needed. The `core`
-  reference gives access to data from other wrappers; for example, that's how `CreationFlags` on
-  Windows works along with `JobObject`. Noop by default.
+- **`fn pre_spawn(&mut self, attempt: &mut SpawnAttempt, command: &Command) -> io::Result<()>`**
+  is called before spawning. It can record portable configuration on this attempt and inspect peer
+  wrappers through `command`. For tracked commands those mutations apply to one attempt; native-only
+  commands retain native mutations. Calling `attempt.native_mut()` or its `stdin`/`stdout`/`stderr`
+  methods makes a tracked attempt incompatible with a portable provider. On Unix, recurring native
+  escapes from a reusable native-only command can retain inactive child-setup callbacks because the
+  native API does not expose callback insertion or command ownership; prefer portable attempt methods
+  for recurring configuration.
 
-- **`fn post_spawn(&mut self, command: &mut tokio::process::Command, child: &mut tokio::process::Child, core: &Command)`**
-  is called after spawn, and should be used for any necessary cleanups. It is offered for completeness
-  but is expected to be less used than `wrap_child()`. Noop by default.
+- **`fn post_spawn(&mut self, attempt: &mut SpawnAttempt, child: &mut dyn ChildWrapper, command: &Command) -> io::Result<()>`**
+  is called after any transport has created its child. The child may be a terminal custom/provider
+  child with no native child value. Changing command settings on `attempt` at this point cannot
+  configure the already-created child.
 
-- **`fn wrap_child(&mut self, child: Box<dyn ChildWrapper>, core: &Command)`** is
-  called after all `post_spawn()`s have run. If your wrapper needs to override the methods on Child,
-  then it should create an instance of its own type implementing `ChildWrapper` and return it
-  here. Child wraps are _in order_: you may end up with a `Foo(Bar(Child))` or a `Bar(Foo(Child))`
-  depending on if `.wrap(Foo).wrap(Bar)` or `.wrap(Bar).wrap(Foo)` was called. If your functionality
-  is order-dependent, make sure to specify so in your documentation! Default is noop: no wrapping is
-  performed and the input `child` is returned as-is.
+- **`fn wrap_child(&mut self, child: Box<dyn ChildWrapper>, command: &Command) -> io::Result<Box<dyn ChildWrapper>>`**
+  is called after all `post_spawn()` hooks. If your wrapper needs to override child methods, create
+  your own `ChildWrapper` layer and return it here. Child wraps run in registration order, so
+  `.wrap(Foo).wrap(Bar)` produces an outer `Bar(Foo(child))`.
 
-Refer to [the API documentation][docs] for more detail and the specifics of child wrapper traits.
+- **`fn spawn_provider(&self) -> Option<&dyn SpawnProvider>`** exposes an alternate transport owned by
+  this wrapper. A provider exposed during selection must remain available throughout the lifecycle;
+  only one registered wrapper may expose one.
+
+Pre-spawn, post-spawn, and child-wrapping hooks all run in registration order and stop at the first
+error or panic. The active wrapper remains registered but is temporarily unavailable through
+`get_wrap`; peer wrappers remain visible.
+
+### Spawn providers
+
+Spawn providers let a wrapper replace only process creation while retaining the complete wrapper
+lifecycle. This is what makes custom transports such as PTYs composable with process-wrap wrappers.
+Callbacks run in this order:
+
+1. `check_available`
+2. native-only base rejection
+3. `validate_command`
+4. every `pre_spawn` hook
+5. native-only attempt rejection
+6. `validate_attempt`
+7. provider `spawn`
+8. every `post_spawn` hook
+9. every child wrapper
+10. transaction `commit`
+
+Validation must reject unsupported portable policy before allocating operating-system resources.
+`spawn` returns a child satisfying the frontend's complete `ChildWrapper` contract together with a
+fresh, armed `SpawnTransaction`. The transaction owns cleanup independently of the child chain. A
+later hook, wrapper, or commit error/panic causes best-effort rollback while preserving the original
+failure. Until `spawn` returns the product, cleanup remains the provider's responsibility.
+
+A command may register only one provider; conflicts are rejected before any provider callback or
+operating-system allocation. Both providers and wrapper state are reused across repeated spawns.
+`spawn_with` and `spawn_with_child` reject a registered provider instead of silently bypassing it.
+On Unix, when wrappers request built-in child setup, a successful explicit spawner must create its
+returned child from the native command before replacing that command. Whenever the spawner replaces
+it, including before returning an error or unwinding, the displaced command must be dropped before
+control leaves the spawner. A replacement is discarded with a tracked attempt or retained by a
+native-only base. Process-wrap installs child setup before invoking the spawner and cannot apply it to
+a replacement which the closure creates and immediately spawns.
+
+Refer to [the API documentation][docs] for the policy getters, platform child capabilities, and the
+specifics of child wrapper traits.
 
 ## Features
 [the features list]: #features
@@ -296,3 +343,7 @@ Both can exist at the same time, but generally you should use one or the other.
 - `process-group`: **default**, enables the [process group](#process-group) wrapper.
 - `process-session`: **default**, enables the [process session](#process-session) wrapper.
 - `reset-sigmask`: enables the [reset signal mask](#reset-signal-mask) wrapper.
+
+### Diagnostics
+
+- `tracing`: **default**, enables internal lifecycle diagnostics through the `tracing` crate.
