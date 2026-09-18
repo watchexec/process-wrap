@@ -9,7 +9,7 @@
 //! ```
 
 #[doc(inline)]
-pub use core::{ChildWrapper, CommandWrap, CommandWrapper};
+pub use core::{ChildWrapper, Command, CommandWrap, CommandWrapper};
 #[cfg(all(windows, feature = "creation-flags"))]
 #[doc(inline)]
 pub use creation_flags::CreationFlags;

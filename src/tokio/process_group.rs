@@ -85,7 +85,7 @@ impl ProcessGroupChild {
 impl CommandWrapper for ProcessGroup {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
-		command.process_group(self.leader.as_raw());
+		crate::command::tokio_process_group(command, self.leader.as_raw());
 		Ok(())
 	}
 

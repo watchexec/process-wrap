@@ -1,7 +1,9 @@
 use std::{
 	any::Any,
 	io::{Read, Result},
-	process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output},
+	process::{
+		Child, ChildStderr, ChildStdin, ChildStdout, Command as NativeCommand, ExitStatus, Output,
+	},
 };
 
 #[cfg(windows)]
@@ -13,7 +15,13 @@ use nix::{
 	unistd::Pid,
 };
 
-crate::generic_wrap::Wrap!(Command, Child, ChildWrapper, |child| child);
+crate::generic_wrap::Wrap!(
+	crate::Blocking,
+	NativeCommand,
+	Child,
+	ChildWrapper,
+	|child| child
+);
 
 /// Wrapper for `std::process::Child`.
 ///
@@ -375,7 +383,6 @@ fn read2(
 	err_v: &mut Vec<u8>,
 ) -> Result<()> {
 	use nix::{
-		errno::Errno,
 		libc,
 		poll::{PollFd, PollFlags, PollTimeout, poll},
 	};
@@ -428,6 +435,8 @@ fn read2(
 
 	#[cfg(target_os = "linux")]
 	fn set_nonblocking(fd: BorrowedFd, nonblocking: bool) -> Result<()> {
+		use nix::errno::Errno;
+
 		let v = nonblocking as libc::c_int;
 		let res = unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONBIO, &v) };
 
