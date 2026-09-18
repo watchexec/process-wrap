@@ -396,7 +396,7 @@ macro_rules! unix_attempt_policy_tests {
 			}
 
 			#[test]
-			fn attach_to_tracks_the_direct_pid_and_actual_group() {
+			fn attach_to_tracks_the_direct_pid_without_waiting_for_the_foreign_group() {
 				let runtime = runtime();
 				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
 				let external = ExternalGroup::spawn();
@@ -415,9 +415,13 @@ macro_rules! unix_attempt_policy_tests {
 				assert_eq!(group_child.pgid(), pgid);
 
 				sleep(Duration::from_millis(200));
-				assert_eq!(child.try_wait().unwrap(), None);
+				let status = child
+					.try_wait()
+					.unwrap()
+					.expect("the direct child exits independently of the foreign group");
+				assert_eq!(status.code(), Some(7));
 				external.kill();
-				assert_eq!(wait_for_exit(child.as_mut()).code(), Some(7));
+				assert_eq!(wait_for_exit(child.as_mut()), status);
 			}
 
 			#[test]

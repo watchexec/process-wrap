@@ -1,22 +1,14 @@
 use std::{
 	future::Future,
 	io::{Error, Result},
-	ops::ControlFlow,
-	os::unix::process::ExitStatusExt,
 	pin::Pin,
 	process::ExitStatus,
 };
 
 use nix::{
-	errno::Errno,
-	libc,
-	sys::{
-		signal::{Signal, killpg},
-		wait::WaitPidFlag,
-	},
+	sys::signal::{Signal, killpg},
 	unistd::Pid,
 };
-use tokio::task::spawn_blocking;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -33,6 +25,11 @@ use super::{ChildWrapper, CommandWrap, CommandWrapper, SpawnAttempt};
 ///
 /// Process groups direct signals to all members of the group, and also serve to control job
 /// placement in foreground or background, among other actions.
+///
+/// With the `Pty` wrapper, [`leader`](Self::leader) leaves session and process-group creation to the
+/// terminal provider while retaining group-wide signalling until the direct child exits. Waiting
+/// still follows that child. A PTY must create a new session, so [`attach_to`](Self::attach_to) is
+/// invalid for that transport.
 ///
 /// This wrapper provides a child wrapper: [`ProcessGroupChild`].
 #[derive(Clone, Copy, Debug)]
@@ -56,25 +53,29 @@ impl ProcessGroup {
 	}
 }
 
-/// Wrapper for `Child` which ensures that all processes in the group are reaped.
+/// Wrapper for `Child` which signals the process group while its direct child is live.
+///
+/// Waiting follows the direct child. Process-wrap deliberately stops using a numeric process-group ID
+/// after that child has been reaped, because the operating system may immediately reuse the ID for an
+/// unrelated group.
 #[derive(Debug)]
 pub struct ProcessGroupChild {
 	inner: Box<dyn ChildWrapper>,
 	exit_status: ChildExitStatus,
-	direct_pid: Pid,
 	pgid: Pid,
-	group_drained: bool,
 }
 
 impl ProcessGroupChild {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
-	pub(crate) fn new(inner: Box<dyn ChildWrapper>, direct_pid: Pid, pgid: Pid) -> Self {
+	pub(crate) fn new(
+		inner: Box<dyn ChildWrapper>,
+		pgid: Pid,
+		exit_status: Option<ExitStatus>,
+	) -> Self {
 		Self {
 			inner,
-			exit_status: ChildExitStatus::Running,
-			direct_pid,
+			exit_status: exit_status.map_or(ChildExitStatus::Running, ChildExitStatus::Exited),
 			pgid,
-			group_drained: false,
 		}
 	}
 
@@ -95,80 +96,40 @@ impl CommandWrapper for ProcessGroup {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
-		inner: Box<dyn ChildWrapper>,
+		mut inner: Box<dyn ChildWrapper>,
 		_core: &CommandWrap,
 	) -> Result<Box<dyn ChildWrapper>> {
-		let direct_pid = Pid::from_raw(
-			i32::try_from(
-				inner
-					.id()
-					.expect("Command was reaped before we could read its PID"),
+		let mut direct_id = inner.id();
+		#[cfg(feature = "pty")]
+		if direct_id.is_none() {
+			direct_id = inner.try_spawned_id();
+		}
+		let direct_id = direct_id.ok_or_else(|| {
+			Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"the child exited before process-group supervision could retain its PID",
 			)
-			.expect("Command PID > i32::MAX"),
-		);
+		})?;
+		let direct_pid = Pid::from_raw(i32::try_from(direct_id).map_err(Error::other)?);
 		let pgid = match self.target {
 			ProcessGroupTarget::Leader => direct_pid,
 			ProcessGroupTarget::AttachTo(pgid) => Pid::from_raw(
 				i32::try_from(pgid).expect("process group IDs are validated before spawning"),
 			),
 		};
+		let exit_status = inner.try_wait()?;
 
-		Ok(Box::new(ProcessGroupChild::new(inner, direct_pid, pgid)))
+		Ok(Box::new(ProcessGroupChild::new(inner, pgid, exit_status)))
 	}
 }
 
 impl ProcessGroupChild {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn signal_imp(&self, sig: Signal) -> Result<()> {
-		killpg(self.pgid, sig).map_err(Error::from)
-	}
-
-	#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
-	fn wait_imp(
-		direct_pid: Pid,
-		pgid: Pid,
-		flag: WaitPidFlag,
-	) -> Result<ControlFlow<Option<ExitStatus>, Option<ExitStatus>>> {
-		// wait for processes in a loop until every process in this group has
-		// exited (this ensures that we reap any zombies that may have been
-		// created if the parent exited after spawning children, but didn't wait
-		// for those children to exit)
-		let mut parent_exit_status: Option<ExitStatus> = None;
-		loop {
-			// we can't use the safe wrapper directly because it doesn't return
-			// the raw status, and we need it to convert to the std's ExitStatus
-			let mut status: i32 = 0;
-			match unsafe {
-				libc::waitpid(-pgid.as_raw(), &mut status as *mut libc::c_int, flag.bits())
-			} {
-				0 => {
-					// zero should only happen if WNOHANG was passed in,
-					// and means that no processes have yet to exit
-					return Ok(ControlFlow::Continue(parent_exit_status));
-				}
-				-1 => {
-					match Errno::last() {
-						Errno::ECHILD => {
-							// no more children to reap; this is a graceful exit
-							return Ok(ControlFlow::Break(parent_exit_status));
-						}
-						errno => {
-							return Err(Error::from(errno));
-						}
-					}
-				}
-				pid => {
-					// a process exited. was it the parent process that we
-					// started? if so, collect the exit signal, otherwise we
-					// reaped a zombie process and should continue looping
-					if direct_pid == Pid::from_raw(pid) {
-						parent_exit_status = Some(ExitStatus::from_raw(status));
-					} else {
-						// reaped a zombie child; keep looping
-					}
-				}
-			};
+		if matches!(self.exit_status, ChildExitStatus::Exited(_)) || self.inner.id().is_none() {
+			return Ok(());
 		}
+		killpg(self.pgid, sig).map_err(Error::from)
 	}
 }
 
@@ -185,98 +146,39 @@ impl ChildWrapper for ProcessGroupChild {
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn start_kill(&mut self) -> Result<()> {
+		if matches!(self.exit_status, ChildExitStatus::Running) {
+			if let Some(status) = self.inner.try_wait()? {
+				self.exit_status = ChildExitStatus::Exited(status);
+			}
+		}
 		self.signal_imp(Signal::SIGKILL)
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wait(&mut self) -> Pin<Box<dyn Future<Output = Result<ExitStatus>> + Send + '_>> {
 		Box::pin(async {
-			let status = match self.exit_status {
+			match self.exit_status {
 				ChildExitStatus::Running => {
 					let status = self.inner.wait().await?;
 					self.exit_status = ChildExitStatus::Exited(status);
-					status
+					Ok(status)
 				}
-				ChildExitStatus::Exited(status) => status,
-			};
-
-			if !self.group_drained {
-				const MAX_RETRY_ATTEMPT: usize = 10;
-				for _ in 1..MAX_RETRY_ATTEMPT {
-					match Self::wait_imp(self.direct_pid, self.pgid, WaitPidFlag::WNOHANG)? {
-						ControlFlow::Break(reaped) => {
-							if let Some(reaped) = reaped {
-								self.exit_status = ChildExitStatus::Exited(reaped);
-							}
-							self.group_drained = true;
-							break;
-						}
-						ControlFlow::Continue(reaped) => {
-							if let Some(reaped) = reaped {
-								self.exit_status = ChildExitStatus::Exited(reaped);
-							}
-						}
-					}
-				}
-			}
-
-			if !self.group_drained {
-				let direct_pid = self.direct_pid;
-				let pgid = self.pgid;
-				let result =
-					spawn_blocking(move || Self::wait_imp(direct_pid, pgid, WaitPidFlag::empty()))
-						.await??;
-				if let ControlFlow::Break(reaped) = result {
-					if let Some(reaped) = reaped {
-						self.exit_status = ChildExitStatus::Exited(reaped);
-					}
-					self.group_drained = true;
-				}
-			}
-
-			match self.exit_status {
 				ChildExitStatus::Exited(status) => Ok(status),
-				ChildExitStatus::Running => Ok(status),
 			}
 		})
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		if self.group_drained {
-			return match self.exit_status {
-				ChildExitStatus::Exited(status) => Ok(Some(status)),
-				ChildExitStatus::Running => {
-					let status = self.inner.try_wait()?;
-					if let Some(status) = status {
-						self.exit_status = ChildExitStatus::Exited(status);
-					}
-					Ok(status)
-				}
-			};
-		}
-
-		let (drained, reaped) =
-			match Self::wait_imp(self.direct_pid, self.pgid, WaitPidFlag::WNOHANG)? {
-				ControlFlow::Break(status) => (true, status),
-				ControlFlow::Continue(status) => (false, status),
-			};
-		if let Some(status) = reaped {
-			self.exit_status = ChildExitStatus::Exited(status);
-		}
-		if matches!(self.exit_status, ChildExitStatus::Running) {
-			if let Some(status) = self.inner.try_wait()? {
-				self.exit_status = ChildExitStatus::Exited(status);
-			}
-		}
-		self.group_drained = drained;
-
-		if !self.group_drained {
-			return Ok(None);
-		}
 		match self.exit_status {
+			ChildExitStatus::Running => {
+				let status = self.inner.try_wait()?;
+				if let Some(status) = status {
+					self.exit_status = ChildExitStatus::Exited(status);
+				}
+				Ok(status)
+			}
 			ChildExitStatus::Exited(status) => Ok(Some(status)),
-			ChildExitStatus::Running => Ok(None),
 		}
 	}
 

@@ -86,6 +86,60 @@ let status = child.wait().await?;
 dbg!(status);
 ```
 
+### or in a pseudo-terminal
+
+The non-default `pty` feature enables Tokio PTY transport on Linux, Android, macOS, FreeBSD,
+NetBSD 10 and newer, OpenBSD, DragonFly BSD, illumos, and Solaris. It implies `tokio1`, selecting
+the Tokio frontend and its terminal dependencies explicitly.
+
+```toml
+[dependencies]
+process-wrap = { version = "10.0.0", features = ["pty"] }
+```
+
+```rust
+use process_wrap::tokio::*;
+use tokio::io::AsyncReadExt;
+
+let mut command = Command::new("ls");
+command.wrap(ProcessSession).wrap(Pty::default());
+let mut child = command.spawn()?;
+let controller = child
+  .take_pty_controller()
+  .expect("a successful PTY spawn installs one controller");
+let (input, mut output, _resize) = controller.into_parts();
+drop(input);
+
+let drain = tokio::spawn(async move {
+  let mut bytes = Vec::new();
+  output.read_to_end(&mut bytes).await?;
+  Ok::<_, std::io::Error>(bytes)
+});
+let status = child.wait().await?;
+let terminal_bytes = drain.await??;
+dbg!(status, terminal_bytes);
+```
+
+A PTY has one ordered terminal stream, so standard output and standard error are merged.
+`PtyInput` and `PtyOutput` are strong owners of one bidirectional master descriptor, so dropping
+either one alone does not half-close the terminal. The terminal hangs up after both are gone;
+`PtyResize` is weak and cannot keep it alive. Send the terminal's VEOF character when that is the
+desired terminal policy instead of expecting a separate input half-close or clonable force-close
+handle.
+
+Child waiting and PTY draining are independent. On most supported Unix systems, descendants can
+retain the slave after the direct child exits. On macOS, drain output concurrently with waiting: the
+kernel drains queued output as the session leader exits, then revokes the controlling terminal from
+its descendants. The transport passes terminal bytes through without owning parent-terminal raw
+mode, relays, key handling, VT parsing, scrollback, or pager policy.
+
+A bare PTY creates the required session. `ProcessGroup::leader()` and `ProcessSession` each preserve
+group-wide signalling while the direct child is live; waiting still follows that direct child.
+`ProcessGroup::attach_to(...)` and explicitly registering both wrappers return `InvalidInput`.
+`ResetSigmask` composes normally. `KillOnDrop` remains Tokio's direct-child behavior—it does not
+promise to kill an entire group or session. Spawning returns the ordinary boxed Tokio child, and
+`take_pty_controller()` traverses any outer child wrappers and yields the controller once.
+
 ### or with std
 
 ```toml
@@ -342,6 +396,8 @@ Both can exist at the same time, but generally you should use one or the other.
 - `kill-on-drop`: **default**, enables the [kill on drop](#kill-on-drop) wrapper.
 - `process-group`: **default**, enables the [process group](#process-group) wrapper.
 - `process-session`: **default**, enables the [process session](#process-session) wrapper.
+- `pty`: enables the Tokio [pseudo-terminal transport](#or-in-a-pseudo-terminal) and implies
+  `tokio1`.
 - `reset-sigmask`: enables the [reset signal mask](#reset-signal-mask) wrapper.
 
 ### Diagnostics

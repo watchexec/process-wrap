@@ -1,4 +1,4 @@
-use std::io::Result;
+use std::io::{Error, ErrorKind, Result};
 
 use nix::unistd::Pid;
 #[cfg(feature = "tracing")]
@@ -18,6 +18,9 @@ use super::{CommandWrap, CommandWrapper, SpawnAttempt};
 ///
 /// This wrapper uses [the same child wrapper as `ProcessGroup`](super::ProcessGroupChild) and does
 /// the same setup (plus the session setup); using both together is unnecessary and may misbehave.
+/// With the `Pty` wrapper, the terminal provider performs the required session setup while this
+/// wrapper retains group-wide signalling until the direct child exits. Waiting still follows that
+/// child. Explicitly combining both supervision wrappers is invalid for that transport.
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessSession;
 
@@ -30,20 +33,27 @@ impl CommandWrapper for ProcessSession {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
-		inner: Box<dyn super::core::ChildWrapper>,
+		mut inner: Box<dyn super::core::ChildWrapper>,
 		_core: &CommandWrap,
 	) -> Result<Box<dyn super::core::ChildWrapper>> {
-		let direct_pid = Pid::from_raw(
-			i32::try_from(
-				inner
-					.id()
-					.expect("Command was reaped before we could read its PID"),
+		let mut direct_id = inner.id();
+		#[cfg(feature = "pty")]
+		if direct_id.is_none() {
+			direct_id = inner.try_spawned_id();
+		}
+		let direct_id = direct_id.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"the child exited before session supervision could retain its PID",
 			)
-			.expect("Command PID > i32::MAX"),
-		);
+		})?;
+		let direct_pid = Pid::from_raw(i32::try_from(direct_id).map_err(Error::other)?);
+		let exit_status = inner.try_wait()?;
 
 		Ok(Box::new(super::ProcessGroupChild::new(
-			inner, direct_pid, direct_pid,
+			inner,
+			direct_pid,
+			exit_status,
 		)))
 	}
 }

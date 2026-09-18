@@ -115,6 +115,28 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 		None
 	}
 
+	/// Return the original PID retained by this exact provider-child layer.
+	///
+	/// This internal capability lets a wrapper finish installation after an earlier post-spawn hook
+	/// observed and reaped a fast provider child. Ordinary child operations must continue to use
+	/// [`ChildWrapper::id`] so they never act on a recycled PID.
+	#[doc(hidden)]
+	#[cfg(all(
+		unix,
+		feature = "pty",
+		any(feature = "process-group", feature = "process-session")
+	))]
+	fn spawned_id_layer(&self) -> Option<u32> {
+		None
+	}
+
+	/// Take the PTY controller owned by this exact child layer.
+	#[doc(hidden)]
+	#[cfg(feature = "pty")]
+	fn take_pty_controller_layer(&mut self) -> Option<super::pty::PtyController> {
+		None
+	}
+
 	/// Finalize Windows spawn state owned by this child layer.
 	///
 	/// Process-wrap invokes this internal lifecycle hook after all child wrappers have been installed.
@@ -338,6 +360,51 @@ impl dyn ChildWrapper + '_ {
 
 	fn is_raw_child(&self) -> bool {
 		self.downcast_ref::<Child>().is_some()
+	}
+
+	#[cfg(all(
+		unix,
+		feature = "pty",
+		any(feature = "process-group", feature = "process-session")
+	))]
+	pub(crate) fn try_spawned_id(&self) -> Option<u32> {
+		let mut inner = self;
+		loop {
+			if let Some(pid) = inner.spawned_id_layer() {
+				return Some(pid);
+			}
+
+			let next = inner.inner();
+			if same_child(inner, next) {
+				return None;
+			}
+			inner = next;
+		}
+	}
+
+	/// Take the controller installed by a PTY spawn.
+	///
+	/// This traverses arbitrary child-wrapper layers without removing them. The controller can be taken
+	/// only once; subsequent calls and non-PTY children return `None`.
+	#[cfg(feature = "pty")]
+	#[cfg_attr(docsrs, doc(cfg(feature = "pty")))]
+	pub fn take_pty_controller(&mut self) -> Option<super::pty::PtyController> {
+		let mut inner = self;
+		loop {
+			if let Some(controller) = inner.take_pty_controller_layer() {
+				return Some(controller);
+			}
+
+			let inner_type = (&*inner as &dyn Any).type_id();
+			let inner_ptr = std::ptr::from_mut(inner);
+			let next = inner.inner_mut();
+			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
+				&& inner_type == (&*next as &dyn Any).type_id()
+			{
+				return None;
+			}
+			inner = next;
+		}
 	}
 
 	/// Find the first Windows process-handle capability in this wrapper chain.

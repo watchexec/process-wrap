@@ -1460,6 +1460,40 @@ impl<B: Backend> SpawnAttempt<B> {
 		self.native_command_mut()
 	}
 
+	/// Take the fresh native command for an alternate provider without applying native platform setup
+	/// or making the portable attempt opaque.
+	///
+	/// Removing the provider's command leaves the tracked intent intact. If a later lifecycle hook
+	/// requests native access, the attempt materializes a separate clean command which contains none of
+	/// the provider's private stdio or child-setup state.
+	///
+	/// The provider must apply every accepted portable policy itself before spawning.
+	#[cfg(all(
+		feature = "pty",
+		any(
+			target_os = "android",
+			target_os = "dragonfly",
+			target_os = "freebsd",
+			target_os = "illumos",
+			target_os = "linux",
+			target_os = "macos",
+			target_os = "netbsd",
+			target_os = "openbsd",
+			target_os = "solaris"
+		)
+	))]
+	pub(crate) fn take_native_for_provider_spawn(&mut self) -> B::NativeCommand {
+		self.materialize_native();
+		match &mut self.state {
+			AttemptState::Tracked { native, .. } => native
+				.take()
+				.expect("the tracked provider attempt was materialized above"),
+			AttemptState::NativeOnly(_) => {
+				unreachable!("portable providers reject native-only attempts before spawning")
+			}
+		}
+	}
+
 	pub(crate) fn native_for_explicit_spawn(&mut self) -> &mut B::NativeCommand {
 		self.make_native_only();
 		self.prepare_platform();

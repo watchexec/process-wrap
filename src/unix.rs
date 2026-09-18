@@ -13,6 +13,21 @@ use crate::command::NativeCommand;
 const NO_PROCESS_GROUP: i32 = -1;
 const LEADER_PROCESS_GROUP: i32 = 0;
 
+pub(crate) fn reset_sigmask() -> io::Result<()> {
+	let mut empty = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+	// SAFETY: `empty` points to writable storage for one signal set.
+	if unsafe { libc::sigemptyset(empty.as_mut_ptr()) } == -1 {
+		return Err(io::Error::last_os_error());
+	}
+	// SAFETY: `sigemptyset` initialized `empty`; the old mask is not requested.
+	let error =
+		unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, empty.as_ptr(), ptr::null_mut()) };
+	if error != 0 {
+		return Err(io::Error::from_raw_os_error(error));
+	}
+	Ok(())
+}
+
 /// Process-group setup requested for one spawn attempt.
 #[cfg_attr(not(feature = "process-group"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -219,18 +234,7 @@ impl Dispatcher {
 		let process_group = self.process_group.load(Ordering::SeqCst);
 
 		if reset_sigmask {
-			let mut empty = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-			// SAFETY: `empty` points to writable storage for one signal set.
-			if unsafe { libc::sigemptyset(empty.as_mut_ptr()) } == -1 {
-				return Err(io::Error::last_os_error());
-			}
-			// SAFETY: `sigemptyset` initialized `empty`; the old mask is not requested.
-			let error = unsafe {
-				libc::pthread_sigmask(libc::SIG_SETMASK, empty.as_ptr(), ptr::null_mut())
-			};
-			if error != 0 {
-				return Err(io::Error::from_raw_os_error(error));
-			}
+			crate::unix::reset_sigmask()?;
 		}
 
 		if process_session {
