@@ -169,9 +169,10 @@ fn check_netbsd_version() -> io::Result<()> {
 	if unsafe { libc::uname(name.as_mut_ptr()) } == -1 {
 		return Err(io::Error::last_os_error());
 	}
-	// SAFETY: uname initialized name, whose release field is a NUL-terminated character array; name
-	// remains live for the CStr view and the immediate byte-slice view.
+	// SAFETY: successful `uname` initialized the complete `utsname` value in `name`.
 	let name = unsafe { name.assume_init() };
+	// SAFETY: the initialized `release` field is a NUL-terminated character array, and `name`
+	// remains live for the `CStr` view and the immediate byte-slice view.
 	let release = unsafe { CStr::from_ptr(name.release.as_ptr()) }.to_bytes();
 	let digits = release.iter().copied().take_while(u8::is_ascii_digit);
 	let mut major = None;
@@ -378,11 +379,13 @@ fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	)?;
 	verify_close_on_exec(&master)?;
 	set_nonblocking(&master)?;
-	// SAFETY: master retains ownership of this open PTY descriptor for both synchronous calls;
-	// neither libc function retains its scalar descriptor argument.
-	if unsafe { libc::grantpt(master.as_raw_fd()) } == -1
-		|| unsafe { libc::unlockpt(master.as_raw_fd()) } == -1
-	{
+	// SAFETY: master retains ownership of this open PTY descriptor for this synchronous call;
+	// `grantpt` does not retain its scalar descriptor argument.
+	if unsafe { libc::grantpt(master.as_raw_fd()) } == -1 || {
+		// SAFETY: master still retains ownership of the open PTY descriptor for this synchronous
+		// call; `unlockpt` does not retain its scalar descriptor argument.
+		(unsafe { libc::unlockpt(master.as_raw_fd()) }) == -1
+	} {
 		return Err(io::Error::last_os_error());
 	}
 	let slave = open_solarish_slave(&master)?;
@@ -548,11 +551,13 @@ fn setup_solarish_streams(slave: &OwnedFd) -> io::Result<()> {
 	// __I_PUSH_NOCTTY is the Solarish variant of I_PUSH which deliberately skips controlling-terminal
 	// acquisition after ptem marks the stream as a terminal. This matters when the parent is a session
 	// leader without an existing controlling terminal.
-	// SAFETY: slave retains this open PTY descriptor for both synchronous scalar ioctls; each
-	// static NUL-terminated module name remains valid for its complete call.
-	if unsafe { libc::ioctl(slave.as_raw_fd(), libc::__I_PUSH_NOCTTY, c"ptem".as_ptr()) } == -1
-		|| unsafe { libc::ioctl(slave.as_raw_fd(), libc::__I_PUSH_NOCTTY, ldterm.as_ptr()) } == -1
-	{
+	// SAFETY: slave retains this open PTY descriptor for the synchronous scalar ioctl, and the
+	// static NUL-terminated `ptem` module name remains valid for the complete call.
+	if unsafe { libc::ioctl(slave.as_raw_fd(), libc::__I_PUSH_NOCTTY, c"ptem".as_ptr()) } == -1 || {
+		// SAFETY: slave still retains the open PTY descriptor for this synchronous scalar ioctl,
+		// and the static NUL-terminated `ldterm` module name remains valid for the complete call.
+		(unsafe { libc::ioctl(slave.as_raw_fd(), libc::__I_PUSH_NOCTTY, ldterm.as_ptr()) }) == -1
+	} {
 		return Err(io::Error::last_os_error());
 	}
 	#[cfg(target_os = "solaris")]
