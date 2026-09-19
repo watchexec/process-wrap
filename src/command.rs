@@ -77,6 +77,14 @@ pub trait NativeCommand: fmt::Debug + Sized + 'static {
 	fn stderr(&mut self, stdio: Stdio);
 
 	/// Register a callback to run in the child after `fork`.
+	///
+	/// # Safety
+	///
+	/// The callback runs in the child process after `fork` and before `exec`. It may only call
+	/// operations valid in that constrained environment. In particular, it must avoid allocation,
+	/// acquiring locks, accessing the environment, and formatting, because another thread may have
+	/// held the corresponding state across `fork`. Do not call target-specific APIs unless their
+	/// async-signal-safety has been audited for the target.
 	#[cfg(unix)]
 	unsafe fn pre_exec<F>(&mut self, callback: F)
 	where
@@ -154,7 +162,8 @@ impl NativeCommand for std::process::Command {
 		F: FnMut() -> std::io::Result<()> + Send + Sync + 'static,
 	{
 		use std::os::unix::process::CommandExt;
-		// SAFETY: the caller accepts the native `pre_exec` contract.
+		// SAFETY: `NativeCommand::pre_exec`'s documented contract is forwarded unchanged to the
+		// backend method.
 		unsafe { CommandExt::pre_exec(self, callback) };
 	}
 
@@ -229,7 +238,8 @@ impl NativeCommand for tokio::process::Command {
 	where
 		F: FnMut() -> std::io::Result<()> + Send + Sync + 'static,
 	{
-		// SAFETY: the caller accepts the native `pre_exec` contract.
+		// SAFETY: `NativeCommand::pre_exec`'s documented contract is forwarded unchanged to the
+		// backend method.
 		unsafe { self.pre_exec(callback) };
 	}
 
@@ -1558,7 +1568,8 @@ impl SpawnAttempt<Blocking> {
 	/// # Safety
 	///
 	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
-	/// operations which are valid in that constrained environment.
+	/// operations which are valid in that constrained environment. In particular, allocating or
+	/// acquiring locks can be unsound when another thread held the corresponding state across `fork`.
 	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
 	where
 		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
@@ -1614,7 +1625,8 @@ impl SpawnAttempt<Tokio1> {
 	/// # Safety
 	///
 	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
-	/// operations which are valid in that constrained environment.
+	/// operations which are valid in that constrained environment. In particular, allocating or
+	/// acquiring locks can be unsound when another thread held the corresponding state across `fork`.
 	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
 	where
 		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
