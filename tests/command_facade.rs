@@ -1,6 +1,6 @@
 #[cfg(feature = "std")]
 mod std_frontend {
-	use std::{ffi::OsStr, io};
+	use std::{ffi::OsStr, io, path::PathBuf};
 
 	use process_wrap::std::{Command, CommandArg, CommandWrap, CommandWrapper, SpawnAttempt};
 
@@ -151,7 +151,7 @@ mod std_frontend {
 
 	#[test]
 	fn tracked_environment_and_cwd_materialize_exactly() {
-		let cwd = std::env::current_dir().unwrap();
+		let cwd = PathBuf::from("/process-wrap-miri-command-facade");
 		let mut command = Command::new("tool");
 		command
 			.env("PROCESS_WRAP_REMOVED", "before-clear")
@@ -250,7 +250,7 @@ mod std_frontend {
 
 #[cfg(feature = "tokio1")]
 mod tokio_frontend {
-	use std::{ffi::OsStr, io};
+	use std::{ffi::OsStr, io, path::PathBuf};
 
 	use process_wrap::tokio::{Command, CommandArg, CommandWrap, CommandWrapper, SpawnAttempt};
 
@@ -401,7 +401,7 @@ mod tokio_frontend {
 
 	#[test]
 	fn tracked_environment_and_cwd_materialize_exactly() {
-		let cwd = std::env::current_dir().unwrap();
+		let cwd = PathBuf::from("/process-wrap-miri-command-facade");
 		let mut command = Command::new("tool");
 		command
 			.env("PROCESS_WRAP_REMOVED", "before-clear")

@@ -510,6 +510,7 @@ macro_rules! spawn_provider_tests {
 			}
 
 			#[test]
+			#[cfg_attr(miri, ignore = "requires a native child process")]
 			fn native_fallback_runs_the_complete_lifecycle() {
 				let runtime = runtime();
 				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
