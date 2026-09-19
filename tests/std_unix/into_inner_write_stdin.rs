@@ -2,6 +2,8 @@ use super::prelude::*;
 
 #[test]
 fn nowrap() -> Result<()> {
+	// SAFETY: this `CommandWrap` has no registered wrapper, so spawn returns its direct native
+	// `cat` child. There is no cleanup or supervision layer to remove before taking it.
 	let mut child = unsafe {
 		CommandWrap::with_new("cat", |command| {
 			command.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -27,6 +29,9 @@ fn nowrap() -> Result<()> {
 #[cfg(feature = "process-group")]
 #[test]
 fn process_group() -> Result<()> {
+	// SAFETY: this fixture's sole layer is `ProcessGroupChild -> native cat child`. Its `cat`
+	// command has no descendants; closing stdin and draining stdout make that child exit, and the
+	// test performs no later group-supervision action after consuming the wrapper.
 	let mut child = unsafe {
 		CommandWrap::with_new("cat", |command| {
 			command.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -53,6 +58,9 @@ fn process_group() -> Result<()> {
 #[cfg(feature = "process-session")]
 #[test]
 fn process_session() -> Result<()> {
+	// SAFETY: this fixture's sole layer is `ProcessGroupChild -> native cat child`, created by
+	// `ProcessSession`. `cat` has no descendants; closing stdin and draining stdout make it exit,
+	// and the test performs no later group-supervision action after consuming the wrapper.
 	let mut child = unsafe {
 		CommandWrap::with_new("cat", |command| {
 			command.stdin(Stdio::piped()).stdout(Stdio::piped());
