@@ -218,11 +218,16 @@ impl ChildWrapper for JobObjectChild {
 			..
 		} = *self;
 		if spawn_finalized && final_kill_on_drop {
-			// manually drop the completion port
+			// Removing this layer through generic unsafe traversal must not run `JobPort::drop`:
+			// `ManuallyDrop` suppresses that destructor. We close the completion port below exactly once,
+			// while deliberately retaining the finalized kill-on-close job handle so its final close does
+			// not terminate the child returned from this operation. That retention is current behavior,
+			// not an endorsement of its API design.
 			let its = std::mem::ManuallyDrop::new(job_port);
+			// SAFETY: `its` contains the completion-port handle transferred from the successful
+			// `CreateIoCompletionPort` result. Because `ManuallyDrop` suppresses `JobPort::drop`, this
+			// is the only close performed for that completion handle on this removal path.
 			unsafe { CloseHandle(its.completion_port.0) }.ok();
-			// we leave the job handle unclosed, otherwise the Child is useless
-			// (as closing it may terminate the job)
 		}
 		// Before spawn finalization, dropping the still-armed job instead guarantees that removing this
 		// layer cannot let descendants escape a later lifecycle failure.
