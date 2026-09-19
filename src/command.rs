@@ -1567,15 +1567,18 @@ impl SpawnAttempt<Blocking> {
 	///
 	/// # Safety
 	///
-	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
-	/// operations which are valid in that constrained environment. In particular, allocating or
-	/// acquiring locks can be unsound when another thread held the corresponding state across `fork`.
+	/// The callback runs in the child process after `fork` and before `exec`. It may only call
+	/// operations valid in that constrained environment. In particular, it must avoid allocation,
+	/// acquiring locks, accessing the environment, and formatting, because another thread may have
+	/// held the corresponding state across `fork`. Do not call target-specific APIs unless their
+	/// async-signal-safety has been audited for the target.
 	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
 	where
 		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
 	{
 		use ::std::os::unix::process::CommandExt;
-		// SAFETY: the caller accepts the native `pre_exec` contract documented above.
+		// SAFETY: this method's public contract matches the backend `pre_exec` requirements, and f is
+		// forwarded unchanged.
 		unsafe { CommandExt::pre_exec(self.native_mut(), f) };
 		self
 	}
@@ -1624,14 +1627,17 @@ impl SpawnAttempt<Tokio1> {
 	///
 	/// # Safety
 	///
-	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
-	/// operations which are valid in that constrained environment. In particular, allocating or
-	/// acquiring locks can be unsound when another thread held the corresponding state across `fork`.
+	/// The callback runs in the child process after `fork` and before `exec`. It may only call
+	/// operations valid in that constrained environment. In particular, it must avoid allocation,
+	/// acquiring locks, accessing the environment, and formatting, because another thread may have
+	/// held the corresponding state across `fork`. Do not call target-specific APIs unless their
+	/// async-signal-safety has been audited for the target.
 	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
 	where
 		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
 	{
-		// SAFETY: the caller accepts the native `pre_exec` contract documented above.
+		// SAFETY: this method's public contract matches the backend `pre_exec` requirements, and f is
+		// forwarded unchanged.
 		unsafe { self.native_mut().pre_exec(f) };
 		self
 	}
@@ -1680,15 +1686,18 @@ impl Command<Blocking> {
 	///
 	/// # Safety
 	///
-	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
-	/// operations which are valid in that constrained environment. In particular, allocating or
-	/// acquiring locks can be unsound when another thread held the corresponding state across `fork`.
+	/// The callback runs in the child process after `fork` and before `exec`. It may only call
+	/// operations valid in that constrained environment. In particular, it must avoid allocation,
+	/// acquiring locks, accessing the environment, and formatting, because another thread may have
+	/// held the corresponding state across `fork`. Do not call target-specific APIs unless their
+	/// async-signal-safety has been audited for the target.
 	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
 	where
 		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
 	{
 		use ::std::os::unix::process::CommandExt;
-		// SAFETY: the caller accepts the native `pre_exec` contract documented above.
+		// SAFETY: this method's public contract matches the backend `pre_exec` requirements, and f is
+		// forwarded unchanged.
 		unsafe { CommandExt::pre_exec(self.native_mut(), f) };
 		self
 	}
@@ -1737,14 +1746,17 @@ impl Command<Tokio1> {
 	///
 	/// # Safety
 	///
-	/// The callback runs in the child process after `fork` and before `exec`. It may only perform
-	/// operations which are valid in that constrained environment. In particular, allocating or
-	/// acquiring locks can be unsound when another thread held the corresponding state across `fork`.
+	/// The callback runs in the child process after `fork` and before `exec`. It may only call
+	/// operations valid in that constrained environment. In particular, it must avoid allocation,
+	/// acquiring locks, accessing the environment, and formatting, because another thread may have
+	/// held the corresponding state across `fork`. Do not call target-specific APIs unless their
+	/// async-signal-safety has been audited for the target.
 	pub unsafe fn pre_exec<F>(&mut self, f: F) -> &mut Self
 	where
 		F: FnMut() -> ::std::io::Result<()> + Send + Sync + 'static,
 	{
-		// SAFETY: the caller accepts the native `pre_exec` contract documented above.
+		// SAFETY: this method's public contract matches the backend `pre_exec` requirements, and f is
+		// forwarded unchanged.
 		unsafe { self.native_mut().pre_exec(f) };
 		self
 	}
