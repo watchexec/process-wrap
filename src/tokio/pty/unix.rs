@@ -505,15 +505,17 @@ fn open_bsd_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
 
 #[cfg(target_os = "dragonfly")]
 fn open_bsd_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
-	// DragonFly's ptsname storage is thread-local. Copy it before making another libc call.
+	// DragonFly's ptsname.c returns main-thread static storage or heap storage retained in
+	// thread-specific state. Its pointer remains live for the calling thread, though a later
+	// same-thread ptsname call may overwrite its contents.
 	// SAFETY: master remains an open, granted, and unlocked borrowed PTY descriptor for this
-	// synchronous call; no intervening libc call invalidates DragonFly's thread-local result.
+	// synchronous call.
 	let name = unsafe { libc::ptsname(master.as_raw_fd()) };
 	if name.is_null() {
 		return Err(io::Error::last_os_error());
 	}
-	// SAFETY: the non-null result points to a NUL-terminated thread-local path which remains valid
-	// until the next libc call; CString copies it before open makes such a call.
+	// SAFETY: the non-null result points to a NUL-terminated path in that still-live storage; no
+	// same-thread ptsname call occurs before CString takes its owned copy.
 	let name = CString::from(unsafe { CStr::from_ptr(name) });
 	open(name.as_c_str(), slave_flags(), Mode::empty()).map_err(io::Error::from)
 }
