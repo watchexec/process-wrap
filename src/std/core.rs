@@ -509,8 +509,15 @@ fn read2(
 
 	let out_fd = out_r.as_raw_fd();
 	let err_fd = err_r.as_raw_fd();
-	// SAFETY: these are dropped at the same time as all other FDs here
+	// SAFETY: the `ChildStdout` `out_r` owns its descriptor for this function's duration. The
+	// fabricated borrow and the `PollFd` made from it cannot outlive that owner: an early return drops
+	// locals before function arguments, and normal scope exit does the same. `BorrowedFd` and `PollFd`
+	// only borrow the descriptor; neither closes nor transfers its ownership.
 	let out_bfd = unsafe { BorrowedFd::borrow_raw(out_fd) };
+	// SAFETY: the `ChildStderr` `err_r` owns its descriptor for this function's duration. The
+	// fabricated borrow and the `PollFd` made from it cannot outlive that owner: an early return drops
+	// locals before function arguments, and normal scope exit does the same. `BorrowedFd` and `PollFd`
+	// only borrow the descriptor; neither closes nor transfers its ownership.
 	let err_bfd = unsafe { BorrowedFd::borrow_raw(err_fd) };
 
 	set_nonblocking(out_bfd, true)?;
@@ -554,6 +561,9 @@ fn read2(
 		use nix::errno::Errno;
 
 		let v = nonblocking as libc::c_int;
+		// SAFETY: `fd` is a live borrowed descriptor owned by the `ChildStdout` or `ChildStderr` held
+		// by `read2`. Linux's `FIONBIO` request changes that descriptor's nonblocking flag. `v` is an
+		// aligned, live `c_int` argument for the duration of this call, and `ioctl` does not retain it.
 		let res = unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONBIO, &v) };
 
 		Errno::result(res).map_err(Error::from).map(drop)
