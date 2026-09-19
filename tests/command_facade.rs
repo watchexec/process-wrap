@@ -1,6 +1,6 @@
 #[cfg(feature = "std")]
 mod std_frontend {
-	use std::{ffi::OsStr, io};
+	use std::{ffi::OsStr, io, path::PathBuf};
 
 	use process_wrap::std::{Command, CommandArg, CommandWrap, CommandWrapper, SpawnAttempt};
 
@@ -151,7 +151,7 @@ mod std_frontend {
 
 	#[test]
 	fn tracked_environment_and_cwd_materialize_exactly() {
-		let cwd = std::env::current_dir().unwrap();
+		let cwd = PathBuf::from("/process-wrap-miri-command-facade");
 		let mut command = Command::new("tool");
 		command
 			.env("PROCESS_WRAP_REMOVED", "before-clear")
@@ -196,7 +196,9 @@ mod std_frontend {
 	fn unix_native_methods_remain_available() {
 		let mut command = Command::new("tool");
 		command.uid(0).gid(0).arg0("argv-zero").process_group(0);
-		// SAFETY: the test callback performs no operations in the child.
+		// SAFETY: after fork and before exec, the callback must use only async-signal-safe
+		// operations and must not allocate, acquire locks, access shared state, or panic. This
+		// callback reads no data and only returns the preexisting `Ok(())` value.
 		unsafe { command.pre_exec(|| Ok(())) };
 
 		assert_eq!(command.native_mut().get_program(), OsStr::new("tool"));
@@ -248,7 +250,7 @@ mod std_frontend {
 
 #[cfg(feature = "tokio1")]
 mod tokio_frontend {
-	use std::{ffi::OsStr, io};
+	use std::{ffi::OsStr, io, path::PathBuf};
 
 	use process_wrap::tokio::{Command, CommandArg, CommandWrap, CommandWrapper, SpawnAttempt};
 
@@ -399,7 +401,7 @@ mod tokio_frontend {
 
 	#[test]
 	fn tracked_environment_and_cwd_materialize_exactly() {
-		let cwd = std::env::current_dir().unwrap();
+		let cwd = PathBuf::from("/process-wrap-miri-command-facade");
 		let mut command = Command::new("tool");
 		command
 			.env("PROCESS_WRAP_REMOVED", "before-clear")
@@ -454,7 +456,9 @@ mod tokio_frontend {
 	fn unix_native_methods_remain_available() {
 		let mut command = Command::new("tool");
 		command.uid(0).gid(0).arg0("argv-zero");
-		// SAFETY: the test callback performs no operations in the child.
+		// SAFETY: after fork and before exec, the callback must use only async-signal-safe
+		// operations and must not allocate, acquire locks, access shared state, or panic. This
+		// callback reads no data and only returns the preexisting `Ok(())` value.
 		unsafe { command.pre_exec(|| Ok(())) };
 
 		assert_eq!(

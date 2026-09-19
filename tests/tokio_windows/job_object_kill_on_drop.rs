@@ -28,6 +28,8 @@ struct ProcessGuard(Option<HANDLE>);
 
 impl ProcessGuard {
 	fn open(pid: u32) -> Result<Self> {
+		// SAFETY: `pid` is reported by the fixture's live descendant helper. A successful call
+		// creates a new process handle, immediately made solely owned by this guard.
 		let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) }
 			.map_err(std::io::Error::other)?;
 		Ok(Self(Some(handle)))
@@ -40,6 +42,8 @@ impl ProcessGuard {
 
 	fn disarm(mut self) -> Result<()> {
 		if let Some(handle) = self.0.take() {
+			// SAFETY: consuming the guard takes its sole successful `OpenProcess` result, removing
+			// the `Drop` close path, so this is exactly one close.
 			unsafe { CloseHandle(handle) }?;
 		}
 		Ok(())
@@ -49,7 +53,10 @@ impl ProcessGuard {
 impl Drop for ProcessGuard {
 	fn drop(&mut self) {
 		if let Some(handle) = self.0.take() {
+			// SAFETY: this is the guard's still-owned successful process handle; taking it prevents
+			// any second close after terminating the fixture descendant.
 			unsafe { TerminateProcess(handle, 1) }.ok();
+			// SAFETY: the same taken handle remains live until this guard's sole close.
 			unsafe { CloseHandle(handle) }.ok();
 		}
 	}
@@ -99,6 +106,9 @@ async fn descendant_pid(child: &mut dyn ChildWrapper) -> Result<u32> {
 async fn wait_for_process_exit(handle: HANDLE) -> Result<()> {
 	let deadline = Instant::now() + EXIT_TIMEOUT;
 	loop {
+		// SAFETY: the caller retains the fixture-owned `ProcessGuard` while this await-free call
+		// executes, so `handle` is its live successful `OpenProcess` result even after the job
+		// drops the descendant process.
 		let wait = unsafe { WaitForSingleObject(handle, 0) };
 		if wait == WAIT_OBJECT_0 {
 			return Ok(());
