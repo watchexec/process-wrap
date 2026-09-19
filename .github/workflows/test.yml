@@ -68,6 +68,28 @@ jobs:
 
       - run: cargo check --locked --no-default-features --lib
 
+  # Miri deliberately excludes native process creation and FFI.
+  miri-process-free:
+    name: Miri (process-free state and ownership)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update nightly
+          rustup component add miri --toolchain nightly
+
+      - run: cargo +nightly miri setup
+      - run: cargo +nightly miri test --locked --no-default-features --features std --lib
+      - run: cargo +nightly miri test --locked --no-default-features --features std --test command_facade
+      - run: cargo +nightly miri test --locked --no-default-features --features std --test wrapper_lookup
+      - run: cargo +nightly miri test --locked --no-default-features --features std --test spawn_provider
+      - run: cargo +nightly miri test --locked --no-default-features --features std --test child_wrapper_contract
+
   all-features:
     strategy:
       fail-fast: false
