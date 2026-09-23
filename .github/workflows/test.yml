@@ -50,7 +50,7 @@ jobs:
         if: matrix.toolchain == 'stable'
         run: cargo test --locked --no-default-features --features ${{ matrix.features }} --all-targets
 
-      - run: cargo clippy --locked --features ${{ matrix.features }}
+      - run: cargo clippy --locked --features ${{ matrix.features }} --all-targets
 
   no-default-features:
     name: Check without any features
@@ -67,6 +67,28 @@ jobs:
           rustup default stable
 
       - run: cargo check --locked --no-default-features --lib
+
+  # Miri deliberately excludes native process creation and FFI.
+  miri-process-free:
+    name: Miri (process-free state and ownership)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update nightly
+          rustup component add miri --toolchain nightly
+
+      - run: cargo +nightly miri setup
+      - run: cargo +nightly miri test --locked --no-default-features --features std --lib
+      - run: cargo +nightly miri test --locked --no-default-features --features std --test command_facade
+      - run: cargo +nightly miri test --locked --no-default-features --features std --test wrapper_lookup
+      - run: cargo +nightly miri test --locked --no-default-features --features std --test spawn_provider
+      - run: cargo +nightly miri test --locked --no-default-features --features std --test child_wrapper_contract
 
   all-features:
     strategy:
@@ -90,9 +112,28 @@ jobs:
           rustup toolchain install --profile minimal --no-self-update nightly
           rustup toolchain install --profile minimal --no-self-update stable
           rustup default stable
+          rustup component add clippy
 
       - run: tests/multiproc_helper.rs 1 1
       - run: cargo test --locked --all-features --all-targets
+      - run: cargo clippy --locked --all-features --all-targets
+
+  msrv-all-features-clippy:
+    name: MSRV all-features Clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update 1.88.0
+          rustup default 1.88.0
+          rustup component add clippy
+
+      - run: cargo clippy --locked --all-features --all-targets
 
   portable-unix-pty:
     strategy:
@@ -120,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -128,6 +169,7 @@ jobs:
         run: |
           rustup toolchain install --profile minimal --no-self-update ${{ matrix.toolchain }}
           rustup default ${{ matrix.toolchain }}
+          rustup component add clippy
           if [ "${{ matrix.toolchain }}" = nightly ]; then
             rustup component add rust-src
           else
@@ -137,9 +179,9 @@ jobs:
       - name: Check portable Unix PTY backend
         run: |
           if [ "${{ matrix.toolchain }}" = nightly ]; then
-            cargo check --locked -Zbuild-std=std --target "${{ matrix.target }}" --no-default-features --features pty --lib
+            cargo clippy --locked -Zbuild-std=std --target "${{ matrix.target }}" --no-default-features --features pty --lib
           else
-            cargo check --locked --target "${{ matrix.target }}" --no-default-features --features pty --lib
+            cargo clippy --locked --target "${{ matrix.target }}" --no-default-features --features pty --lib
           fi
 
   rustdoc:
@@ -169,7 +211,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

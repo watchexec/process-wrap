@@ -2,6 +2,7 @@ use super::prelude::*;
 
 #[test]
 fn nowrap() -> Result<()> {
+	// SAFETY: there is no wrapper layer to bypass.
 	let mut child = unsafe {
 		CommandWrap::with_new("cat", |command| {
 			command.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -27,6 +28,7 @@ fn nowrap() -> Result<()> {
 #[cfg(feature = "process-group")]
 #[test]
 fn process_group() -> Result<()> {
+	// SAFETY: the fixture has no descendants or later group-supervision step to bypass.
 	let mut child = unsafe {
 		CommandWrap::with_new("cat", |command| {
 			command.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -53,6 +55,7 @@ fn process_group() -> Result<()> {
 #[cfg(feature = "process-session")]
 #[test]
 fn process_session() -> Result<()> {
+	// SAFETY: the fixture has no descendants or later group-supervision step to bypass.
 	let mut child = unsafe {
 		CommandWrap::with_new("cat", |command| {
 			command.stdin(Stdio::piped()).stdout(Stdio::piped());

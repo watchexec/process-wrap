@@ -509,8 +509,9 @@ fn read2(
 
 	let out_fd = out_r.as_raw_fd();
 	let err_fd = err_r.as_raw_fd();
-	// SAFETY: these are dropped at the same time as all other FDs here
+	// SAFETY: `out_r` owns this descriptor through every use of the borrow below.
 	let out_bfd = unsafe { BorrowedFd::borrow_raw(out_fd) };
+	// SAFETY: `err_r` owns this descriptor through every use of the borrow below.
 	let err_bfd = unsafe { BorrowedFd::borrow_raw(err_fd) };
 
 	set_nonblocking(out_bfd, true)?;
@@ -554,6 +555,7 @@ fn read2(
 		use nix::errno::Errno;
 
 		let v = nonblocking as libc::c_int;
+		// SAFETY: `fd` is live and `v` is a valid `c_int` argument for `FIONBIO`.
 		let res = unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONBIO, &v) };
 
 		Errno::result(res).map_err(Error::from).map(drop)

@@ -28,6 +28,7 @@ struct ProcessGuard(Option<HANDLE>);
 
 impl ProcessGuard {
 	fn open(pid: u32) -> Result<Self> {
+		// SAFETY: success returns a new process handle immediately owned by this guard.
 		let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) }
 			.map_err(std::io::Error::other)?;
 		Ok(Self(Some(handle)))
@@ -40,6 +41,7 @@ impl ProcessGuard {
 
 	fn disarm(mut self) -> Result<()> {
 		if let Some(handle) = self.0.take() {
+			// SAFETY: taking the guard's owned handle removes the `Drop` close path.
 			unsafe { CloseHandle(handle) }?;
 		}
 		Ok(())
@@ -49,7 +51,9 @@ impl ProcessGuard {
 impl Drop for ProcessGuard {
 	fn drop(&mut self) {
 		if let Some(handle) = self.0.take() {
+			// SAFETY: the guard still owns this handle and has taken it out of the later drop path.
 			unsafe { TerminateProcess(handle, 1) }.ok();
+			// SAFETY: the same taken handle remains live until this close.
 			unsafe { CloseHandle(handle) }.ok();
 		}
 	}
@@ -99,6 +103,7 @@ async fn descendant_pid(child: &mut dyn ChildWrapper) -> Result<u32> {
 async fn wait_for_process_exit(handle: HANDLE) -> Result<()> {
 	let deadline = Instant::now() + EXIT_TIMEOUT;
 	loop {
+		// SAFETY: the caller's `ProcessGuard` keeps this handle live for the call.
 		let wait = unsafe { WaitForSingleObject(handle, 0) };
 		if wait == WAIT_OBJECT_0 {
 			return Ok(());

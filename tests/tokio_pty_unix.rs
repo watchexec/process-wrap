@@ -322,11 +322,11 @@ async fn process_group_wait_is_independent_from_descendant_output_eof() -> io::R
 
 #[tokio::test]
 async fn failed_spawn_leaves_command_reusable() -> io::Result<()> {
-	use std::os::unix::fs::PermissionsExt;
-
 	let directory = tempfile::tempdir()?;
 	let program = directory.path().join("created-after-first-spawn");
-	let mut command = Command::new(&program);
+	let mut command = Command::with_new(&program, |command| {
+		command.args(["-c", "printf reused"]);
+	});
 	assert_eq!(
 		spawn_with_terminal(&mut command, PtySize::default())
 			.unwrap_err()
@@ -334,8 +334,7 @@ async fn failed_spawn_leaves_command_reusable() -> io::Result<()> {
 		io::ErrorKind::NotFound
 	);
 
-	std::fs::write(&program, "#!/bin/sh\nprintf reused")?;
-	std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+	std::os::unix::fs::symlink("/bin/sh", &program)?;
 	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
@@ -513,6 +512,7 @@ async fn process_group_try_wait_supports_terminal_provider_child() -> io::Result
 		}
 	})
 	.await??;
+	// SAFETY: the terminal child has no native child to expose, so no layer is removed.
 	assert!(unsafe { child.try_inner_child_mut() }.is_none());
 	assert_eq!(child.try_wait()?, Some(status));
 	assert_eq!(child.wait().await?, status);

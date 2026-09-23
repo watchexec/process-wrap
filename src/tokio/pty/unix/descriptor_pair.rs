@@ -55,9 +55,10 @@ pub(super) fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
 ///
 /// # Safety
 ///
-/// `socket` and every descriptor in `descriptors` must be live for the duration of this call. This
-/// function is suitable for the restricted child side of a post-fork helper: it uses only stack data,
-/// pointer operations, `sendmsg`, and the thread-local errno slot.
+/// `socket` and every descriptor in `descriptors` must remain live and must not be concurrently
+/// closed or reused for this call. This function is suitable for the restricted child side of a
+/// post-fork helper: it uses only stack data, pointer operations, `sendmsg`, and the thread-local
+/// errno slot.
 pub(super) unsafe fn send_response(
 	socket: RawFd,
 	error: libc::c_int,
@@ -85,7 +86,8 @@ pub(super) unsafe fn send_response(
 		if header.is_null() {
 			return false;
 		}
-		// SAFETY: header points into the live, sufficiently sized control buffer.
+		// SAFETY: `header` and its payload fit in the aligned control buffer. SCM_RIGHTS aligns
+		// CMSG_DATA for RawFd, and the separate source array cannot overlap it.
 		unsafe {
 			(*header).cmsg_len = libc::CMSG_LEN(DESCRIPTOR_BYTES as libc::c_uint) as _;
 			(*header).cmsg_level = libc::SOL_SOCKET;
@@ -218,7 +220,8 @@ impl ReceivedRights {
 			return (rights, false);
 		}
 
-		// SAFETY: cmsg_len covers count complete descriptors and the destination has room for both.
+		// SAFETY: the checked cmsg_len covers `count` RawFds; SCM_RIGHTS aligns CMSG_DATA for
+		// RawFd, and the destination has room and cannot overlap the control buffer.
 		unsafe {
 			std::ptr::copy_nonoverlapping(
 				libc::CMSG_DATA(header).cast::<RawFd>(),

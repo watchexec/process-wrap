@@ -207,6 +207,7 @@ impl ChildWrapper for JobObjectChild {
 		if spawn_finalized && final_kill_on_drop {
 			// manually drop the completion port
 			let its = std::mem::ManuallyDrop::new(job_port);
+			// SAFETY: `its` owns the completion-port handle and suppresses `JobPort::drop`.
 			unsafe { CloseHandle(its.completion_port.0) }.ok();
 			// we leave the job handle unclosed, otherwise the Child is useless
 			// (as closing it may terminate the job)
