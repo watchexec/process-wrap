@@ -28,18 +28,15 @@ const _: () = assert!(size_of::<PtmGet>() == 40);
 
 pub(super) fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	let (parent_socket, helper_socket) = descriptor_pair::socket_pair()?;
-	// SAFETY: the two OwnedFds remain live across this synchronous call. On a non-error parent
-	// return, the caller receives a positive helper PID and continues normal Rust execution; the
-	// child immediately passes non-owning raw descriptor views to the syscall-only branch below and
-	// terminates via _exit.
+	// SAFETY: the child immediately enters the audited post-fork helper and exits through `_exit`
+	// without touching shared runtime state.
 	let helper = unsafe { libc::fork() };
 	if helper == -1 {
 		return Err(io::Error::last_os_error());
 	}
 	if helper == 0 {
-		// SAFETY: fork selected this post-fork child; both raw descriptors are inherited, live, and
-		// distinct. allocate_and_send uses only its documented syscall-oriented path and _exit,
-		// so this branch cannot return into or unwind through the Rust runtime.
+		// SAFETY: this child inherited the two distinct, live endpoints created by `socket_pair`;
+		// `allocate_and_send` follows its audited post-fork path and exits via `_exit`.
 		unsafe { allocate_and_send(parent_socket.as_raw_fd(), helper_socket.as_raw_fd()) }
 	}
 
@@ -68,104 +65,77 @@ pub(super) fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 
 /// # Safety
 ///
-/// `parent_socket` and `helper_socket` must be distinct, live socket descriptors inherited by the
-/// immediate post-fork child. Call this function only in that child. Its body relies on OpenBSD's
-/// libc implementations of the required descriptor, ancillary-message, and `PTMGET` ioctl
-/// operations being direct syscall-oriented operations without allocation or locks in this path;
-/// this is a supported-target reliance, not a portable POSIX async-signal-safety guarantee. It
-/// must use only that syscall-oriented path, never return or unwind into Rust teardown, and
-/// terminate every path through `_exit`.
+/// `parent_socket` and `helper_socket` must be distinct live sockets inherited by the immediate
+/// post-fork child. Call this only in that child. The body relies on OpenBSD's libc operations here
+/// being direct, allocation- and lock-free syscall paths, and every path terminates through `_exit`.
 unsafe fn allocate_and_send(parent_socket: RawFd, helper_socket: RawFd) -> ! {
-	// SAFETY: parent_socket is this child's inherited descriptor-table reference to the parent
-	// endpoint; it is live by the function contract, is never used again here, and close consumes
-	// only that reference. The inherited OwnedFd backing this raw view is never dropped because
-	// this helper's documented _exit-only path cannot return into Rust teardown.
+	// SAFETY: both descriptors were inherited across fork and the helper does not use the parent end.
 	unsafe {
 		libc::close(parent_socket);
 	}
 
-	// SAFETY: PTM_DEVICE is static NUL-terminated byte storage whose pointer remains valid for this
-	// synchronous open call; its result is either -1 or one new raw descriptor owned by this helper.
+	// SAFETY: PTM_DEVICE is a static NUL-terminated path.
 	let ptm = unsafe { libc::open(PTM_DEVICE.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
 	if ptm == -1 {
-		// SAFETY: OpenBSD's __errno returns a non-null pointer to this helper thread's live errno
-		// slot, which is read before send_response or any other operation can overwrite it.
+		// SAFETY: __errno returns the helper thread's live errno slot.
 		let error = unsafe { *libc::__errno() };
-		// SAFETY: helper_socket is this child's still-live inherited helper endpoint; None transfers no
-		// descriptors, and send_response's stack-backed response/control storage remains live for its call.
+		// SAFETY: helper_socket remains live and no descriptors accompany this error response.
 		let sent = unsafe { descriptor_pair::send_response(helper_socket, error, None) };
-		// SAFETY: _exit consumes only this scalar status after send_response returns; it prevents Rust
-		// destructors, allocator use, unwinding, and shared-runtime teardown in the post-fork child.
+		// SAFETY: the helper must not run Rust destructors or shared runtime teardown after fork.
 		unsafe { libc::_exit(if sent { 0 } else { 1 }) }
 	}
 
 	let mut pair = MaybeUninit::<PtmGet>::zeroed();
-	// SAFETY: ptm is this helper's open raw /dev/ptm descriptor. PTMGET encodes the exact repr(C)
-	// PtmGet ABI layout, and pair provides aligned writable storage for that complete structure until
-	// ioctl returns. POSIX does not mandate this ioctl as async-signal-safe; this post-fork call relies
-	// on the supported OpenBSD libc implementation being direct syscall-oriented without allocation
-	// or locks.
+	// SAFETY: ptm is an open /dev/ptm descriptor, PTMGET encodes the exact PtmGet layout, and the output
+	// pointer is writable for that complete structure.
 	let allocated = unsafe { libc::ioctl(ptm, PTMGET, pair.as_mut_ptr()) };
 	// Capture errno before close can change it.
 	let error = if allocated == -1 {
-		// SAFETY: OpenBSD's __errno returns a non-null pointer to this helper thread's live errno
-		// slot, which is read before send_response or any other operation can overwrite it.
+		// SAFETY: __errno returns the helper thread's live errno slot.
 		unsafe { *libc::__errno() }
 	} else {
 		0
 	};
-	// SAFETY: ptm is the helper's one live raw descriptor reference returned by open; errno was
-	// captured first, and close consumes that reference before this value is never used again.
+	// SAFETY: ptm is the helper's live, independently owned descriptor.
 	unsafe {
 		libc::close(ptm);
 	}
 	if allocated == -1 {
-		// SAFETY: helper_socket is this child's still-live inherited helper endpoint; None transfers no
-		// descriptors, and send_response's stack-backed response/control storage remains live for its call.
+		// SAFETY: helper_socket remains live and no descriptors accompany this error response.
 		let sent = unsafe { descriptor_pair::send_response(helper_socket, error, None) };
-		// SAFETY: _exit consumes only this scalar status after send_response returns; it prevents Rust
-		// destructors, allocator use, unwinding, and shared-runtime teardown in the post-fork child.
+		// SAFETY: the helper must not run Rust destructors or shared runtime teardown after fork.
 		unsafe { libc::_exit(if sent { 0 } else { 1 }) }
 	}
 
-	// SAFETY: a successful PTMGET initialized pair's complete repr(C) PtmGet storage before returning;
-	// the value is now read only after ptm's unrelated descriptor-table reference was closed.
+	// SAFETY: PTMGET succeeded and initialized the complete structure.
 	let pair = unsafe { pair.assume_init() };
 	if pair.controller < 0 || pair.slave < 0 || pair.controller == pair.slave {
 		if pair.controller >= 0 {
-			// SAFETY: successful PTMGET installed this nonnegative controller descriptor as a helper-owned
-			// raw reference; this branch closes it exactly once and never uses it afterward.
+			// SAFETY: a nonnegative controller came from successful PTMGET.
 			unsafe {
 				libc::close(pair.controller);
 			}
 		}
 		if pair.slave >= 0 && pair.slave != pair.controller {
-			// SAFETY: successful PTMGET installed this distinct nonnegative slave descriptor as a
-			// helper-owned raw reference; the preceding comparison prevents a duplicate close.
+			// SAFETY: a distinct nonnegative slave came from successful PTMGET.
 			unsafe {
 				libc::close(pair.slave);
 			}
 		}
-		// SAFETY: helper_socket is this child's still-live inherited helper endpoint; None transfers no
-		// descriptors, and send_response's stack-backed response/control storage remains live for its call.
+		// SAFETY: helper_socket remains live and no descriptors accompany this error response.
 		let sent = unsafe { descriptor_pair::send_response(helper_socket, libc::EIO, None) };
-		// SAFETY: _exit consumes only this scalar status after send_response returns; it prevents Rust
-		// destructors, allocator use, unwinding, and shared-runtime teardown in the post-fork child.
+		// SAFETY: the helper must not run Rust destructors or shared runtime teardown after fork.
 		unsafe { libc::_exit(if sent { 0 } else { 1 }) }
 	}
 
 	// PTMGET installs both descriptors without close-on-exec. They exist only in this no-exec helper;
-	// SCM_RIGHTS copies their rights, which recvmsg installs atomically with close-on-exec in the parent.
-	// SAFETY: helper_socket and both distinct nonnegative PTY descriptors remain live through the
-	// synchronous send_response call. Its stack-backed msghdr/control storage copies the two raw
-	// values; it does not transfer this helper's close responsibility.
+	// SCM_RIGHTS transfers copies which recvmsg installs atomically with close-on-exec in the parent.
+	// SAFETY: helper_socket and both PTY descriptors remain live through this call.
 	let sent = unsafe {
 		descriptor_pair::send_response(helper_socket, 0, Some([pair.controller, pair.slave]))
 	};
-	// SAFETY: PTMGET gave the helper distinct raw descriptor references. send_response has returned,
-	// so its buffers no longer borrow their values; a successful send left independent socket-message
-	// references for the parent, while these two local references are each closed exactly once. _exit
-	// then prevents every Rust teardown path.
+	// SAFETY: both descriptors are independently owned by the helper. The successful send retained its
+	// own references in the socket message until the parent receives them.
 	unsafe {
 		libc::close(pair.controller);
 		libc::close(pair.slave);
@@ -176,8 +146,7 @@ unsafe fn allocate_and_send(parent_socket: RawFd, helper_socket: RawFd) -> ! {
 fn reap_helper(helper: libc::pid_t) -> io::Result<()> {
 	let mut status = 0;
 	loop {
-		// SAFETY: helper is the positive PID returned by this open_pty invocation's successful fork, and
-		// status is aligned writable storage for exactly one wait status that remains live for waitpid.
+		// SAFETY: helper is the positive PID returned by fork and status is writable for one wait status.
 		let waited = unsafe { libc::waitpid(helper, &mut status, 0) };
 		if waited == helper {
 			if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {

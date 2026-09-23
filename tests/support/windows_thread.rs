@@ -21,9 +21,7 @@ struct OwnedHandle(HANDLE);
 
 impl Drop for OwnedHandle {
 	fn drop(&mut self) {
-		// SAFETY: every construction below wraps only a successful snapshot or thread-open result.
-		// This private wrapper is that result's sole owner, and its one `Drop` invocation closes it
-		// exactly once.
+		// SAFETY: this wrapper solely owns a successfully opened handle.
 		unsafe { CloseHandle(self.0) }.ok();
 	}
 }
@@ -31,25 +29,19 @@ impl Drop for OwnedHandle {
 #[derive(Debug)]
 pub struct ProcessGuard(Option<HANDLE>);
 
-// SAFETY: Windows process handles are process-wide, not thread-affine, and support waiting,
-// termination, and close from any thread. `ProcessGuard` privately owns the successful `OpenProcess`
-// result in its `Option`; moving it moves that sole close/terminate responsibility, exposes no
-// shared mutable Rust state, and only consuming or mutable methods remove the handle, so transfer
-// cannot race a second fixture-owned close.
+// SAFETY: Windows handles are process-wide, and this guard uniquely owns its handle.
 unsafe impl Send for ProcessGuard {}
 
 impl ProcessGuard {
 	pub fn open(pid: u32) -> Result<Self> {
-		// SAFETY: a successful `OpenProcess` returns a newly owned handle for this fixture PID;
-		// storing it in this guard makes the guard its sole closer.
+		// SAFETY: success returns a new process handle immediately owned by this guard.
 		let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) }
 			.map_err(Error::other)?;
 		Ok(Self(Some(handle)))
 	}
 
 	pub fn has_exited(&self) -> Result<bool> {
-		// SAFETY: `self.handle()` is the live successful `OpenProcess` result retained by this
-		// borrowed guard, which cannot be disarmed or dropped for this call's duration.
+		// SAFETY: this borrowed guard keeps its process handle live for the call.
 		let wait = unsafe { WaitForSingleObject(self.handle(), 0) };
 		if wait == WAIT_FAILED {
 			Err(Error::last_os_error())
@@ -60,8 +52,7 @@ impl ProcessGuard {
 
 	pub fn disarm(mut self) -> Result<()> {
 		if let Some(handle) = self.0.take() {
-			// SAFETY: consuming `self` and taking its only successful `OpenProcess` result leave no
-			// `Drop` path owning this handle, so this is its single close.
+			// SAFETY: taking the guard's owned handle removes the `Drop` close path.
 			unsafe { CloseHandle(handle) }?;
 		}
 		Ok(())
@@ -76,18 +67,16 @@ impl ProcessGuard {
 impl Drop for ProcessGuard {
 	fn drop(&mut self) {
 		if let Some(handle) = self.0.take() {
-			// SAFETY: this is the guard's still-owned successful `OpenProcess` result; taking it
-			// prevents a second close after the best-effort termination.
+			// SAFETY: the guard still owns this handle and has taken it out of the later drop path.
 			unsafe { TerminateProcess(handle, 1) }.ok();
-			// SAFETY: the same taken handle remains live until this sole close.
+			// SAFETY: the same taken handle remains live until this close.
 			unsafe { CloseHandle(handle) }.ok();
 		}
 	}
 }
 
 pub fn resume_process_threads(pid: u32) -> Result<()> {
-	// SAFETY: success returns a snapshot handle owned immediately by this `OwnedHandle`; it stays
-	// live through all enumeration calls below and its `Drop` closes it exactly once.
+	// SAFETY: success returns a snapshot handle that is immediately owned.
 	let snapshot = OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }?);
 	let mut entry = THREADENTRY32 {
 		dwSize: std::mem::size_of::<THREADENTRY32>()
@@ -95,29 +84,24 @@ pub fn resume_process_threads(pid: u32) -> Result<()> {
 			.expect("THREADENTRY32 is guaranteed to fit in a DWORD"),
 		..Default::default()
 	};
-	// SAFETY: `snapshot` is live, and `entry` is aligned stack storage initialized by `Default`
-	// with `dwSize` set to exactly `THREADENTRY32`'s size; its mutable pointer lasts for the call.
+	// SAFETY: `snapshot` is live; `entry` is writable and has the required `dwSize`.
 	unsafe { Thread32First(snapshot.0, &mut entry) }.map_err(Error::other)?;
 
 	let mut found = false;
 	loop {
 		if entry.th32OwnerProcessID == pid {
 			found = true;
-			// SAFETY: this thread ID comes from the initialized current snapshot entry whose owner
-			// equals the fixture's target PID. A successful result is immediately the sole handle in
-			// `OwnedHandle`, and the requested right permits the following suspend/resume call.
+			// SAFETY: snapshot enumeration initialized this thread ID; success is immediately owned.
 			let thread = OwnedHandle(unsafe {
 				OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
 			}?);
-			// SAFETY: `thread` still solely owns the successful `OpenThread` result and requested
-			// `THREAD_SUSPEND_RESUME`, so its handle is live and authorized for this operation.
+			// SAFETY: `thread` owns a live handle with suspend/resume access.
 			if unsafe { ResumeThread(thread.0) } == u32::MAX {
 				return Err(Error::last_os_error());
 			}
 		}
 
-		// SAFETY: the live snapshot remains owned by `snapshot`, and `entry` retains its aligned,
-		// initialized `THREADENTRY32` storage and exact `dwSize` for this call.
+		// SAFETY: `snapshot` stays live; `entry` remains writable with the required `dwSize`.
 		match unsafe { Thread32Next(snapshot.0, &mut entry) } {
 			Ok(()) => {}
 			Err(error) if error.code() == HRESULT::from_win32(ERROR_NO_MORE_FILES.0) => break,
@@ -133,8 +117,7 @@ pub fn resume_process_threads(pid: u32) -> Result<()> {
 }
 
 pub fn process_has_suspended_thread(pid: u32) -> Result<bool> {
-	// SAFETY: success returns a snapshot handle owned immediately by this `OwnedHandle`; it stays
-	// live through all enumeration calls below and its `Drop` closes it exactly once.
+	// SAFETY: success returns a snapshot handle that is immediately owned.
 	let snapshot = OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }?);
 	let mut entry = THREADENTRY32 {
 		dwSize: std::mem::size_of::<THREADENTRY32>()
@@ -142,8 +125,7 @@ pub fn process_has_suspended_thread(pid: u32) -> Result<bool> {
 			.expect("THREADENTRY32 is guaranteed to fit in a DWORD"),
 		..Default::default()
 	};
-	// SAFETY: `snapshot` is live, and `entry` is aligned stack storage initialized by `Default`
-	// with `dwSize` set to exactly `THREADENTRY32`'s size; its mutable pointer lasts for the call.
+	// SAFETY: `snapshot` is live; `entry` is writable and has the required `dwSize`.
 	unsafe { Thread32First(snapshot.0, &mut entry) }.map_err(Error::other)?;
 
 	let mut found = false;
@@ -151,20 +133,16 @@ pub fn process_has_suspended_thread(pid: u32) -> Result<bool> {
 	loop {
 		if entry.th32OwnerProcessID == pid {
 			found = true;
-			// SAFETY: this thread ID comes from the initialized current snapshot entry whose owner
-			// equals the fixture's target PID. A successful result is immediately the sole handle in
-			// `OwnedHandle`, and the requested right permits the following suspend/resume call.
+			// SAFETY: snapshot enumeration initialized this thread ID; success is immediately owned.
 			let thread = OwnedHandle(unsafe {
 				OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
 			}?);
-			// SAFETY: `thread` solely owns the live successful `OpenThread` result with
-			// `THREAD_SUSPEND_RESUME`, so it is authorized for this balanced probe.
+			// SAFETY: `thread` owns a live handle with suspend/resume access.
 			let previous_count = unsafe { SuspendThread(thread.0) };
 			if previous_count == u32::MAX {
 				return Err(Error::last_os_error());
 			}
-			// SAFETY: `thread` still solely owns the live handle with the requested resume access;
-			// this call balances the immediately preceding successful suspension probe.
+			// SAFETY: the same live handle is used to balance the preceding suspension.
 			let balanced_count = unsafe { ResumeThread(thread.0) };
 			if balanced_count == u32::MAX {
 				return Err(Error::last_os_error());
@@ -175,8 +153,7 @@ pub fn process_has_suspended_thread(pid: u32) -> Result<bool> {
 			suspended |= previous_count > 0;
 		}
 
-		// SAFETY: the live snapshot remains owned by `snapshot`, and `entry` retains its aligned,
-		// initialized `THREADENTRY32` storage and exact `dwSize` for this call.
+		// SAFETY: `snapshot` stays live; `entry` remains writable with the required `dwSize`.
 		match unsafe { Thread32Next(snapshot.0, &mut entry) } {
 			Ok(()) => {}
 			Err(error) if error.code() == HRESULT::from_win32(ERROR_NO_MORE_FILES.0) => break,

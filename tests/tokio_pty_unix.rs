@@ -513,9 +513,7 @@ async fn process_group_try_wait_supports_terminal_provider_child() -> io::Result
 		}
 	})
 	.await??;
-	// SAFETY: this fixture is `ProcessGroupChild -> terminal PTY child`; the provider is
-	// terminal rather than native, so traversal returns `None` without exposing a mutable
-	// child or removing either layer's group-supervision or cleanup state.
+	// SAFETY: the terminal child has no native child to expose, so no layer is removed.
 	assert!(unsafe { child.try_inner_child_mut() }.is_none());
 	assert_eq!(child.try_wait()?, Some(status));
 	assert_eq!(child.wait().await?, status);

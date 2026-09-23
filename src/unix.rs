@@ -15,16 +15,11 @@ const LEADER_PROCESS_GROUP: i32 = 0;
 
 pub(crate) fn reset_sigmask() -> io::Result<()> {
 	let mut empty = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-	// SAFETY: `empty` provides writable, properly aligned storage for one `sigset_t`. A successful
-	// `sigemptyset` initializes that storage. On failure, `last_os_error` immediately reads errno
-	// through the raw-OS error path used by the accepted `pre_exec` callback result.
+	// SAFETY: `empty` points to writable storage for one signal set.
 	if unsafe { libc::sigemptyset(empty.as_mut_ptr()) } == -1 {
 		return Err(io::Error::last_os_error());
 	}
-	// SAFETY: `sigemptyset` initialized the live `empty` set, and the null old-mask pointer requests
-	// no output. `pthread_sigmask` returns its error number directly, which becomes the raw-OS error
-	// representation returned by the callback. These signal-mask operations are POSIX-listed
-	// async-signal-safe operations; this does not make generic Rust library calls post-fork safe.
+	// SAFETY: `sigemptyset` initialized `empty`; the old mask is not requested.
 	let error =
 		unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, empty.as_ptr(), ptr::null_mut()) };
 	if error != 0 {
@@ -139,15 +134,8 @@ impl CommandState {
 		drop(installed);
 
 		let dispatcher = Arc::clone(&self.0);
-		// SAFETY: both `Arc` clones and all policy values are prepared in the parent before this
-		// callback can run. Its dispatch decision only dereferences those captured allocations and
-		// performs atomic loads: it never clones or drops a reference count, or touches
-		// `active_callback`'s mutex. On supported targets, the `AtomicBool` and `AtomicI32` widths used
-		// here do not allocate or use runtime locks. The parent publishes policy with `SeqCst` stores
-		// before spawning, and the child reads it with corresponding `SeqCst` loads. That ordering
-		// governs policy publication; it is not the POSIX async-signal-safety proof. The callback then
-		// runs only the audited signal-mask, session, and process-group operations and their raw-OS
-		// error paths.
+		// SAFETY: the callback only invokes async-signal-safe Unix process setup functions and
+		// reads atomics populated before spawning. It never accesses `active_callback`'s mutex.
 		unsafe {
 			command.pre_exec(move || {
 				if active.load(Ordering::Acquire) {
@@ -250,9 +238,7 @@ impl Dispatcher {
 		}
 
 		if process_session {
-			// SAFETY: `setsid` takes no pointers or borrowed values and is a POSIX-listed
-			// async-signal-safe operation. A `-1` result is reported through the raw-OS error
-			// representation accepted by `pre_exec`.
+			// SAFETY: `setsid` takes no pointers and runs in the child before exec.
 			if unsafe { libc::setsid() } == -1 {
 				return Err(io::Error::last_os_error());
 			}
@@ -261,9 +247,7 @@ impl Dispatcher {
 		if process_group != NO_PROCESS_GROUP
 			&& !(process_session && process_group == LEADER_PROCESS_GROUP)
 		{
-			// SAFETY: `setpgid` receives only scalar process IDs, retains no borrowed pointers, and is a
-			// POSIX-listed async-signal-safe operation. A `-1` result is reported through the raw-OS
-			// error representation accepted by `pre_exec`.
+			// SAFETY: `setpgid` is applied to the current child and retains no pointers.
 			if unsafe { libc::setpgid(0, process_group) } == -1 {
 				return Err(io::Error::last_os_error());
 			}

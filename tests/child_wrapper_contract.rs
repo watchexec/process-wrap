@@ -353,16 +353,12 @@ mod std_frontend {
 		child.wait().expect("reap immutable-test child");
 
 		let mut child = layered_native();
-		// SAFETY: `layered_native` builds `Layer -> Layer -> native child`; each `Layer`
-		// only forwards its `Option<Box<dyn ChildWrapper>>` and owns no cleanup or
-		// supervision state, so mutating the exclusive native-child borrow bypasses none.
+		// SAFETY: these fixture layers only forward their child; they add no cleanup or supervision state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_some());
 		child.wait().expect("reap mutable-test child");
 
 		let child = layered_native();
-		// SAFETY: this is the same `Layer -> Layer -> native child` fixture; consuming either
-		// forwarding `Layer` drops only its counter and transfers its child, so no cleanup or
-		// supervision invariant is bypassed before the native child is recovered.
+		// SAFETY: consuming these forwarding layers bypasses no cleanup or supervision state.
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().expect("reap consuming-test child");
 	}
@@ -375,14 +371,12 @@ mod std_frontend {
 		child.wait().expect("reap immutable-test child");
 
 		let mut child: Box<dyn ChildWrapper> = Box::new(InlineLayer(native_child()));
-		// SAFETY: `InlineLayer` contains only the native child and its `inner_mut` directly
-		// returns that field; it adds no cleanup or supervision state for this borrow to bypass.
+		// SAFETY: `InlineLayer` adds no cleanup or supervision state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_some());
 		child.wait().expect("reap mutable-test child");
 
 		let child: Box<dyn ChildWrapper> = Box::new(InlineLayer(native_child()));
-		// SAFETY: consuming this `InlineLayer` only moves out its native-child field; the
-		// fixture adds no cleanup or supervision layer whose removal could break an invariant.
+		// SAFETY: consuming `InlineLayer` bypasses no cleanup or supervision state.
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().expect("reap consuming-test child");
 	}
@@ -391,10 +385,7 @@ mod std_frontend {
 	fn consuming_traversal_allows_same_type_to_reuse_its_allocation() {
 		if cfg!(miri) {
 			let (child, into_inner_calls, leaf_calls, leaf_ptr) = reusing_synthetic();
-			// SAFETY: `reusing_synthetic` creates two `ReusingLayer`s that transfer their
-			// terminal `Leaf` while retaining the same outer allocation. The terminal leaf owns
-			// only atomic counters, so consuming the forwarding layers bypasses no cleanup or
-			// supervision invariant.
+			// SAFETY: these forwarding layers and the counter-only leaf own no cleanup state.
 			let child = unsafe { child.try_into_inner_child() }
 				.expect_err("the synthetic terminal must be returned");
 			assert_eq!(data_ptr(child.as_ref()), leaf_ptr);
@@ -408,9 +399,7 @@ mod std_frontend {
 		}
 
 		let (child, into_inner_calls) = reusing_native();
-		// SAFETY: `reusing_native` creates `ReusingLayer -> ReusingLayer -> native child`.
-		// Each layer only replaces its own enum slot while transferring that child and increments
-		// a counter, so consuming it bypasses neither cleanup nor supervision.
+		// SAFETY: `ReusingLayer` only forwards its child and records a call count.
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().expect("reap consuming-test child");
 		assert_eq!(into_inner_calls.load(Ordering::SeqCst), 2);
@@ -420,15 +409,11 @@ mod std_frontend {
 	fn self_leaf_try_accessors_preserve_ownership() {
 		let (mut child, calls) = leaf();
 		assert!(child.try_inner_child().is_none());
-		// SAFETY: the `Leaf` fixture returns itself and contains only shared atomic call counters;
-		// it owns no child, cleanup action, or supervision state that this exclusive traversal can
-		// bypass, and a terminal leaf yields no mutable native child.
+		// SAFETY: `Leaf` owns only atomic counters, with no child or lifecycle state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_none());
 
 		let original = data_ptr(child.as_ref());
-		// SAFETY: this terminal `Leaf` owns no native child or lifecycle resource; its only
-		// state is shared atomic counters, so the failed consuming traversal neither bypasses
-		// cleanup nor removes supervision.
+		// SAFETY: consuming the counter-only `Leaf` bypasses no cleanup or supervision state.
 		let child = unsafe { child.try_into_inner_child() }
 			.expect_err("a non-native leaf must be returned");
 		assert_eq!(data_ptr(child.as_ref()), original);
@@ -452,12 +437,9 @@ mod std_frontend {
 		));
 
 		assert!(child.try_inner_child().is_none());
-		// SAFETY: this fixture is `Layer -> Layer -> Leaf`; both `Layer`s only transfer their
-		// child and increment drop counters, while `Leaf` has only atomic counters. Traversal
-		// yields no mutable native child and bypasses neither cleanup nor supervision.
+		// SAFETY: the forwarding layers and counter-only leaf own no lifecycle state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_none());
-		// SAFETY: consuming the two forwarding `Layer`s only records their drops and returns the
-		// terminal `Leaf`, whose counter-only state has no cleanup or supervision invariant.
+		// SAFETY: consuming the forwarding layers bypasses no cleanup or supervision state.
 		let child = unsafe { child.try_into_inner_child() }
 			.expect_err("the terminal leaf must be returned");
 		assert_eq!(data_ptr(child.as_ref()), leaf_ptr);
@@ -873,16 +855,12 @@ mod tokio_frontend {
 		child.wait().await.expect("reap immutable-test child");
 
 		let mut child = layered_native();
-		// SAFETY: `layered_native` builds `Layer -> Layer -> native child`; each `Layer`
-		// only forwards its `Option<Box<dyn ChildWrapper>>` and owns no cleanup or
-		// supervision state, so mutating the exclusive native-child borrow bypasses none.
+		// SAFETY: these fixture layers only forward their child; they add no cleanup or supervision state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_some());
 		child.wait().await.expect("reap mutable-test child");
 
 		let child = layered_native();
-		// SAFETY: this is the same `Layer -> Layer -> native child` fixture; consuming either
-		// forwarding `Layer` drops only its counter and transfers its child, so no cleanup or
-		// supervision invariant is bypassed before the native child is recovered.
+		// SAFETY: consuming these forwarding layers bypasses no cleanup or supervision state.
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().await.expect("reap consuming-test child");
 	}
@@ -895,14 +873,12 @@ mod tokio_frontend {
 		child.wait().await.expect("reap immutable-test child");
 
 		let mut child: Box<dyn ChildWrapper> = Box::new(InlineLayer(native_child()));
-		// SAFETY: `InlineLayer` contains only the native child and its `inner_mut` directly
-		// returns that field; it adds no cleanup or supervision state for this borrow to bypass.
+		// SAFETY: `InlineLayer` adds no cleanup or supervision state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_some());
 		child.wait().await.expect("reap mutable-test child");
 
 		let child: Box<dyn ChildWrapper> = Box::new(InlineLayer(native_child()));
-		// SAFETY: consuming this `InlineLayer` only moves out its native-child field; the
-		// fixture adds no cleanup or supervision layer whose removal could break an invariant.
+		// SAFETY: consuming `InlineLayer` bypasses no cleanup or supervision state.
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().await.expect("reap consuming-test child");
 	}
@@ -911,10 +887,7 @@ mod tokio_frontend {
 	async fn consuming_traversal_allows_same_type_to_reuse_its_allocation() {
 		if cfg!(miri) {
 			let (child, into_inner_calls, leaf_calls, leaf_ptr) = reusing_synthetic();
-			// SAFETY: `reusing_synthetic` creates two `ReusingLayer`s that transfer their
-			// terminal `Leaf` while retaining the same outer allocation. The terminal leaf owns
-			// only atomic counters, so consuming the forwarding layers bypasses no cleanup or
-			// supervision invariant.
+			// SAFETY: these forwarding layers and the counter-only leaf own no cleanup state.
 			let child = unsafe { child.try_into_inner_child() }
 				.expect_err("the synthetic terminal must be returned");
 			assert_eq!(data_ptr(child.as_ref()), leaf_ptr);
@@ -928,9 +901,7 @@ mod tokio_frontend {
 		}
 
 		let (child, into_inner_calls) = reusing_native();
-		// SAFETY: `reusing_native` creates `ReusingLayer -> ReusingLayer -> native child`.
-		// Each layer only replaces its own enum slot while transferring that child and increments
-		// a counter, so consuming it bypasses neither cleanup nor supervision.
+		// SAFETY: `ReusingLayer` only forwards its child and records a call count.
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().await.expect("reap consuming-test child");
 		assert_eq!(into_inner_calls.load(Ordering::SeqCst), 2);
@@ -940,15 +911,11 @@ mod tokio_frontend {
 	async fn self_leaf_try_accessors_preserve_ownership() {
 		let (mut child, calls) = leaf();
 		assert!(child.try_inner_child().is_none());
-		// SAFETY: the `Leaf` fixture returns itself and contains only shared atomic call counters;
-		// it owns no child, cleanup action, or supervision state that this exclusive traversal can
-		// bypass, and a terminal leaf yields no mutable native child.
+		// SAFETY: `Leaf` owns only atomic counters, with no child or lifecycle state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_none());
 
 		let original = data_ptr(child.as_ref());
-		// SAFETY: this terminal `Leaf` owns no native child or lifecycle resource; its only
-		// state is shared atomic counters, so the failed consuming traversal neither bypasses
-		// cleanup nor removes supervision.
+		// SAFETY: consuming the counter-only `Leaf` bypasses no cleanup or supervision state.
 		let child = unsafe { child.try_into_inner_child() }
 			.expect_err("a non-native leaf must be returned");
 		assert_eq!(data_ptr(child.as_ref()), original);
@@ -972,12 +939,9 @@ mod tokio_frontend {
 		));
 
 		assert!(child.try_inner_child().is_none());
-		// SAFETY: this fixture is `Layer -> Layer -> Leaf`; both `Layer`s only transfer their
-		// child and increment drop counters, while `Leaf` has only atomic counters. Traversal
-		// yields no mutable native child and bypasses neither cleanup nor supervision.
+		// SAFETY: the forwarding layers and counter-only leaf own no lifecycle state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_none());
-		// SAFETY: consuming the two forwarding `Layer`s only records their drops and returns the
-		// terminal `Leaf`, whose counter-only state has no cleanup or supervision invariant.
+		// SAFETY: consuming the forwarding layers bypasses no cleanup or supervision state.
 		let child = unsafe { child.try_into_inner_child() }
 			.expect_err("the terminal leaf must be returned");
 		assert_eq!(data_ptr(child.as_ref()), leaf_ptr);

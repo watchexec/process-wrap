@@ -8,8 +8,7 @@ use nix::libc;
 
 const DESCRIPTOR_COUNT: usize = 2;
 const DESCRIPTOR_BYTES: usize = size_of::<[RawFd; DESCRIPTOR_COUNT]>();
-// SAFETY: DESCRIPTOR_BYTES is the representable byte length of exactly two RawFd values, so this
-// supported-target CMSG_SPACE invocation computes control storage for precisely that payload.
+// SAFETY: the requested payload length is the size of exactly two RawFd values.
 const CONTROL_BYTES: usize = unsafe { libc::CMSG_SPACE(DESCRIPTOR_BYTES as libc::c_uint) as usize };
 
 #[repr(C, align(16))]
@@ -29,9 +28,8 @@ struct Response {
 
 pub(super) fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
 	let mut sockets = [-1; 2];
-	// SAFETY: sockets is aligned writable storage for exactly two c_int descriptors and stays live
-	// for this synchronous call. SOCK_CLOEXEC makes each successful descriptor installation atomic
-	// with respect to a concurrent fork and exec.
+	// SAFETY: sockets is writable for two descriptors. SOCK_CLOEXEC makes descriptor installation
+	// atomic with respect to a concurrent fork and exec.
 	if unsafe {
 		libc::socketpair(
 			libc::AF_UNIX,
@@ -44,8 +42,7 @@ pub(super) fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
 		return Err(io::Error::last_os_error());
 	}
 
-	// SAFETY: a successful socketpair initialized both slots with distinct owned descriptors; each
-	// from_raw_fd consumes one slot exactly once and gives it one OwnedFd close responsibility.
+	// SAFETY: socketpair initialized two independently owned descriptors on success.
 	Ok(unsafe {
 		(
 			OwnedFd::from_raw_fd(sockets[0]),
@@ -58,12 +55,10 @@ pub(super) fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
 ///
 /// # Safety
 ///
-/// `socket` must remain a live, open socket descriptor and must not be concurrently closed,
-/// replaced, or reused for the complete call. Every descriptor in `descriptors` must likewise
-/// remain open and not be concurrently closed. `sendmsg` only copies their rights; it does not
-/// transfer the caller's close responsibility. This function is suitable for the restricted child
-/// side of a post-fork helper: it uses only stack data, pointer operations, `sendmsg`, and the
-/// calling thread's errno slot.
+/// `socket` and every descriptor in `descriptors` must remain live and must not be concurrently
+/// closed or reused for this call. This function is suitable for the restricted child side of a
+/// post-fork helper: it uses only stack data, pointer operations, `sendmsg`, and the thread-local
+/// errno slot.
 pub(super) unsafe fn send_response(
 	socket: RawFd,
 	error: libc::c_int,
@@ -74,8 +69,8 @@ pub(super) unsafe fn send_response(
 		iov_base: std::ptr::from_mut(&mut response).cast(),
 		iov_len: size_of::<Response>(),
 	};
-	// SAFETY: all-zero is a valid msghdr with null address/control pointers and zero lengths. The
-	// only nonzero sendmsg fields are initialized below before the synchronous call.
+	// SAFETY: an all-zero msghdr represents no address, vectors, or ancillary data. The fields used by
+	// sendmsg are initialized below.
 	let mut message = unsafe { MaybeUninit::<libc::msghdr>::zeroed().assume_init() };
 	message.msg_iov = std::ptr::from_mut(&mut io_vector);
 	message.msg_iovlen = 1 as _;
@@ -85,19 +80,14 @@ pub(super) unsafe fn send_response(
 		message.msg_control = control.0.as_mut_ptr().cast();
 		message.msg_controllen = control.0.len() as _;
 
-		// SAFETY: msg_control points at control's live, 16-byte-aligned backing array, and
-		// msg_controllen reports its full CONTROL_BYTES capacity. CMSG_SPACE for this exact payload
-		// makes CMSG_FIRSTHDR's returned cmsghdr and CMSG_LEN payload range fit in that array.
+		// SAFETY: the control buffer is aligned for cmsghdr, has CMSG_SPACE for two descriptors, and the
+		// message points to the complete buffer.
 		let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
 		if header.is_null() {
 			return false;
 		}
-		// SAFETY: the preceding CMSG_FIRSTHDR proof bounds header and the entire two-RawFd payload in
-		// control. On supported targets, the SCM_RIGHTS CMSG_DATA ABI places that payload at a
-		// RawFd-aligned address when its cmsghdr is in this 16-byte-aligned ControlBuffer; that
-		// separate ABI property, not CMSG_LEN, validates the typed destination cast. descriptors is
-		// a separate live two-element source array, so the nonoverlapping copy writes only the
-		// bounded payload before sendmsg observes it.
+		// SAFETY: `header` and its payload fit in the aligned control buffer. SCM_RIGHTS aligns
+		// CMSG_DATA for RawFd, and the separate source array cannot overlap it.
 		unsafe {
 			(*header).cmsg_len = libc::CMSG_LEN(DESCRIPTOR_BYTES as libc::c_uint) as _;
 			(*header).cmsg_level = libc::SOL_SOCKET;
@@ -111,11 +101,7 @@ pub(super) unsafe fn send_response(
 	}
 
 	loop {
-		// SAFETY: this function's contract keeps socket live, open, and neither closed nor reused while
-		// sendmsg runs. message, response, and io_vector remain live; response is an initialized
-		// repr(C) Response, and io_vector's sole entry gives sendmsg its exact byte length. msg_control
-		// is either null or points to control's complete backing array, which remains live for the
-		// synchronous call.
+		// SAFETY: message points to live response, vector, and optional control-buffer storage.
 		let sent = unsafe { libc::sendmsg(socket, &message, 0) };
 		if sent == size_of::<Response>() as libc::ssize_t {
 			return true;
@@ -137,8 +123,8 @@ pub(super) fn receive_response(socket: &OwnedFd) -> io::Result<[OwnedFd; DESCRIP
 		iov_len: size_of::<Response>(),
 	};
 	let mut control = ControlBuffer::zeroed();
-	// SAFETY: all-zero is a valid msghdr with null address/control pointers and zero lengths. Its
-	// iovec, control pointer, and lengths are initialized below before recvmsg.
+	// SAFETY: an all-zero msghdr represents no address, vectors, or ancillary data. All receive storage
+	// fields are initialized below.
 	let mut message = unsafe { MaybeUninit::<libc::msghdr>::zeroed().assume_init() };
 	message.msg_iov = std::ptr::from_mut(&mut io_vector);
 	message.msg_iovlen = 1 as _;
@@ -146,11 +132,8 @@ pub(super) fn receive_response(socket: &OwnedFd) -> io::Result<[OwnedFd; DESCRIP
 	message.msg_controllen = control.0.len() as _;
 
 	let received = loop {
-		// SAFETY: socket's OwnedFd remains alive for this synchronous call. message's one iovec points
-		// to response's aligned, writable Response-sized storage; msg_control points to control's
-		// complete live 16-byte-aligned backing array with its capacity in msg_controllen. recvmsg
-		// writes no more than those advertised ranges, and MSG_CMSG_CLOEXEC makes each received
-		// descriptor installation close-on-exec atomically.
+		// SAFETY: message points to writable response, vector, and control-buffer storage. The flag makes
+		// every received descriptor close-on-exec as part of descriptor installation.
 		let received =
 			unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
 		if received != -1 {
@@ -206,30 +189,24 @@ impl ReceivedRights {
 			return (rights, true);
 		}
 
-		// SAFETY: receive_response is this private function's only caller. It constructs message directly
-		// above with msg_control pointing to control's live backing array and passes that exact capacity
-		// to recvmsg; the kernel returns a control length within that array before decode is called.
-		// Thus CMSG_FIRSTHDR may inspect the first complete cmsghdr while control remains in scope.
+		// SAFETY: message's control pointer and length still refer to the live receive buffer.
 		let header = unsafe { libc::CMSG_FIRSTHDR(message) };
 		if header.is_null() {
 			return (rights, false);
 		}
 
-		// SAFETY: zero is a representable c_uint ancillary payload length, so CMSG_LEN computes the
-		// supported-target cmsghdr byte length without accessing the receive buffer.
+		// SAFETY: zero is a valid ancillary payload length.
 		let header_bytes = unsafe { libc::CMSG_LEN(0) as usize };
 		// OpenBSD defines msg_controllen as socklen_t while Linux uses usize.
 		#[allow(clippy::unnecessary_cast)]
 		let available = message.msg_controllen as usize;
-		// SAFETY: CMSG_FIRSTHDR established that header is a complete cmsghdr within control's live
-		// receive range, so reading its cmsg_len is in bounds and properly aligned.
+		// SAFETY: CMSG_FIRSTHDR returned a header within the receive buffer.
 		let length = unsafe { (*header).cmsg_len as usize };
 		if length < header_bytes || length > available {
 			return (rights, false);
 		}
 
-		// SAFETY: cmsg_len is at least the complete cmsghdr length and no greater than the live
-		// control range, as checked above, so both header field reads are in bounds.
+		// SAFETY: the complete cmsghdr lies within the receive buffer after the bounds check above.
 		let is_rights = unsafe {
 			(*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS
 		};
@@ -243,11 +220,8 @@ impl ReceivedRights {
 			return (rights, false);
 		}
 
-		// SAFETY: cmsg_len's checked header/payload range contains count complete RawFd values. The
-		// current receive_response caller supplies a 16-byte-aligned ControlBuffer, and the supported-
-		// target SCM_RIGHTS CMSG_DATA ABI aligns that payload for RawFd; this separate ABI property
-		// validates the typed source cast. count is at most two, rights.descriptors has room for two,
-		// and the separate control and rights allocations cannot overlap.
+		// SAFETY: the checked cmsg_len covers `count` RawFds; SCM_RIGHTS aligns CMSG_DATA for
+		// RawFd, and the destination has room and cannot overlap the control buffer.
 		unsafe {
 			std::ptr::copy_nonoverlapping(
 				libc::CMSG_DATA(header).cast::<RawFd>(),
@@ -256,12 +230,10 @@ impl ReceivedRights {
 			);
 		}
 		rights.count = count;
-		// SAFETY: count is at most two, so its RawFd byte length is representable as c_uint and this
-		// supported-target ancillary-size computation accesses no receive storage.
+		// SAFETY: count is bounded to the two-descriptor control buffer above.
 		let expected_length =
 			unsafe { libc::CMSG_LEN((count * size_of::<RawFd>()) as libc::c_uint) as usize };
-		// SAFETY: count is at most two, so its RawFd byte length is representable as c_uint and this
-		// supported-target ancillary-size computation accesses no receive storage.
+		// SAFETY: count is bounded to the two-descriptor control buffer above.
 		let expected_space =
 			unsafe { libc::CMSG_SPACE((count * size_of::<RawFd>()) as libc::c_uint) as usize };
 		let valid = length == expected_length
@@ -286,9 +258,8 @@ impl ReceivedRights {
 		}
 		let descriptors = self.descriptors;
 		self.count = 0;
-		// SAFETY: recvmsg installed two distinct, nonnegative descriptors after the protocol checks
-		// above. Setting count to zero first relinquishes this guard's close responsibility, and each
-		// from_raw_fd then installs exactly one received descriptor in its corresponding OwnedFd.
+		// SAFETY: SCM_RIGHTS installed two distinct owned descriptors, and this guard has relinquished
+		// responsibility for closing them.
 		Ok(unsafe {
 			[
 				OwnedFd::from_raw_fd(descriptors[0]),
@@ -301,9 +272,7 @@ impl ReceivedRights {
 impl Drop for ReceivedRights {
 	fn drop(&mut self) {
 		for descriptor in &self.descriptors[..self.count] {
-			// SAFETY: every indexed descriptor was copied from SCM_RIGHTS installation and has not been
-			// transferred to OwnedFd because count still includes it. close consumes only this guard's
-			// descriptor-table reference and this loop uses each stored descriptor once.
+			// SAFETY: each descriptor was installed by SCM_RIGHTS and remains owned by this guard.
 			unsafe {
 				libc::close(*descriptor);
 			}
@@ -313,15 +282,13 @@ impl Drop for ReceivedRights {
 
 #[cfg(target_os = "openbsd")]
 unsafe fn errno() -> libc::c_int {
-	// SAFETY: OpenBSD's __errno returns a non-null pointer to this calling thread's live errno
-	// slot, which is read immediately before another operation can overwrite it.
+	// SAFETY: __errno returns the calling thread's live errno slot.
 	unsafe { *libc::__errno() }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 unsafe fn errno() -> libc::c_int {
-	// SAFETY: __errno_location returns a non-null pointer to this calling thread's live errno
-	// slot, which is read immediately before another operation can overwrite it.
+	// SAFETY: __errno_location returns the calling thread's live errno slot.
 	unsafe { *libc::__errno_location() }
 }
 

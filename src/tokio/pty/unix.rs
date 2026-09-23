@@ -169,10 +169,9 @@ fn check_netbsd_version() -> io::Result<()> {
 	if unsafe { libc::uname(name.as_mut_ptr()) } == -1 {
 		return Err(io::Error::last_os_error());
 	}
-	// SAFETY: successful `uname` initialized the complete `utsname` value in `name`.
+	// SAFETY: `uname` succeeded and initialized `name`.
 	let name = unsafe { name.assume_init() };
-	// SAFETY: the initialized `release` field is a NUL-terminated character array, and `name`
-	// remains live for the `CStr` view and the immediate byte-slice view.
+	// SAFETY: `release` is NUL-terminated and remains live for this view.
 	let release = unsafe { CStr::from_ptr(name.release.as_ptr()) }.to_bytes();
 	let digits = release.iter().copied().take_while(u8::is_ascii_digit);
 	let mut major = None;
@@ -219,8 +218,7 @@ pub(super) fn spawn(attempt: &mut SpawnAttempt, size: PtySize) -> io::Result<Pro
 	command.kill_on_drop(kill_on_drop);
 	let spawned = catch_unwind(AssertUnwindSafe(|| {
 		with_slave_stdio(&mut command, slave_stdin, slave_stdout, slave, |command| {
-			// SAFETY: setup_child's local proof limits this post-fork callback to the required
-			// syscall-oriented setup operations and raw operating-system error reporting.
+			// SAFETY: `setup_child` audits every operation for post-fork use.
 			unsafe {
 				command.pre_exec(move || setup_child(reset_sigmask));
 			}
@@ -363,8 +361,7 @@ fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	unlockpt(&master)?;
 	let slave = open_slave(&master)?;
 	verify_close_on_exec(&slave)?;
-	// SAFETY: posix_openpt returned this owned, live descriptor on success; into_raw_fd relinquishes
-	// PtyMaster's ownership, and from_raw_fd immediately installs that same descriptor in one OwnedFd.
+	// SAFETY: ownership moves from PtyMaster into exactly one OwnedFd.
 	let master = unsafe { OwnedFd::from_raw_fd(master.into_raw_fd()) };
 	set_size(&master, size)?;
 	Ok((master, slave))
@@ -379,11 +376,9 @@ fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	)?;
 	verify_close_on_exec(&master)?;
 	set_nonblocking(&master)?;
-	// SAFETY: master retains ownership of this open PTY descriptor for this synchronous call;
-	// `grantpt` does not retain its scalar descriptor argument.
+	// SAFETY: `master` owns an open PTY descriptor for this call.
 	if unsafe { libc::grantpt(master.as_raw_fd()) } == -1 || {
-		// SAFETY: master still retains ownership of the open PTY descriptor for this synchronous
-		// call; `unlockpt` does not retain its scalar descriptor argument.
+		// SAFETY: `master` still owns the open PTY descriptor.
 		(unsafe { libc::unlockpt(master.as_raw_fd()) }) == -1
 	} {
 		return Err(io::Error::last_os_error());
@@ -414,8 +409,7 @@ fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	unlockpt(&master)?;
 	let slave = open_bsd_slave(&master)?;
 	verify_close_on_exec(&slave)?;
-	// SAFETY: posix_openpt returned this owned, live descriptor on success; into_raw_fd relinquishes
-	// PtyMaster's ownership, and from_raw_fd immediately installs that same descriptor in one OwnedFd.
+	// SAFETY: ownership moves from PtyMaster into exactly one OwnedFd.
 	let master = unsafe { OwnedFd::from_raw_fd(master.into_raw_fd()) };
 	set_size(&master, size)?;
 	Ok((master, slave))
@@ -471,8 +465,7 @@ fn open_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
 #[cfg(target_os = "macos")]
 fn open_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
 	let mut name = [0_u8; 128];
-	// SAFETY: master remains an open borrowed PTY descriptor for this synchronous call. TIOCPTYGNAME
-	// writes only within name's complete 128-byte storage, which remains exclusively live for the call.
+	// SAFETY: name is the 128-byte output buffer encoded by Darwin's TIOCPTYGNAME request.
 	if unsafe {
 		libc::ioctl(
 			master.as_raw_fd(),
@@ -491,8 +484,7 @@ fn open_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
 #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 fn open_bsd_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
 	let mut name = [0 as libc::c_char; 1024];
-	// SAFETY: master remains an open borrowed PTY descriptor for this synchronous call, and name is
-	// writable for all 1024 c_char elements which stay live until ptsname_r returns.
+	// SAFETY: name is writable for its full reported length and master is an open PTY descriptor.
 	let result = unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) };
 	if result != 0 {
 		return Err(if result > 0 {
@@ -508,17 +500,13 @@ fn open_bsd_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
 
 #[cfg(target_os = "dragonfly")]
 fn open_bsd_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
-	// DragonFly's ptsname.c returns main-thread static storage or heap storage retained in
-	// thread-specific state. Its pointer remains live for the calling thread, though a later
-	// same-thread ptsname call may overwrite its contents.
-	// SAFETY: master remains an open, granted, and unlocked borrowed PTY descriptor for this
-	// synchronous call.
+	// DragonFly returns static or thread-specific storage; copy it before another same-thread call.
+	// SAFETY: master is an open, granted, and unlocked PTY descriptor.
 	let name = unsafe { libc::ptsname(master.as_raw_fd()) };
 	if name.is_null() {
 		return Err(io::Error::last_os_error());
 	}
-	// SAFETY: the non-null result points to a NUL-terminated path in that still-live storage; no
-	// same-thread ptsname call occurs before CString takes its owned copy.
+	// SAFETY: the non-null result is NUL-terminated and remains live until copied.
 	let name = CString::from(unsafe { CStr::from_ptr(name) });
 	open(name.as_c_str(), slave_flags(), Mode::empty()).map_err(io::Error::from)
 }
@@ -538,8 +526,7 @@ fn open_solarish_slave(master: &OwnedFd) -> io::Result<OwnedFd> {
 #[cfg(any(target_os = "illumos", target_os = "solaris"))]
 fn setup_solarish_streams(slave: &OwnedFd) -> io::Result<()> {
 	let ldterm = c"ldterm";
-	// SAFETY: slave retains this open PTY descriptor for the synchronous scalar ioctl; ldterm is a
-	// static NUL-terminated module name whose pointer remains valid for the complete call.
+	// SAFETY: the descriptor is an open PTY slave and the module name is a static C string.
 	let present = unsafe { libc::ioctl(slave.as_raw_fd(), libc::I_FIND, ldterm.as_ptr()) };
 	if present == -1 {
 		return Err(io::Error::last_os_error());
@@ -551,18 +538,15 @@ fn setup_solarish_streams(slave: &OwnedFd) -> io::Result<()> {
 	// __I_PUSH_NOCTTY is the Solarish variant of I_PUSH which deliberately skips controlling-terminal
 	// acquisition after ptem marks the stream as a terminal. This matters when the parent is a session
 	// leader without an existing controlling terminal.
-	// SAFETY: slave retains this open PTY descriptor for the synchronous scalar ioctl, and the
-	// static NUL-terminated `ptem` module name remains valid for the complete call.
+	// SAFETY: the descriptor is an open PTY slave and `ptem` is a static C string.
 	if unsafe { libc::ioctl(slave.as_raw_fd(), libc::__I_PUSH_NOCTTY, c"ptem".as_ptr()) } == -1 || {
-		// SAFETY: slave still retains the open PTY descriptor for this synchronous scalar ioctl,
-		// and the static NUL-terminated `ldterm` module name remains valid for the complete call.
+		// SAFETY: the descriptor remains open and `ldterm` is a static C string.
 		(unsafe { libc::ioctl(slave.as_raw_fd(), libc::__I_PUSH_NOCTTY, ldterm.as_ptr()) }) == -1
 	} {
 		return Err(io::Error::last_os_error());
 	}
 	#[cfg(target_os = "solaris")]
-	// SAFETY: slave retains this open PTY descriptor for the synchronous scalar ioctl, and the
-	// static NUL-terminated module name remains valid for the complete call.
+	// SAFETY: the descriptor is an open PTY slave and the argument is a static C string.
 	if unsafe {
 		libc::ioctl(
 			slave.as_raw_fd(),
@@ -587,9 +571,8 @@ fn winsize(size: PtySize) -> Winsize {
 
 fn set_size(master: &OwnedFd, size: PtySize) -> io::Result<()> {
 	let size = winsize(size);
-	// SAFETY: master remains an open borrowed PTY descriptor for the synchronous call. TIOCSWINSZ
-	// expects the exact initialized winsize layout at size's aligned address; that storage is not
-	// aliased mutably and remains live until ioctl returns.
+	// SAFETY: master is a live PTY descriptor and size points to a valid winsize for the duration of
+	// the ioctl call.
 	if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) } == -1 {
 		return Err(io::Error::last_os_error());
 	}
@@ -600,14 +583,9 @@ fn setup_child(reset_sigmask: bool) -> io::Result<()> {
 	if reset_sigmask {
 		crate::unix::reset_sigmask()?;
 	}
-	// SAFETY: this callback runs only after fork and before exec. POSIX lists setsid, getpgrp, and
-	// tcsetpgrp as async-signal-safe; STDIN_FILENO is the already-installed PTY slave in this child
-	// and remains a valid scalar descriptor for every call. TIOCSCTTY takes only its scalar request
-	// and zero scalar argument, so it dereferences no caller storage. POSIX does not require ioctl
-	// to be async-signal-safe. Process-wrap instead relies on its supported target libcs implementing
-	// this controlling-terminal ioctl as a direct syscall-oriented operation without allocation or
-	// locks in this post-fork path. Each failed call reads errno immediately and returns that raw
-	// operating-system error before any further operation can overwrite it.
+	// SAFETY: POSIX lists `setsid`, `getpgrp`, and `tcsetpgrp` as async-signal-safe. On supported
+	// targets, `TIOCSCTTY` is a direct scalar ioctl with no allocation or locking. Each failure reads
+	// errno immediately.
 	unsafe {
 		if libc::setsid() == -1 {
 			return Err(io::Error::last_os_error());
@@ -623,8 +601,7 @@ fn setup_child(reset_sigmask: bool) -> io::Result<()> {
 }
 
 fn read(fd: &OwnedFd, buffer: &mut [u8]) -> io::Result<usize> {
-	// SAFETY: fd's owner remains alive through this synchronous call, and buffer is an exclusively
-	// writable, properly aligned byte range for its full length which remains live until read returns.
+	// SAFETY: the buffer is writable for its full length and remains live for the call.
 	let read = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
 	if read == -1 {
 		return Err(io::Error::last_os_error());
@@ -633,8 +610,7 @@ fn read(fd: &OwnedFd, buffer: &mut [u8]) -> io::Result<usize> {
 }
 
 fn write(fd: &OwnedFd, buffer: &[u8]) -> io::Result<usize> {
-	// SAFETY: fd's owner remains alive through this synchronous call, and buffer is an initialized,
-	// properly aligned readable byte range for its full length which remains live until write returns.
+	// SAFETY: the buffer is readable for its full length and remains live for the call.
 	let written = unsafe { libc::write(fd.as_raw_fd(), buffer.as_ptr().cast(), buffer.len()) };
 	if written == -1 {
 		return Err(io::Error::last_os_error());
@@ -665,15 +641,13 @@ mod tests {
 	}
 
 	fn assert_open(fd: RawFd) {
-		// SAFETY: test callers pass a raw descriptor borrowed from an OwnedFd that remains live and is
-		// not concurrently closed through this synchronous scalar fcntl call.
+		// SAFETY: the caller retains ownership of a descriptor which must still be open here.
 		assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
 	}
 
 	fn assert_closed(reader: &OwnedFd) {
 		let mut byte = 0_u8;
-		// SAFETY: reader owns this live nonblocking pipe descriptor for the synchronous call, and byte
-		// is an aligned one-byte writable buffer which remains live until read returns.
+		// SAFETY: reader is a live nonblocking pipe descriptor and byte is writable for one byte.
 		let read =
 			unsafe { libc::read(reader.as_raw_fd(), std::ptr::from_mut(&mut byte).cast(), 1) };
 		if read != 0 {

@@ -196,9 +196,7 @@ mod std_frontend {
 	fn unix_native_methods_remain_available() {
 		let mut command = Command::new("tool");
 		command.uid(0).gid(0).arg0("argv-zero").process_group(0);
-		// SAFETY: after fork and before exec, the callback must use only async-signal-safe
-		// operations and must not allocate, acquire locks, access shared state, or panic. This
-		// callback reads no data and only returns the preexisting `Ok(())` value.
+		// SAFETY: the test callback performs no operations in the child.
 		unsafe { command.pre_exec(|| Ok(())) };
 
 		assert_eq!(command.native_mut().get_program(), OsStr::new("tool"));
@@ -456,9 +454,7 @@ mod tokio_frontend {
 	fn unix_native_methods_remain_available() {
 		let mut command = Command::new("tool");
 		command.uid(0).gid(0).arg0("argv-zero");
-		// SAFETY: after fork and before exec, the callback must use only async-signal-safe
-		// operations and must not allocate, acquire locks, access shared state, or panic. This
-		// callback reads no data and only returns the preexisting `Ok(())` value.
+		// SAFETY: the test callback performs no operations in the child.
 		unsafe { command.pre_exec(|| Ok(())) };
 
 		assert_eq!(

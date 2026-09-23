@@ -45,9 +45,7 @@ impl OwnedHandle {
 
 impl Drop for OwnedHandle {
 	fn drop(&mut self) {
-		// SAFETY: this private wrapper is constructed only around successful Win32 handle-returning
-		// calls. `into_raw` forgets the wrapper when it transfers ownership to `JobPort`; otherwise
-		// Rust runs this single `Drop` exactly once, so this wrapper closes its owned handle once.
+		// SAFETY: this wrapper solely owns a successfully created handle.
 		unsafe { CloseHandle(self.0) }.ok();
 	}
 }
@@ -91,31 +89,17 @@ mod creation_flag_tests {
 #[derive(Clone, Copy, Debug)]
 pub struct JobHandle(pub HANDLE);
 
-// SAFETY: a `HANDLE` names a process-wide kernel object and `JobHandle` contains only that scalar,
-// with no references or pointers into Rust-managed memory. This `Copy` view neither owns nor closes
-// the handle; the current owning path is `JobPort`, whose one destructor closes its distinct job
-// handle. This implementation does not make an arbitrarily constructed or concurrently closed raw
-// handle valid for a Win32 call.
+// SAFETY: this non-owning wrapper contains only a process-wide kernel handle value.
 unsafe impl Send for JobHandle {}
-// SAFETY: shared `JobHandle` references expose only a copyable kernel-handle value, not mutable
-// Rust memory. `JobPort` remains the current owner that closes the distinct job handle once; this
-// wrapper itself cannot close it. This implementation does not establish liveness or prevent an
-// independent raw-handle close.
+// SAFETY: shared access exposes only the handle value, not mutable Rust memory.
 unsafe impl Sync for JobHandle {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct PortHandle(pub HANDLE);
 
-// SAFETY: a `HANDLE` names a process-wide kernel object and `PortHandle` contains only that scalar,
-// with no references or pointers into Rust-managed memory. This `Copy` view neither owns nor closes
-// the handle; the current owning path is `JobPort`, whose one destructor closes its distinct
-// completion-port handle. This implementation does not make an arbitrarily constructed or
-// concurrently closed raw handle valid for a Win32 call.
+// SAFETY: this non-owning wrapper contains only a process-wide kernel handle value.
 unsafe impl Send for PortHandle {}
-// SAFETY: shared `PortHandle` references expose only a copyable kernel-handle value, not mutable
-// Rust memory. `JobPort` remains the current owner that closes the distinct completion-port handle
-// once; this wrapper itself cannot close it. This implementation does not establish liveness or
-// prevent an independent raw-handle close.
+// SAFETY: shared access exposes only the handle value, not mutable Rust memory.
 unsafe impl Sync for PortHandle {}
 
 /// A JobObject and its associated completion port.
@@ -129,13 +113,9 @@ pub(crate) struct JobPort {
 
 impl Drop for JobPort {
 	fn drop(&mut self) {
-		// SAFETY: `JobPort` receives this job handle only when `into_raw` transfers a successful
-		// `CreateJobObjectW` result out of its `OwnedHandle`. This is `JobPort`'s one destruction, so
-		// it closes that owned job handle once; it is distinct from `completion_port` below.
+		// SAFETY: `JobPort` solely owns this job handle.
 		unsafe { CloseHandle(self.job.0) }.ok();
-		// SAFETY: `JobPort` receives this completion handle only when `into_raw` transfers a successful
-		// `CreateIoCompletionPort` result out of its `OwnedHandle`. This same one owner destruction
-		// closes the distinct completion-port handle once.
+		// SAFETY: `JobPort` solely owns this distinct completion-port handle.
 		unsafe { CloseHandle(self.completion_port.0) }.ok();
 	}
 }
@@ -148,12 +128,7 @@ pub(crate) fn set_job_kill_on_drop(job: JobHandle, kill_on_drop: bool) -> Result
 		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 	}
 
-	// SAFETY: `info` is a fully initialized `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` whose address,
-	// alignment, and exact `size_of_val` byte length remain valid for this synchronous call. Before
-	// `JobPort` construction, `make_job_object` passes a copy of its successful `CreateJobObjectW`
-	// result while the local `OwnedHandle` remains its owner; afterward, `disarm_job_object_layer`
-	// passes a copy from its live `JobPort`. Access-right or handle-state failures remain ordinary
-	// Win32 errors rather than pointer-safety premises.
+	// SAFETY: `job` is live, and initialized `info` has the reported size and outlives the call.
 	unsafe {
 		SetInformationJobObject(
 			job.0,
@@ -175,17 +150,12 @@ pub(crate) fn set_job_kill_on_drop(job: JobHandle, kill_on_drop: bool) -> Result
 /// essentially implements the "reap children" feature of Unix systems directly in Win32.
 #[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Result<JobPort> {
-	// SAFETY: the null security-attributes and name pointers select Win32 defaults and are valid for
-	// the duration of this call. On success, the returned job handle is immediately put in the
-	// private `OwnedHandle`; its ownership is transferred to `JobPort` only after setup succeeds.
-	// Creation failure is an ordinary API error, not a pointer-safety condition.
+	// SAFETY: null attributes and name request defaults; the successful handle is immediately owned.
 	let job = OwnedHandle(unsafe { CreateJobObjectW(None, None) }.map_err(Error::other)?);
 	#[cfg(feature = "tracing")]
 	debug!(?job, "done CreateJobObjectW");
 
-	// SAFETY: `INVALID_HANDLE_VALUE` requests a new completion port, `None` supplies no existing
-	// port, and the remaining arguments are scalars. A successful result immediately enters the
-	// private `OwnedHandle`, which owns it until transfer to `JobPort`; API failure is ordinary.
+	// SAFETY: these arguments create a new port; the successful handle is immediately owned.
 	let completion_port =
 		OwnedHandle(unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) }?);
 	#[cfg(feature = "tracing")]
@@ -196,12 +166,8 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 		CompletionPort: completion_port.0,
 	};
 
-	// SAFETY: `associate_completion` is a fully initialized value of the exact Win32 structure
-	// type; its aligned stack address and `size_of_val` byte length remain valid for this synchronous
-	// call. `CompletionKey` is an opaque application-defined pointer-sized value derived from job
-	// handle bits; Win32 does not dereference, own, or close it. The separate job argument and the
-	// `CompletionPort` field are successful results still owned by `job` and `completion_port`.
-	// Access-right or handle-state failures remain ordinary API errors, not pointer-safety premises.
+	// SAFETY: the handles stay live, and initialized `associate_completion` has the reported size.
+	// `CompletionKey` is opaque and is not dereferenced.
 	unsafe {
 		SetInformationJobObject(
 			job.0,
@@ -220,11 +186,7 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 
 	set_job_kill_on_drop(JobHandle(job.0), kill_on_drop)?;
 
-	// SAFETY: the job handle is the successful `CreateJobObjectW` result still owned by `job`.
-	// Current private callers derive `process_handle` from `ChildWrapper::try_process_handle`'s
-	// `BorrowedHandle` and retain that child through this call. This establishes the Rust borrow's
-	// call duration, but does not establish protection from an independent raw-handle close; access,
-	// stale-object, and handle-state failures are ordinary Win32 errors.
+	// SAFETY: `job` is owned here and `process_handle` is borrowed from the live child.
 	unsafe { AssignProcessToJobObject(job.0, process_handle) }?;
 	#[cfg(feature = "tracing")]
 	debug!(?job, ?process_handle, "done AssignProcessToJobObject");
@@ -249,25 +211,17 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 				.expect("THREADENTRY32 is guaranteed to fit in a DWORD"),
 			..Default::default()
 		};
-		// SAFETY: the caller supplies `tool_handle` from a successful thread-snapshot creation and
-		// keeps its `OwnedHandle` alive for this call. `entry` is initialized, aligned storage of the
-		// exact `THREADENTRY32` type, with `dwSize` set to its full byte length, and its mutable pointer
-		// remains live for the synchronous call. Snapshot/access failures are ordinary API errors.
+		// SAFETY: `tool_handle` is live; `entry` is writable and has the required `dwSize`.
 		unsafe { Thread32First(tool_handle, &mut entry) }.map_err(Error::other)?;
 
 		let mut resumed = false;
 		loop {
 			if entry.th32OwnerProcessID == pid {
-				// SAFETY: `entry` was initialized by `Thread32First` or `Thread32Next`, so its scalar
-				// thread ID is readable. A successful `OpenThread` result is immediately owned by this
-				// private `OwnedHandle` for the following use and one close; stale IDs and access denial
-				// are normal API failures.
+				// SAFETY: snapshot enumeration initialized this thread ID; success is immediately owned.
 				let thread_handle = OwnedHandle(unsafe {
 					OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
 				}?);
-				// SAFETY: `thread_handle` owns the successful `OpenThread` result and remains alive for
-				// this synchronous call. `ResumeThread` receives no Rust pointers; suspension state and
-				// access failures are reported by its return value rather than pointer-safety premises.
+				// SAFETY: `thread_handle` owns a live handle with suspend/resume access.
 				let previous_count = unsafe { ResumeThread(thread_handle.0) };
 				if previous_count == u32::MAX {
 					return Err(Error::last_os_error());
@@ -277,10 +231,7 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 				}
 			}
 
-			// SAFETY: `tool_handle` remains owned by the caller's live snapshot guard. `entry` remains
-			// initialized, aligned storage of the exact `THREADENTRY32` type with its required `dwSize`,
-			// and its mutable pointer is live for this synchronous call. `ERROR_NO_MORE_FILES` and other
-			// enumeration failures are normal API results.
+			// SAFETY: `tool_handle` stays live; `entry` remains writable with the required `dwSize`.
 			match unsafe { Thread32Next(tool_handle, &mut entry) } {
 				Ok(()) => {}
 				Err(error) if error.code() == HRESULT::from_win32(ERROR_NO_MORE_FILES.0) => {
@@ -297,32 +248,22 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 		}
 	}
 
-	// SAFETY: current private callers derive `child_process` from `ChildWrapper::try_process_handle`'s
-	// `BorrowedHandle` and retain that child for this call; the API writes no Rust memory. This borrow
-	// duration does not establish protection from an independent raw-handle close. A zero result,
-	// access denial, or a handle-state failure is reported as an ordinary OS error below.
+	// SAFETY: `child_process` is borrowed from the live child for this call.
 	let child_id = unsafe { GetProcessId(child_process) };
 	if child_id == 0 {
 		return Err(Error::last_os_error());
 	}
 
-	// SAFETY: the snapshot flags and process ID are scalar values. On success, the returned snapshot
-	// handle immediately enters `OwnedHandle`, whose later one-time drop closes this snapshot; a
-	// snapshot/access failure is an ordinary API error.
+	// SAFETY: success returns a snapshot handle that is immediately owned.
 	let tool_handle = OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }?);
-	// SAFETY: `tool_handle` is the successful snapshot result above and remains owned by its live
-	// `OwnedHandle` through `inner`; that guard performs the snapshot-owned `CloseHandle` exactly
-	// once after the call returns.
+	// SAFETY: `tool_handle` remains owned and live through `inner`.
 	unsafe { inner(child_id, tool_handle.0) }
 }
 
 /// Terminate a job object without waiting for the processes to exit.
 #[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 pub(crate) fn terminate_job(job: JobHandle, exit_code: u32) -> Result<()> {
-	// SAFETY: current private callers take `job` from a `JobPort` whose ownership originated at a
-	// successful `CreateJobObjectW` result and remains in that `JobPort` during the synchronous call.
-	// `TerminateJobObject` receives only scalar values; access rights and job-handle state failures
-	// are ordinary Win32 errors, not Rust memory-safety premises.
+	// SAFETY: `job` is borrowed from a live `JobPort`; the call takes only scalar values.
 	unsafe { TerminateJobObject(job.0, exit_code) }.map_err(Error::other)
 }
 
@@ -337,16 +278,9 @@ pub(crate) fn wait_on_job(
 	let mut overlapped = OVERLAPPED::default();
 	let mut lp_overlapped = &mut overlapped as *mut OVERLAPPED;
 
-	// SAFETY: `code`, `key`, and `lp_overlapped` are initialized, aligned stack output storage; the
-	// pointer stored in `lp_overlapped` initially points to the live initialized `overlapped` stack
-	// value. All four allocations remain live and exclusively borrowed for this synchronous call.
-	// Current callers source `completion_port` from a `JobPort` created by successful
-	// `CreateIoCompletionPort`; `PortHandle` itself does not establish liveness or prevent an
-	// independent raw-handle close. On failure with a null `*lp_overlapped`, no packet was dequeued
-	// and `code` and `key` are indeterminate, so this function only tests the output pointer. On
-	// failure with a non-null `*lp_overlapped`, a failed-I/O packet was dequeued and all packet
-	// outputs carry information. This FFI proof does not validate the current packet filtering or
-	// timeout semantics.
+	// SAFETY: `completion_port` is borrowed from a live `JobPort`, and every output pointer refers
+	// to live stack storage. On failure we inspect `code` and `key` only when a packet was dequeued,
+	// as indicated by a non-null `lp_overlapped`.
 	let result = unsafe {
 		GetQueuedCompletionStatus(
 			completion_port.0,

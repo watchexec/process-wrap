@@ -448,10 +448,8 @@ impl CommandWrapper for FailAfterSpawn {
 fn assert_reaped(pid: u32) {
 	let pid = i32::try_from(pid).unwrap();
 	let mut status = 0;
-	// SAFETY: every caller supplies the PID recorded from this test process's direct provider
-	// child. `status` is an initialized, aligned `i32` local whose exclusive pointer lives for
-	// this call. `ReapThenFail` already reaped the child in its hook, while rollback reaped it in
-	// the other fixtures; either way no wait status remains for this `WNOHANG` query to transfer.
+	// SAFETY: status is writable, and this only queries whether the provider transaction already
+	// reaped the recorded direct child.
 	let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
 	assert_eq!(waited, -1);
 	assert_eq!(
@@ -591,9 +589,8 @@ impl CommandWrapper for FailAfterLeaderExits {
 
 		loop {
 			let mut status = MaybeUninit::<libc::siginfo_t>::zeroed();
-			// SAFETY: `direct_pid` was recorded from this process's direct provider child and that
-			// child remains unreaped here. `status` is aligned `siginfo_t` storage zeroed for the
-			// full call, and `WNOWAIT` observes its status without transferring reaping ownership.
+			// SAFETY: direct_pid names this process's direct child, status is writable, and WNOWAIT
+			// observes an exit without releasing the PID which anchors the PTY process group.
 			if unsafe {
 				libc::waitid(
 					libc::P_PID,
@@ -605,9 +602,7 @@ impl CommandWrapper for FailAfterLeaderExits {
 			{
 				return Err(io::Error::last_os_error());
 			}
-			// SAFETY: the same `siginfo_t` storage was zero-initialized before `waitid`; on this
-			// successful return it either contains that call's complete result or the preserved
-			// zero `si_pid` no-event value, so reading it is initialized and within its lifetime.
+			// SAFETY: status was zero-initialized and waitid either filled it or left si_pid as zero.
 			if unsafe { status.assume_init().si_pid() }
 				== libc::pid_t::try_from(direct_pid).map_err(io::Error::other)?
 			{
@@ -629,8 +624,7 @@ impl CommandWrapper for FailAfterLeaderExits {
 fn assert_process_disappears(pid: i32) {
 	let deadline = Instant::now() + Duration::from_secs(5);
 	loop {
-		// SAFETY: callers pass the descendant PID reported by this PTY fixture's shell before
-		// rollback; signal zero only queries whether that recorded process still exists.
+		// SAFETY: signal zero only queries whether a process with this PID exists.
 		if unsafe { libc::kill(pid, 0) } == -1
 			&& io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 		{

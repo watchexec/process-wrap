@@ -20,11 +20,9 @@ unsafe extern "system" {
 
 fn terminate_and_wait(process: &OwnedHandle) {
 	let raw = process.as_raw_handle();
-	// SAFETY: the provider-spawned child was duplicated into this handle, then rollback took it
-	// into its local `process`. That local owns the handle across both calls; this borrow keeps it
-	// live and unclosed, and the local `OwnedHandle` drops to close it exactly once afterward.
+	// SAFETY: the transaction owns this process handle until both calls return.
 	let _ = unsafe { TerminateProcess(raw, 1) };
-	// SAFETY: the same rollback-local owned handle remains live and unclosed through this wait.
+	// SAFETY: the process handle remains live for the duration of this call.
 	let _ = unsafe { WaitForSingleObject(raw, u32::MAX) };
 }
 
@@ -143,9 +141,7 @@ impl ChildWrapper for ExactResumeChild {
 
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
 		let handle = self.child.raw_handle()?;
-		// SAFETY: `ExactResumeChild` owns this raw process handle through its `child` field.
-		// The returned borrow is tied to `&self`, so that field cannot be moved or dropped before
-		// the borrow ends.
+		// SAFETY: the child owns this handle and the returned borrow cannot outlive `self`.
 		Some(unsafe { BorrowedHandle::borrow_raw(handle) })
 	}
 
@@ -210,9 +206,7 @@ impl SpawnProvider for ProcessProvider {
 		let handle = child
 			.raw_handle()
 			.ok_or_else(|| std::io::Error::other("spawned child has no process handle"))?;
-		// SAFETY: the local `child` owns this live handle until it is moved into
-		// `ExactResumeChild` below. This borrow lasts only for `try_clone_to_owned`, which makes
-		// the transaction's independently owned duplicate before that move.
+		// SAFETY: `child` owns this handle until it is moved into `ExactResumeChild` below.
 		let process = unsafe { BorrowedHandle::borrow_raw(handle) }.try_clone_to_owned()?;
 		Ok(ProviderProduct::new(
 			Box::new(ExactResumeChild {
@@ -277,9 +271,7 @@ impl CommandWrapper for LegacyInline {
 		child: Box<dyn ChildWrapper>,
 		_core: &CommandWrap,
 	) -> Result<Box<dyn ChildWrapper>> {
-		// SAFETY: the only `LegacyInline` fixture is registered directly around the native child
-		// by `sleeping_command_wrap().wrap(LegacyInline).wrap(JobObject)`. It adds no cleanup or
-		// supervision state before extracting that child, so no wrapper invariant is bypassed.
+		// SAFETY: `LegacyInline` adds no cleanup or supervision state.
 		let child = unsafe { child.try_into_inner_child() }
 			.map_err(|_| std::io::Error::other("legacy inline wrapper expected a native child"))?;
 		Ok(Box::new(LegacyInlineChild(child)))
