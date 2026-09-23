@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [9.1.1](https://github.com/watchexec/process-wrap/compare/v10.0.1..9.1.1) - 2026-09-23
+
+
+- **Bugfix:** Avoid tracing after fork - ([a3becd3](https://github.com/watchexec/process-wrap/commit/a3becd3a534de2106037f0bbaf082b9a12d7dedd))
+- **Bugfix:** Stop capturing unused signal mask - ([31905ea](https://github.com/watchexec/process-wrap/commit/31905eab427c43e55a8b9a4b4d16112c28271316))
+
+---
 ## [9.1.0](https://github.com/watchexec/process-wrap/compare/v9.0.3..9.1.0) - 2026-03-08
 
 
