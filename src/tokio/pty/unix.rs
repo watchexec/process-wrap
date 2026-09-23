@@ -169,8 +169,9 @@ fn check_netbsd_version() -> io::Result<()> {
 	if unsafe { libc::uname(name.as_mut_ptr()) } == -1 {
 		return Err(io::Error::last_os_error());
 	}
-	// SAFETY: uname succeeded, and utsname release is a NUL-terminated character array.
+	// SAFETY: `uname` succeeded and initialized `name`.
 	let name = unsafe { name.assume_init() };
+	// SAFETY: `release` is NUL-terminated and remains live for this view.
 	let release = unsafe { CStr::from_ptr(name.release.as_ptr()) }.to_bytes();
 	let digits = release.iter().copied().take_while(u8::is_ascii_digit);
 	let mut major = None;
@@ -217,8 +218,7 @@ pub(super) fn spawn(attempt: &mut SpawnAttempt, size: PtySize) -> io::Result<Pro
 	command.kill_on_drop(kill_on_drop);
 	let spawned = catch_unwind(AssertUnwindSafe(|| {
 		with_slave_stdio(&mut command, slave_stdin, slave_stdout, slave, |command| {
-			// SAFETY: the callback only invokes async-signal-safe libc functions and reports the
-			// operating system's error without accessing shared process state.
+			// SAFETY: `setup_child` audits every operation for post-fork use.
 			unsafe {
 				command.pre_exec(move || setup_child(reset_sigmask));
 			}
@@ -376,10 +376,11 @@ fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	)?;
 	verify_close_on_exec(&master)?;
 	set_nonblocking(&master)?;
-	// SAFETY: the descriptor is an open PTY master and remains owned for both calls.
-	if unsafe { libc::grantpt(master.as_raw_fd()) } == -1
-		|| unsafe { libc::unlockpt(master.as_raw_fd()) } == -1
-	{
+	// SAFETY: `master` owns an open PTY descriptor for this call.
+	if unsafe { libc::grantpt(master.as_raw_fd()) } == -1 || {
+		// SAFETY: `master` still owns the open PTY descriptor.
+		(unsafe { libc::unlockpt(master.as_raw_fd()) }) == -1
+	} {
 		return Err(io::Error::last_os_error());
 	}
 	let slave = open_solarish_slave(&master)?;
@@ -499,13 +500,13 @@ fn open_bsd_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
 
 #[cfg(target_os = "dragonfly")]
 fn open_bsd_slave(master: &PtyMaster) -> io::Result<OwnedFd> {
-	// DragonFly's ptsname storage is thread-local. Copy it before making another libc call.
-	// SAFETY: master is an open, granted and unlocked PTY descriptor.
+	// DragonFly returns static or thread-specific storage; copy it before another same-thread call.
+	// SAFETY: master is an open, granted, and unlocked PTY descriptor.
 	let name = unsafe { libc::ptsname(master.as_raw_fd()) };
 	if name.is_null() {
 		return Err(io::Error::last_os_error());
 	}
-	// SAFETY: a non-null result from ptsname points to a NUL-terminated path.
+	// SAFETY: the non-null result is NUL-terminated and remains live until copied.
 	let name = CString::from(unsafe { CStr::from_ptr(name) });
 	open(name.as_c_str(), slave_flags(), Mode::empty()).map_err(io::Error::from)
 }
@@ -525,7 +526,7 @@ fn open_solarish_slave(master: &OwnedFd) -> io::Result<OwnedFd> {
 #[cfg(any(target_os = "illumos", target_os = "solaris"))]
 fn setup_solarish_streams(slave: &OwnedFd) -> io::Result<()> {
 	let ldterm = c"ldterm";
-	// SAFETY: the descriptor is an open PTY slave and the module names are static C strings.
+	// SAFETY: the descriptor is an open PTY slave and the module name is a static C string.
 	let present = unsafe { libc::ioctl(slave.as_raw_fd(), libc::I_FIND, ldterm.as_ptr()) };
 	if present == -1 {
 		return Err(io::Error::last_os_error());
@@ -537,10 +538,11 @@ fn setup_solarish_streams(slave: &OwnedFd) -> io::Result<()> {
 	// __I_PUSH_NOCTTY is the Solarish variant of I_PUSH which deliberately skips controlling-terminal
 	// acquisition after ptem marks the stream as a terminal. This matters when the parent is a session
 	// leader without an existing controlling terminal.
-	// SAFETY: the descriptor is an open PTY slave and each argument is a static C string.
-	if unsafe { libc::ioctl(slave.as_raw_fd(), libc::__I_PUSH_NOCTTY, c"ptem".as_ptr()) } == -1
-		|| unsafe { libc::ioctl(slave.as_raw_fd(), libc::__I_PUSH_NOCTTY, ldterm.as_ptr()) } == -1
-	{
+	// SAFETY: the descriptor is an open PTY slave and `ptem` is a static C string.
+	if unsafe { libc::ioctl(slave.as_raw_fd(), libc::__I_PUSH_NOCTTY, c"ptem".as_ptr()) } == -1 || {
+		// SAFETY: the descriptor remains open and `ldterm` is a static C string.
+		(unsafe { libc::ioctl(slave.as_raw_fd(), libc::__I_PUSH_NOCTTY, ldterm.as_ptr()) }) == -1
+	} {
 		return Err(io::Error::last_os_error());
 	}
 	#[cfg(target_os = "solaris")]
@@ -581,8 +583,9 @@ fn setup_child(reset_sigmask: bool) -> io::Result<()> {
 	if reset_sigmask {
 		crate::unix::reset_sigmask()?;
 	}
-	// SAFETY: this function runs after fork and before exec. Each call is async-signal-safe and uses
-	// only the already-installed standard input descriptor.
+	// SAFETY: POSIX lists `setsid`, `getpgrp`, and `tcsetpgrp` as async-signal-safe. On supported
+	// targets, `TIOCSCTTY` is a direct scalar ioctl with no allocation or locking. Each failure reads
+	// errno immediately.
 	unsafe {
 		if libc::setsid() == -1 {
 			return Err(io::Error::last_os_error());

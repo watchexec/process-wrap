@@ -4,12 +4,53 @@
 mod std_frontend {
 	use std::{
 		any::TypeId,
-		process::{Child, Command},
+		process::{Child, Command, ExitStatus},
 		sync::{
 			Arc,
 			atomic::{AtomicUsize, Ordering},
 		},
 	};
+
+	#[derive(Debug)]
+	struct CompletedChild;
+
+	fn successful_exit_status() -> ExitStatus {
+		#[cfg(unix)]
+		{
+			use std::os::unix::process::ExitStatusExt;
+
+			ExitStatus::from_raw(0)
+		}
+
+		#[cfg(windows)]
+		{
+			use std::os::windows::process::ExitStatusExt;
+
+			ExitStatus::from_raw(0)
+		}
+	}
+
+	impl ChildWrapper for CompletedChild {
+		fn inner(&self) -> &dyn ChildWrapper {
+			self
+		}
+
+		fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+			self
+		}
+
+		fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+			self
+		}
+
+		fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+			Ok(Some(successful_exit_status()))
+		}
+
+		fn wait(&mut self) -> std::io::Result<ExitStatus> {
+			Ok(successful_exit_status())
+		}
+	}
 
 	use process_wrap::std::ChildWrapper;
 	#[cfg(all(unix, any(feature = "process-group", feature = "process-session")))]
@@ -132,6 +173,7 @@ mod std_frontend {
 	enum ReusedChild {
 		Layer(Box<ReusingLayer>),
 		Native(Box<Child>),
+		Synthetic(Box<dyn ChildWrapper>),
 		Taken,
 	}
 
@@ -146,6 +188,7 @@ mod std_frontend {
 			match &self.inner {
 				ReusedChild::Layer(child) => child.as_ref(),
 				ReusedChild::Native(child) => child.as_ref(),
+				ReusedChild::Synthetic(child) => child.as_ref(),
 				ReusedChild::Taken => unreachable!("the layer still owns its child"),
 			}
 		}
@@ -154,6 +197,7 @@ mod std_frontend {
 			match &mut self.inner {
 				ReusedChild::Layer(child) => child.as_mut(),
 				ReusedChild::Native(child) => child.as_mut(),
+				ReusedChild::Synthetic(child) => child.as_mut(),
 				ReusedChild::Taken => unreachable!("the layer still owns its child"),
 			}
 		}
@@ -166,6 +210,7 @@ mod std_frontend {
 					self
 				}
 				ReusedChild::Native(child) => child,
+				ReusedChild::Synthetic(child) => child,
 				ReusedChild::Taken => unreachable!("the layer still owns its child"),
 			}
 		}
@@ -259,6 +304,34 @@ mod std_frontend {
 		(Box::new(outer), calls)
 	}
 
+	fn reusing_synthetic() -> (
+		Box<dyn ChildWrapper>,
+		Arc<AtomicUsize>,
+		Arc<LeafCalls>,
+		*const (),
+	) {
+		let (leaf, leaf_calls) = leaf();
+		let leaf_ptr = data_ptr(leaf.as_ref());
+		let calls = Arc::new(AtomicUsize::new(0));
+		let inner = ReusingLayer {
+			inner: ReusedChild::Synthetic(leaf),
+			into_inner_calls: Arc::clone(&calls),
+		};
+		let outer = ReusingLayer {
+			inner: ReusedChild::Layer(Box::new(inner)),
+			into_inner_calls: Arc::clone(&calls),
+		};
+		(Box::new(outer), calls, leaf_calls, leaf_ptr)
+	}
+
+	fn layered_repeatable() -> Box<dyn ChildWrapper> {
+		if cfg!(miri) {
+			Box::new(Layer::new(Box::new(Layer::new(Box::new(CompletedChild)))))
+		} else {
+			layered_native()
+		}
+	}
+
 	fn leaf() -> (Box<dyn ChildWrapper>, Arc<LeafCalls>) {
 		let calls = Arc::new(LeafCalls::default());
 		(Box::new(Leaf(Arc::clone(&calls))), calls)
@@ -273,38 +346,60 @@ mod std_frontend {
 	}
 
 	#[test]
+	#[cfg_attr(miri, ignore = "requires a native child process")]
 	fn native_child_try_accessors_traverse_layers() {
 		let mut child = layered_native();
 		assert!(child.try_inner_child().is_some());
 		child.wait().expect("reap immutable-test child");
 
 		let mut child = layered_native();
+		// SAFETY: these fixture layers only forward their child; they add no cleanup or supervision state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_some());
 		child.wait().expect("reap mutable-test child");
 
 		let child = layered_native();
+		// SAFETY: consuming these forwarding layers bypasses no cleanup or supervision state.
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().expect("reap consuming-test child");
 	}
 
 	#[test]
+	#[cfg_attr(miri, ignore = "requires a native child process")]
 	fn inline_native_child_is_not_mistaken_for_a_self_leaf() {
 		let mut child: Box<dyn ChildWrapper> = Box::new(InlineLayer(native_child()));
 		assert!(child.try_inner_child().is_some());
 		child.wait().expect("reap immutable-test child");
 
 		let mut child: Box<dyn ChildWrapper> = Box::new(InlineLayer(native_child()));
+		// SAFETY: `InlineLayer` adds no cleanup or supervision state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_some());
 		child.wait().expect("reap mutable-test child");
 
 		let child: Box<dyn ChildWrapper> = Box::new(InlineLayer(native_child()));
+		// SAFETY: consuming `InlineLayer` bypasses no cleanup or supervision state.
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().expect("reap consuming-test child");
 	}
 
 	#[test]
 	fn consuming_traversal_allows_same_type_to_reuse_its_allocation() {
+		if cfg!(miri) {
+			let (child, into_inner_calls, leaf_calls, leaf_ptr) = reusing_synthetic();
+			// SAFETY: these forwarding layers and the counter-only leaf own no cleanup state.
+			let child = unsafe { child.try_into_inner_child() }
+				.expect_err("the synthetic terminal must be returned");
+			assert_eq!(data_ptr(child.as_ref()), leaf_ptr);
+			assert!(is_type::<Leaf>(child.as_ref()));
+			assert_eq!(into_inner_calls.load(Ordering::SeqCst), 2);
+			assert_eq!(leaf_calls.into_inner.load(Ordering::SeqCst), 0);
+			assert_eq!(leaf_calls.drops.load(Ordering::SeqCst), 0);
+			drop(child);
+			assert_eq!(leaf_calls.drops.load(Ordering::SeqCst), 1);
+			return;
+		}
+
 		let (child, into_inner_calls) = reusing_native();
+		// SAFETY: `ReusingLayer` only forwards its child and records a call count.
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().expect("reap consuming-test child");
 		assert_eq!(into_inner_calls.load(Ordering::SeqCst), 2);
@@ -314,9 +409,11 @@ mod std_frontend {
 	fn self_leaf_try_accessors_preserve_ownership() {
 		let (mut child, calls) = leaf();
 		assert!(child.try_inner_child().is_none());
+		// SAFETY: `Leaf` owns only atomic counters, with no child or lifecycle state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_none());
 
 		let original = data_ptr(child.as_ref());
+		// SAFETY: consuming the counter-only `Leaf` bypasses no cleanup or supervision state.
 		let child = unsafe { child.try_into_inner_child() }
 			.expect_err("a non-native leaf must be returned");
 		assert_eq!(data_ptr(child.as_ref()), original);
@@ -340,7 +437,9 @@ mod std_frontend {
 		));
 
 		assert!(child.try_inner_child().is_none());
+		// SAFETY: the forwarding layers and counter-only leaf own no lifecycle state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_none());
+		// SAFETY: consuming the forwarding layers bypasses no cleanup or supervision state.
 		let child = unsafe { child.try_into_inner_child() }
 			.expect_err("the terminal leaf must be returned");
 		assert_eq!(data_ptr(child.as_ref()), leaf_ptr);
@@ -355,7 +454,7 @@ mod std_frontend {
 
 	#[test]
 	fn lifecycle_is_repeatable_through_custom_layers() {
-		let mut child = layered_native();
+		let mut child = layered_repeatable();
 		let first = child.wait().expect("first wait");
 		let second = child.wait().expect("second wait");
 		let third = child
@@ -402,11 +501,57 @@ mod std_frontend {
 mod tokio_frontend {
 	use std::{
 		any::TypeId,
+		future::Future,
+		pin::Pin,
+		process::ExitStatus,
 		sync::{
 			Arc,
 			atomic::{AtomicUsize, Ordering},
 		},
 	};
+
+	#[derive(Debug)]
+	struct CompletedChild;
+
+	fn successful_exit_status() -> ExitStatus {
+		#[cfg(unix)]
+		{
+			use std::os::unix::process::ExitStatusExt;
+
+			ExitStatus::from_raw(0)
+		}
+
+		#[cfg(windows)]
+		{
+			use std::os::windows::process::ExitStatusExt;
+
+			ExitStatus::from_raw(0)
+		}
+	}
+
+	impl ChildWrapper for CompletedChild {
+		fn inner(&self) -> &dyn ChildWrapper {
+			self
+		}
+
+		fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+			self
+		}
+
+		fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+			self
+		}
+
+		fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+			Ok(Some(successful_exit_status()))
+		}
+
+		fn wait(
+			&mut self,
+		) -> Pin<Box<dyn Future<Output = std::io::Result<ExitStatus>> + Send + '_>> {
+			Box::pin(async { Ok(successful_exit_status()) })
+		}
+	}
 
 	use process_wrap::tokio::ChildWrapper;
 	#[cfg(all(unix, any(feature = "process-group", feature = "process-session")))]
@@ -530,6 +675,7 @@ mod tokio_frontend {
 	enum ReusedChild {
 		Layer(Box<ReusingLayer>),
 		Native(Box<Child>),
+		Synthetic(Box<dyn ChildWrapper>),
 		Taken,
 	}
 
@@ -544,6 +690,7 @@ mod tokio_frontend {
 			match &self.inner {
 				ReusedChild::Layer(child) => child.as_ref(),
 				ReusedChild::Native(child) => child.as_ref(),
+				ReusedChild::Synthetic(child) => child.as_ref(),
 				ReusedChild::Taken => unreachable!("the layer still owns its child"),
 			}
 		}
@@ -552,6 +699,7 @@ mod tokio_frontend {
 			match &mut self.inner {
 				ReusedChild::Layer(child) => child.as_mut(),
 				ReusedChild::Native(child) => child.as_mut(),
+				ReusedChild::Synthetic(child) => child.as_mut(),
 				ReusedChild::Taken => unreachable!("the layer still owns its child"),
 			}
 		}
@@ -564,6 +712,7 @@ mod tokio_frontend {
 					self
 				}
 				ReusedChild::Native(child) => child,
+				ReusedChild::Synthetic(child) => child,
 				ReusedChild::Taken => unreachable!("the layer still owns its child"),
 			}
 		}
@@ -657,6 +806,34 @@ mod tokio_frontend {
 		(Box::new(outer), calls)
 	}
 
+	fn reusing_synthetic() -> (
+		Box<dyn ChildWrapper>,
+		Arc<AtomicUsize>,
+		Arc<LeafCalls>,
+		*const (),
+	) {
+		let (leaf, leaf_calls) = leaf();
+		let leaf_ptr = data_ptr(leaf.as_ref());
+		let calls = Arc::new(AtomicUsize::new(0));
+		let inner = ReusingLayer {
+			inner: ReusedChild::Synthetic(leaf),
+			into_inner_calls: Arc::clone(&calls),
+		};
+		let outer = ReusingLayer {
+			inner: ReusedChild::Layer(Box::new(inner)),
+			into_inner_calls: Arc::clone(&calls),
+		};
+		(Box::new(outer), calls, leaf_calls, leaf_ptr)
+	}
+
+	fn layered_repeatable() -> Box<dyn ChildWrapper> {
+		if cfg!(miri) {
+			Box::new(Layer::new(Box::new(Layer::new(Box::new(CompletedChild)))))
+		} else {
+			layered_native()
+		}
+	}
+
 	fn leaf() -> (Box<dyn ChildWrapper>, Arc<LeafCalls>) {
 		let calls = Arc::new(LeafCalls::default());
 		(Box::new(Leaf(Arc::clone(&calls))), calls)
@@ -671,38 +848,60 @@ mod tokio_frontend {
 	}
 
 	#[tokio::test]
+	#[cfg_attr(miri, ignore = "requires a native child process")]
 	async fn native_child_try_accessors_traverse_layers() {
 		let mut child = layered_native();
 		assert!(child.try_inner_child().is_some());
 		child.wait().await.expect("reap immutable-test child");
 
 		let mut child = layered_native();
+		// SAFETY: these fixture layers only forward their child; they add no cleanup or supervision state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_some());
 		child.wait().await.expect("reap mutable-test child");
 
 		let child = layered_native();
+		// SAFETY: consuming these forwarding layers bypasses no cleanup or supervision state.
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().await.expect("reap consuming-test child");
 	}
 
 	#[tokio::test]
+	#[cfg_attr(miri, ignore = "requires a native child process")]
 	async fn inline_native_child_is_not_mistaken_for_a_self_leaf() {
 		let mut child: Box<dyn ChildWrapper> = Box::new(InlineLayer(native_child()));
 		assert!(child.try_inner_child().is_some());
 		child.wait().await.expect("reap immutable-test child");
 
 		let mut child: Box<dyn ChildWrapper> = Box::new(InlineLayer(native_child()));
+		// SAFETY: `InlineLayer` adds no cleanup or supervision state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_some());
 		child.wait().await.expect("reap mutable-test child");
 
 		let child: Box<dyn ChildWrapper> = Box::new(InlineLayer(native_child()));
+		// SAFETY: consuming `InlineLayer` bypasses no cleanup or supervision state.
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().await.expect("reap consuming-test child");
 	}
 
 	#[tokio::test]
 	async fn consuming_traversal_allows_same_type_to_reuse_its_allocation() {
+		if cfg!(miri) {
+			let (child, into_inner_calls, leaf_calls, leaf_ptr) = reusing_synthetic();
+			// SAFETY: these forwarding layers and the counter-only leaf own no cleanup state.
+			let child = unsafe { child.try_into_inner_child() }
+				.expect_err("the synthetic terminal must be returned");
+			assert_eq!(data_ptr(child.as_ref()), leaf_ptr);
+			assert!(is_type::<Leaf>(child.as_ref()));
+			assert_eq!(into_inner_calls.load(Ordering::SeqCst), 2);
+			assert_eq!(leaf_calls.into_inner.load(Ordering::SeqCst), 0);
+			assert_eq!(leaf_calls.drops.load(Ordering::SeqCst), 0);
+			drop(child);
+			assert_eq!(leaf_calls.drops.load(Ordering::SeqCst), 1);
+			return;
+		}
+
 		let (child, into_inner_calls) = reusing_native();
+		// SAFETY: `ReusingLayer` only forwards its child and records a call count.
 		let mut child = unsafe { child.try_into_inner_child() }.expect("native child");
 		child.wait().await.expect("reap consuming-test child");
 		assert_eq!(into_inner_calls.load(Ordering::SeqCst), 2);
@@ -712,9 +911,11 @@ mod tokio_frontend {
 	async fn self_leaf_try_accessors_preserve_ownership() {
 		let (mut child, calls) = leaf();
 		assert!(child.try_inner_child().is_none());
+		// SAFETY: `Leaf` owns only atomic counters, with no child or lifecycle state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_none());
 
 		let original = data_ptr(child.as_ref());
+		// SAFETY: consuming the counter-only `Leaf` bypasses no cleanup or supervision state.
 		let child = unsafe { child.try_into_inner_child() }
 			.expect_err("a non-native leaf must be returned");
 		assert_eq!(data_ptr(child.as_ref()), original);
@@ -738,7 +939,9 @@ mod tokio_frontend {
 		));
 
 		assert!(child.try_inner_child().is_none());
+		// SAFETY: the forwarding layers and counter-only leaf own no lifecycle state.
 		assert!(unsafe { child.try_inner_child_mut() }.is_none());
+		// SAFETY: consuming the forwarding layers bypasses no cleanup or supervision state.
 		let child = unsafe { child.try_into_inner_child() }
 			.expect_err("the terminal leaf must be returned");
 		assert_eq!(data_ptr(child.as_ref()), leaf_ptr);
@@ -753,7 +956,7 @@ mod tokio_frontend {
 
 	#[tokio::test]
 	async fn lifecycle_is_repeatable_through_custom_layers() {
-		let mut child = layered_native();
+		let mut child = layered_repeatable();
 		let first = child.wait().await.expect("first wait");
 		let second = child.wait().await.expect("second wait");
 		let third = child

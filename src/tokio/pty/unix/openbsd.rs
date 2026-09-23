@@ -28,15 +28,15 @@ const _: () = assert!(size_of::<PtmGet>() == 40);
 
 pub(super) fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	let (parent_socket, helper_socket) = descriptor_pair::socket_pair()?;
-	// SAFETY: fork has no Rust-side invariants beyond separating execution by its return value. The child
-	// immediately enters a syscall-only helper and exits without touching shared runtime state.
+	// SAFETY: the child immediately enters the audited post-fork helper and exits through `_exit`
+	// without touching shared runtime state.
 	let helper = unsafe { libc::fork() };
 	if helper == -1 {
 		return Err(io::Error::last_os_error());
 	}
 	if helper == 0 {
-		// SAFETY: this is the post-fork helper. It uses only stack state and descriptor syscalls before
-		// terminating through _exit, and never returns into the Rust runtime.
+		// SAFETY: this child inherited the two distinct, live endpoints created by `socket_pair`;
+		// `allocate_and_send` follows its audited post-fork path and exits via `_exit`.
 		unsafe { allocate_and_send(parent_socket.as_raw_fd(), helper_socket.as_raw_fd()) }
 	}
 
@@ -63,6 +63,11 @@ pub(super) fn open_pty(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
 	Ok((master, slave))
 }
 
+/// # Safety
+///
+/// `parent_socket` and `helper_socket` must be distinct live sockets inherited by the immediate
+/// post-fork child. Call this only in that child. The body relies on OpenBSD's libc operations here
+/// being direct, allocation- and lock-free syscall paths, and every path terminates through `_exit`.
 unsafe fn allocate_and_send(parent_socket: RawFd, helper_socket: RawFd) -> ! {
 	// SAFETY: both descriptors were inherited across fork and the helper does not use the parent end.
 	unsafe {

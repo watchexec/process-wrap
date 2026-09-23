@@ -280,6 +280,7 @@ impl CommandWrapper for LegacyInline {
 		child: Box<dyn ChildWrapper>,
 		_core: &CommandWrap,
 	) -> Result<Box<dyn ChildWrapper>> {
+		// SAFETY: `LegacyInline` adds no cleanup or supervision state.
 		let child = unsafe { child.try_into_inner_child() }
 			.map_err(|_| std::io::Error::other("legacy inline wrapper expected a native child"))?;
 		Ok(Box::new(LegacyInlineChild(child)))

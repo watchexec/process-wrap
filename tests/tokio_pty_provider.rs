@@ -504,6 +504,23 @@ async fn transaction_observes_a_child_reaped_by_a_hook() {
 	assert_reaped(pid);
 }
 
+fn wait_for_reported_pid(path: &std::path::Path, deadline: Instant) -> io::Result<i32> {
+	loop {
+		if let Ok(pid) = std::fs::read_to_string(path)
+			.and_then(|pid| pid.trim().parse().map_err(io::Error::other))
+		{
+			return Ok(pid);
+		}
+		if Instant::now() >= deadline {
+			return Err(io::Error::new(
+				io::ErrorKind::TimedOut,
+				"PTY descendant did not report its PID",
+			));
+		}
+		std::thread::sleep(Duration::from_millis(10));
+	}
+}
+
 #[derive(Debug)]
 struct FailAfterDescendantStarts {
 	pid_file: std::path::PathBuf,
@@ -523,19 +540,7 @@ impl CommandWrapper for FailAfterDescendantStarts {
 			.lock()
 			.unwrap_or_else(std::sync::PoisonError::into_inner) = child.id();
 		let deadline = Instant::now() + Duration::from_secs(5);
-		while !self.pid_file.exists() {
-			if Instant::now() >= deadline {
-				return Err(io::Error::new(
-					io::ErrorKind::TimedOut,
-					"PTY descendant did not report its PID",
-				));
-			}
-			std::thread::sleep(Duration::from_millis(10));
-		}
-		let pid = std::fs::read_to_string(&self.pid_file)?
-			.trim()
-			.parse()
-			.map_err(io::Error::other)?;
+		let pid = wait_for_reported_pid(&self.pid_file, deadline)?;
 		*self
 			.descendant_pid
 			.lock()
@@ -569,19 +574,7 @@ impl CommandWrapper for FailAfterLeaderExits {
 			.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(direct_pid);
 
 		let deadline = Instant::now() + Duration::from_secs(5);
-		while !self.pid_file.exists() {
-			if Instant::now() >= deadline {
-				return Err(io::Error::new(
-					io::ErrorKind::TimedOut,
-					"PTY descendant did not report its PID",
-				));
-			}
-			std::thread::sleep(Duration::from_millis(10));
-		}
-		let descendant_pid = std::fs::read_to_string(&self.pid_file)?
-			.trim()
-			.parse()
-			.map_err(io::Error::other)?;
+		let descendant_pid = wait_for_reported_pid(&self.pid_file, deadline)?;
 		*self
 			.descendant_pid
 			.lock()
@@ -619,6 +612,23 @@ impl CommandWrapper for FailAfterLeaderExits {
 
 		Err(io::Error::other("fail after the PTY leader exits"))
 	}
+}
+
+#[test]
+fn waits_until_existing_pid_file_contains_a_pid() -> io::Result<()> {
+	let directory = tempfile::tempdir()?;
+	let pid_file = directory.path().join("descendant-pid");
+	std::fs::write(&pid_file, b"")?;
+	let writer_path = pid_file.clone();
+	let writer = std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_millis(20));
+		std::fs::write(writer_path, "1234")
+	});
+
+	let pid = wait_for_reported_pid(&pid_file, Instant::now() + Duration::from_secs(1))?;
+	writer.join().expect("PID writer thread panicked")?;
+	assert_eq!(pid, 1234);
+	Ok(())
 }
 
 fn assert_process_disappears(pid: i32) {
