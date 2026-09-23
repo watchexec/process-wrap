@@ -16,9 +16,8 @@ impl TokioCommandWrapper for ResetSigmask {
 	fn pre_spawn(&mut self, command: &mut Command, _core: &TokioCommandWrap) -> Result<()> {
 		unsafe {
 			command.pre_exec(|| {
-				let mut oldset = SigSet::empty();
 				let newset = SigSet::all();
-				sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&newset), Some(&mut oldset))?;
+				sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&newset), None)?;
 				Ok(())
 			});
 		}
