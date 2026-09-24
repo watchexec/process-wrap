@@ -20,7 +20,7 @@ jobs:
           - windows
         toolchain:
           - stable
-          - 1.87.0
+          - 1.88.0
         features:
           - tokio1
           - std
@@ -129,8 +129,8 @@ jobs:
 
       - name: Configure Rust
         run: |
-          rustup toolchain install --profile minimal --no-self-update 1.87.0
-          rustup default 1.87.0
+          rustup toolchain install --profile minimal --no-self-update 1.88.0
+          rustup default 1.88.0
           rustup component add clippy
 
       - run: cargo clippy --locked --all-features --all-targets

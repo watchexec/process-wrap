@@ -15,7 +15,7 @@ readme = "README.md"
 edition = "2024"
 resolver = "3"
 exclude = ["/bin", "/.github"]
-rust-version = "1.87.0"
+rust-version = "1.88.0"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
