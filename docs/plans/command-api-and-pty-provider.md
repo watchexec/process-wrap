@@ -92,8 +92,11 @@ Carry creation flags, explicit versus temporary suspension, JobObject, and KillO
 ## ConPTY transport
 
 Reuse the existing dynamic ConPTY API resolution, startup attributes, named pipes, manual `CreateProcessW`, custom child, controller, and cleanup modules.
-Integrate them as the Tokio `Pty` provider rather than a separate spawn method.
-Preserve unsupported-runtime precedence and exact command line, environment, cwd, flag, and handle-inheritance semantics.
+Call the native ConPTY API through the `windows` crate rather than introducing another PTY or process abstraction.
+Integrate the transport as the Tokio `Pty` provider rather than a separate spawn method.
+Resolve `CreatePseudoConsole`, `ResizePseudoConsole`, `ReleasePseudoConsole`, and `ClosePseudoConsole` dynamically and preserve unsupported-runtime precedence.
+Require Windows 11 24H2 build 26100 or Windows Server 2025 because descendant-aware output EOF depends on `ReleasePseudoConsole`.
+Preserve exact command line, environment, cwd, flag, and handle-inheritance semantics.
 Retain process and primary-thread handles through JobObject assignment and provider-owned suspension finalization.
 Keep the cleanup guard armed through all wrapper hooks and disarm it only when the provider transaction commits.
 Preserve cancellation-safe repeated waits, post-exit kill behavior, resize, merged I/O, direct-child and job-object kill-on-drop behavior, and off-reactor pseudoconsole closure.
@@ -109,3 +112,4 @@ Preserve the terminal stream, ownership, VEOF, draining, macOS lifecycle, and pr
 Explain that `pty` remains non-default because it selects Tokio and PTY dependencies.
 Remove the rejected public PTY builder, tuple spawn, marker names, fallback-to-pipes wording, and CI-runner prose.
 Document native-only escape behavior and the migration from the former PTY prototype.
+Document ConPTY support, its Windows build floor, and the descendant-aware EOF semantics which require that floor.
