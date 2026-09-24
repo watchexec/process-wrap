@@ -115,3 +115,30 @@ Explain that `pty` remains non-default because it selects Tokio and PTY dependen
 Remove the rejected public PTY builder, tuple spawn, marker names, fallback-to-pipes wording, and CI-runner prose.
 Document native-only escape behavior and the migration from the former PTY prototype.
 Document ConPTY support, its Windows build floor, and the descendant-aware EOF semantics which require that floor.
+
+## Recovery and completion sequence
+
+Treat the shared command family, exact state, attempt lifecycle, spawn providers, Tokio PTY wrapper, Unix transport, and exact Windows command model as the merged foundation on `main`.
+Recover the unpublished ConPTY work by rebasing its logical commits onto that foundation rather than merging the obsolete branch or reconstructing one squashed change.
+Preserve the feature sequence for executable resolution, dynamic API resolution, named pipes, startup ownership, child ownership, controller ownership, exact process creation, and provider integration.
+Preserve the subsequent test and lifecycle-fix commits while omitting the historical correction merge whose other parent is already an ancestor of `main`.
+
+Keep the recovered Windows transport split by responsibility:
+
+- `src/tokio/pty/windows/api.rs` resolves and calls the required ConPTY entry points.
+- `src/tokio/pty/windows/attributes.rs` owns the process-thread startup attribute list.
+- `src/tokio/pty/windows/backend.rs` validates, allocates, and returns the provider product and transaction.
+- `src/tokio/pty/windows/child.rs` owns process handles and cancellation-safe wait state.
+- `src/tokio/pty/windows/console.rs` owns startup release, resize, and off-reactor pseudoconsole closure.
+- `src/tokio/pty/windows/controller.rs` exposes PTY input, output, and resize ownership.
+- `src/tokio/pty/windows/pipe.rs` pairs ConPTY-compatible synchronous endpoints with Tokio-compatible named-pipe endpoints.
+- `src/tokio/pty/windows/program.rs` resolves executables deterministically and rejects direct batch execution.
+- `src/tokio/pty/windows/spawn.rs` performs exact `CreateProcessW` startup and arms process cleanup.
+- `src/tokio/pty/windows/mod.rs` composes those modules with the existing command and environment preparation.
+- `src/tokio/pty.rs` selects the Windows backend and exposes the public capability queries.
+- `Cargo.toml` enables only the additional Win32 API features required by the transport.
+- `README.md` and crate-level documentation describe Windows support, its runtime floor, and the same ownership and lifecycle contract as the Unix backend.
+
+Add the capability-query API as a focused follow-up commit after the recovered historical series.
+Resolve current-`main` integration gaps in new focused commits rather than folding fixes into the recovered commits.
+When every implementation promise in this plan is present, remove this plan in a standalone `unplan:` commit.
