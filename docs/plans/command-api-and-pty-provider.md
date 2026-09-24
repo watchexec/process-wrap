@@ -67,6 +67,8 @@ Keep ordinary `spawn` returning the boxed Tokio child contract.
 Install a private child layer which owns the PTY controller beneath arbitrary outer wrappers.
 Add one-shot controller extraction by traversing the child chain without unwrapping it.
 Keep PTY input and output on the controller and keep native Tokio pipe accessors absent.
+Expose side-effect-free `Pty::check_supported` and `Pty::is_supported` associated functions for platform and runtime capability detection.
+Keep command configuration, wrapper compatibility, and spawn failures outside that capability result so callers do not mistake availability for a spawn guarantee.
 
 ## Unix PTY transport
 
