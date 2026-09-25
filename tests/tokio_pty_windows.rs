@@ -3,9 +3,10 @@
 use std::{
 	env,
 	io::{self, Read, Write},
+	os::windows::process::CommandExt,
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Path, PathBuf},
-	process::ExitStatus,
+	process::{ExitStatus, Stdio},
 	sync::{
 		Arc, Mutex,
 		atomic::{AtomicBool, Ordering},
@@ -36,8 +37,8 @@ use windows::Win32::{
 			GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
 		},
 		Threading::{
-			INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
-			WaitForSingleObject,
+			DETACHED_PROCESS, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+			TerminateProcess, WaitForSingleObject,
 		},
 	},
 };
@@ -79,12 +80,26 @@ fn spawn_with_terminal(
 	Ok((child, controller))
 }
 
-fn spawn_descendant(release: &Path) -> io::Result<std::process::Child> {
-	std::process::Command::new(env::current_exe()?)
+fn descendant_command(release: &Path) -> io::Result<std::process::Command> {
+	let mut command = std::process::Command::new(env::current_exe()?);
+	command
 		.args(["--exact", "conpty_child_helper", "--nocapture"])
 		.env(HELPER_MODE, "descendant")
 		.env("PW_RELEASE", release)
-		.env_remove("PW_DESCENDANT_PID")
+		.env_remove("PW_DESCENDANT_PID");
+	Ok(command)
+}
+
+fn spawn_descendant(release: &Path) -> io::Result<std::process::Child> {
+	descendant_command(release)?.spawn()
+}
+
+fn spawn_detached_descendant(release: &Path) -> io::Result<std::process::Child> {
+	descendant_command(release)?
+		.creation_flags(DETACHED_PROCESS.0)
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
 		.spawn()
 }
 
@@ -288,7 +303,7 @@ fn conpty_child_helper() -> io::Result<()> {
 			let pid_file = env::var_os("PW_DESCENDANT_PID").ok_or_else(|| {
 				io::Error::new(io::ErrorKind::InvalidInput, "PW_DESCENDANT_PID is unset")
 			})?;
-			let descendant = spawn_descendant(Path::new(&release))?;
+			let descendant = spawn_detached_descendant(Path::new(&release))?;
 			std::fs::write(pid_file, descendant.id().to_string())?;
 			drop(descendant);
 			print!("PW-TREE-READY");

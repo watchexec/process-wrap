@@ -1,9 +1,10 @@
 use std::{
 	fs,
 	io::{Error, ErrorKind},
+	os::windows::process::CommandExt,
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::PathBuf,
-	process::{Command as StdCommand, ExitStatus},
+	process::{Command as StdCommand, ExitStatus, Stdio},
 	sync::{
 		Arc, Mutex,
 		atomic::{AtomicU32, Ordering},
@@ -12,7 +13,8 @@ use std::{
 };
 
 use windows::Win32::System::Threading::{
-	CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_CREATION_FLAGS,
+	CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS,
+	PROCESS_CREATION_FLAGS,
 };
 
 use super::{
@@ -141,6 +143,7 @@ enum FailureHook {
 	WrapChild,
 	FinalizeSpawn,
 	DisarmSpawnCleanup,
+	DisarmJobObject,
 }
 
 #[derive(Debug)]
@@ -176,6 +179,17 @@ impl ChildWrapper for FailFinalizationChild {
 
 	fn disarm_spawn_cleanup_layer(&mut self) -> Result<()> {
 		if self.hook == FailureHook::DisarmSpawnCleanup {
+			match self.failure {
+				Failure::Error => Err(Error::other("child wrapping failed")),
+				Failure::Panic => panic!("child wrapping failed"),
+			}
+		} else {
+			Ok(())
+		}
+	}
+
+	fn disarm_job_object_layer(&mut self) -> Result<()> {
+		if self.hook == FailureHook::DisarmJobObject {
 			match self.failure {
 				Failure::Error => Err(Error::other("child wrapping failed")),
 				Failure::Panic => panic!("child wrapping failed"),
@@ -257,7 +271,9 @@ impl CommandWrapper for FailAfterDescendant {
 		self.observe_descendant()?;
 		if matches!(
 			self.hook,
-			FailureHook::FinalizeSpawn | FailureHook::DisarmSpawnCleanup
+			FailureHook::FinalizeSpawn
+				| FailureHook::DisarmSpawnCleanup
+				| FailureHook::DisarmJobObject
 		) {
 			return Ok(Box::new(FailFinalizationChild {
 				inner: child,
@@ -274,12 +290,18 @@ impl CommandWrapper for FailAfterDescendant {
 	}
 }
 
-fn descendant_pid_file() -> PathBuf {
-	std::env::temp_dir().join(format!(
+fn descendant_pid_file() -> Result<PathBuf> {
+	let path = std::env::temp_dir().join(format!(
 		"process-wrap-{}-{}.pid",
 		std::process::id(),
 		PID_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-	))
+	));
+	match fs::remove_file(&path) {
+		Ok(()) => {}
+		Err(error) if error.kind() == ErrorKind::NotFound => {}
+		Err(error) => return Err(error),
+	}
+	Ok(path)
 }
 
 async fn wait_for_process_exit(guard: ProcessGuard) -> Result<()> {
@@ -414,6 +436,10 @@ fn lifecycle_descendant_leaf() {
 fn lifecycle_descendant_parent() {
 	let mut descendant = StdCommand::new(std::env::current_exe().unwrap())
 		.args(["lifecycle_descendant_leaf", "--ignored", "--nocapture"])
+		.creation_flags(DETACHED_PROCESS.0)
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
 		.spawn()
 		.unwrap();
 	fs::write(
@@ -435,10 +461,12 @@ async fn armed_job_kills_descendants_after_later_failures() -> Result<()> {
 		(FailureHook::FinalizeSpawn, true, false),
 		(FailureHook::DisarmSpawnCleanup, false, false),
 		(FailureHook::DisarmSpawnCleanup, true, false),
+		(FailureHook::DisarmJobObject, false, false),
+		(FailureHook::DisarmJobObject, true, false),
 	];
 	for failure in [Failure::Error, Failure::Panic] {
 		for (hook, job_first, unwrap_child) in cases {
-			let pid_file = descendant_pid_file();
+			let pid_file = descendant_pid_file()?;
 			let guard = Arc::new(Mutex::new(None));
 			let mut command = CommandWrap::with_new(std::env::current_exe()?, |command| {
 				command

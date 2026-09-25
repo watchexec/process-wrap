@@ -220,6 +220,9 @@ impl ChildWrapper for JobObjectChild {
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
 		self.inner.try_process_handle()
 	}
+	fn owns_job_object_cleanup_layer(&self) -> bool {
+		true
+	}
 	fn disarm_job_object_layer(&mut self) -> Result<()> {
 		set_job_kill_on_drop(self.job_port.job, self.final_kill_on_drop)?;
 		self.spawn_finalized = true;

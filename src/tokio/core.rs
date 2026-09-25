@@ -157,9 +157,19 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 		Ok(())
 	}
 
-	/// Disarm the JobObject cleanup state owned by this child layer.
+	/// Report whether this layer owns the JobObject rollback guard.
 	///
-	/// This process-wrap-internal phase runs after every other fallible finalizer and cleanup disarm.
+	/// Process-wrap defers the sole owning layer until every other fallible child-layer hook succeeds.
+	#[doc(hidden)]
+	#[cfg(windows)]
+	fn owns_job_object_cleanup_layer(&self) -> bool {
+		false
+	}
+
+	/// Disarm JobObject-phase cleanup state owned by this child layer.
+	///
+	/// Non-owning hooks run first. The sole layer identified by
+	/// [`ChildWrapper::owns_job_object_cleanup_layer`] runs last.
 	#[doc(hidden)]
 	#[cfg(windows)]
 	fn disarm_job_object_layer(&mut self) -> Result<()> {
@@ -474,10 +484,59 @@ impl dyn ChildWrapper + '_ {
 	}
 
 	#[cfg(windows)]
+	fn visit_spawn_layers_until(
+		&mut self,
+		mut visit: impl FnMut(&mut dyn ChildWrapper) -> Result<bool>,
+	) -> Result<()> {
+		let mut inner = self;
+		loop {
+			if visit(inner)? {
+				return Ok(());
+			}
+
+			let inner_type = (&*inner as &dyn Any).type_id();
+			let inner_ptr = std::ptr::from_mut(inner);
+			let next = inner.inner_mut();
+			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
+				&& inner_type == (&*next as &dyn Any).type_id()
+			{
+				return Ok(());
+			}
+			inner = next;
+		}
+	}
+
+	#[cfg(windows)]
 	pub(crate) fn finalize_spawn(&mut self) -> Result<()> {
 		self.visit_spawn_layers(|inner| inner.finalize_spawn_layer())?;
 		self.visit_spawn_layers(|inner| inner.disarm_spawn_cleanup_layer())?;
-		self.visit_spawn_layers(|inner| inner.disarm_job_object_layer())
+
+		let mut owners = 0;
+		self.visit_spawn_layers(|inner| {
+			if inner.owns_job_object_cleanup_layer() {
+				owners += 1;
+				Ok(())
+			} else {
+				inner.disarm_job_object_layer()
+			}
+		})?;
+		if owners > 1 {
+			return Err(std::io::Error::other(
+				"multiple child layers own JobObject cleanup",
+			));
+		}
+		if owners == 0 {
+			return Ok(());
+		}
+
+		self.visit_spawn_layers_until(|inner| {
+			if inner.owns_job_object_cleanup_layer() {
+				inner.disarm_job_object_layer()?;
+				Ok(true)
+			} else {
+				Ok(false)
+			}
+		})
 	}
 
 	/// Try to obtain a reference to the underlying native [`Child`].
