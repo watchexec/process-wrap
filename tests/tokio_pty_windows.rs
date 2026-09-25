@@ -70,6 +70,25 @@ fn take_controller(child: &mut dyn ChildWrapper) -> PtyController {
 	controller
 }
 
+#[test]
+fn capability_queries_agree_with_windows_backend() {
+	let checked = Pty::check_supported().is_ok();
+	assert_eq!(Pty::is_supported(), checked);
+}
+
+#[test]
+fn capability_queries_ignore_invalid_configuration_on_windows() {
+	let invalid = Pty::new(PtySize {
+		rows: 0,
+		columns: 0,
+		pixel_width: 0,
+		pixel_height: 0,
+	});
+	let checked = Pty::check_supported().is_ok();
+
+	assert_eq!(invalid.check_available().is_ok(), checked);
+}
+
 fn spawn_with_terminal(
 	command: &mut Command,
 	size: PtySize,
