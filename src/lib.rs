@@ -112,7 +112,9 @@
 //!
 //! The non-default `pty` feature selects the Tokio frontend and terminal dependencies. It provides
 //! native transport on Linux, Android, macOS, FreeBSD, NetBSD 10 and newer, OpenBSD, DragonFly BSD,
-//! illumos, and Solaris; unavailable platforms report `std::io::ErrorKind::Unsupported`.
+//! illumos, Solaris, and Windows 11 24H2 (build 26100) or Windows Server 2025. The Windows backend
+//! uses native ConPTY. That Windows floor is required because descendant-aware output EOF requires
+//! `ReleasePseudoConsole`. Unavailable platforms report `std::io::ErrorKind::Unsupported`.
 //!
 //! ```rust,no_run
 //! # #[cfg(feature = "pty")]
@@ -133,6 +135,13 @@
 //! # }
 //! # fn main() {}
 //! ```
+//!
+//! On every supported platform, including Windows, register `Pty` with the same
+//! `Command::wrap(Pty::default()).spawn()` API and take the same `PtyController`. Its ownership and
+//! lifecycle contract below applies on Unix and Windows alike. To select a PTY conditionally, use
+//! `Pty::check_supported()` for a capability result or `Pty::is_supported()` for a boolean. These
+//! report platform and runtime capability only; they do not suppress later configuration,
+//! compatibility, or spawn errors.
 //!
 //! A terminal has one ordered output stream, so PTY standard output and standard error are merged.
 //! Input and output each strongly own the bidirectional master; resize handles are weak. Dropping one

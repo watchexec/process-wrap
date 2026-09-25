@@ -89,8 +89,10 @@ dbg!(status);
 ### or in a pseudo-terminal
 
 The non-default `pty` feature enables Tokio PTY transport on Linux, Android, macOS, FreeBSD,
-NetBSD 10 and newer, OpenBSD, DragonFly BSD, illumos, and Solaris. It implies `tokio1`, selecting
-the Tokio frontend and its terminal dependencies explicitly.
+NetBSD 10 and newer, OpenBSD, DragonFly BSD, illumos, Solaris, and Windows 11 24H2 (build 26100)
+or Windows Server 2025. The Windows backend uses native ConPTY. That Windows floor is required
+because descendant-aware output EOF requires `ReleasePseudoConsole`. The feature implies `tokio1`,
+selecting the Tokio frontend and its terminal dependencies explicitly.
 
 ```toml
 [dependencies]
@@ -119,6 +121,13 @@ let status = child.wait().await?;
 let terminal_bytes = drain.await??;
 dbg!(status, terminal_bytes);
 ```
+
+On every supported platform, including Windows, register `Pty` with the same
+`Command::wrap(Pty::default()).spawn()` API and take the same `PtyController`. The controller has
+the ownership and lifecycle contract described below on Unix and Windows alike. To select a PTY
+conditionally, use `Pty::check_supported()` for a capability result or `Pty::is_supported()` for a
+boolean. These report platform and runtime capability only; they do not suppress later
+configuration, compatibility, or spawn errors.
 
 A PTY has one ordered terminal stream, so standard output and standard error are merged.
 `PtyInput` and `PtyOutput` are strong owners of one bidirectional master descriptor, so dropping
