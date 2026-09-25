@@ -49,6 +49,7 @@ use windows::Win32::{
 mod windows_thread;
 
 const HELPER_MODE: &str = "PROCESS_WRAP_CONPTY_HELPER";
+const HELPER_DIAGNOSTIC_STAGE_FILE: &str = "PROCESS_WRAP_CONPTY_DIAGNOSTIC_STAGE_FILE";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn helper(mode: &str) -> io::Result<Command> {
@@ -57,6 +58,71 @@ fn helper(mode: &str) -> io::Result<Command> {
 		.args(["--exact", "conpty_child_helper", "--nocapture"])
 		.env(HELPER_MODE, mode);
 	Ok(command)
+}
+
+fn record_diagnostic_stage(path: Option<&Path>, stage: &str) -> io::Result<()> {
+	if let Some(path) = path {
+		writeln!(
+			std::fs::OpenOptions::new()
+				.append(true)
+				.create(true)
+				.open(path)?,
+			"{stage}"
+		)?;
+	}
+	Ok(())
+}
+
+fn last_diagnostic_stage(path: &Path) -> String {
+	match std::fs::read_to_string(path) {
+		Ok(stages) => stages
+			.lines()
+			.last()
+			.map_or_else(|| "empty".to_owned(), ToOwned::to_owned),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => "absent".to_owned(),
+		Err(error) => format!("read error: {error}"),
+	}
+}
+
+fn descendant_pid_timeout_error(stage: String, child: io::Result<Option<ExitStatus>>) -> io::Error {
+	let child = match child {
+		Ok(Some(status)) => format!("exited with {status}"),
+		Ok(None) => "still running".to_owned(),
+		Err(error) => format!("try_wait error: {error}"),
+	};
+	io::Error::new(
+		io::ErrorKind::TimedOut,
+		format!(
+			"ConPTY descendant did not report its process ID (last stage: {stage}; direct child: {child})"
+		),
+	)
+}
+
+#[test]
+fn diagnostic_stage_recording_is_ordered() -> io::Result<()> {
+	let directory = tempfile::tempdir()?;
+	let stage_file = directory.path().join("diagnostic-stage");
+
+	record_diagnostic_stage(Some(&stage_file), "mode-read")?;
+	record_diagnostic_stage(Some(&stage_file), "terminal-handles-ready")?;
+
+	assert_eq!(
+		std::fs::read_to_string(&stage_file)?,
+		"mode-read\nterminal-handles-ready\n"
+	);
+	assert_eq!(last_diagnostic_stage(&stage_file), "terminal-handles-ready");
+	Ok(())
+}
+
+#[test]
+fn descendant_pid_timeout_describes_stage_and_child() {
+	let error = descendant_pid_timeout_error("terminal-handles-ready".to_owned(), Ok(None));
+
+	assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+	assert_eq!(
+		error.to_string(),
+		"ConPTY descendant did not report its process ID (last stage: terminal-handles-ready; direct child: still running)"
+	);
 }
 
 fn take_controller(child: &mut dyn ChildWrapper) -> PtyController {
@@ -105,7 +171,8 @@ fn descendant_command(release: &Path) -> io::Result<std::process::Command> {
 		.args(["--exact", "conpty_child_helper", "--nocapture"])
 		.env(HELPER_MODE, "descendant")
 		.env("PW_RELEASE", release)
-		.env_remove("PW_DESCENDANT_PID");
+		.env_remove("PW_DESCENDANT_PID")
+		.env_remove(HELPER_DIAGNOSTIC_STAGE_FILE);
 	Ok(command)
 }
 
@@ -255,7 +322,10 @@ fn conpty_child_helper() -> io::Result<()> {
 	let Ok(mode) = env::var(HELPER_MODE) else {
 		return Ok(());
 	};
+	let diagnostic_stage_file = env::var_os(HELPER_DIAGNOSTIC_STAGE_FILE).map(PathBuf::from);
+	record_diagnostic_stage(diagnostic_stage_file.as_deref(), "mode-read")?;
 	let (stdin_handle, stdout_handle, stderr_handle) = terminal_handles()?;
+	record_diagnostic_stage(diagnostic_stage_file.as_deref(), "terminal-handles-ready")?;
 
 	match mode.as_str() {
 		"terminal" => {
@@ -322,8 +392,14 @@ fn conpty_child_helper() -> io::Result<()> {
 			let pid_file = env::var_os("PW_DESCENDANT_PID").ok_or_else(|| {
 				io::Error::new(io::ErrorKind::InvalidInput, "PW_DESCENDANT_PID is unset")
 			})?;
+			record_diagnostic_stage(diagnostic_stage_file.as_deref(), "tree-environment-ready")?;
 			let descendant = spawn_detached_descendant(Path::new(&release))?;
+			record_diagnostic_stage(
+				diagnostic_stage_file.as_deref(),
+				&format!("detached-descendant-spawned:{}", descendant.id()),
+			)?;
 			std::fs::write(pid_file, descendant.id().to_string())?;
+			record_diagnostic_stage(diagnostic_stage_file.as_deref(), "descendant-pid-written")?;
 			drop(descendant);
 			print!("PW-TREE-READY");
 			io::stdout().flush()?;
@@ -928,12 +1004,13 @@ struct FailAfterDescendantOnce {
 	stage: LifecycleStage,
 	failed: bool,
 	pid_file: PathBuf,
+	stage_file: PathBuf,
 	descendant: Arc<Mutex<Option<ProcessExitGuard>>>,
 }
 
 #[cfg(feature = "job-object")]
 impl FailAfterDescendantOnce {
-	fn capture_descendant(&self) -> io::Result<()> {
+	fn capture_descendant(&self, child: &mut dyn ChildWrapper) -> io::Result<()> {
 		let deadline = Instant::now() + TIMEOUT;
 		let pid = loop {
 			if let Ok(pid) = std::fs::read_to_string(&self.pid_file)
@@ -942,9 +1019,9 @@ impl FailAfterDescendantOnce {
 				break pid;
 			}
 			if Instant::now() >= deadline {
-				return Err(io::Error::new(
-					io::ErrorKind::TimedOut,
-					"ConPTY descendant did not report its process ID",
+				return Err(descendant_pid_timeout_error(
+					last_diagnostic_stage(&self.stage_file),
+					child.try_wait(),
 				));
 			}
 			std::thread::sleep(Duration::from_millis(10));
@@ -966,7 +1043,7 @@ impl CommandWrapper for FailAfterDescendantOnce {
 			return Ok(());
 		}
 		assert!(child.take_pty_controller().is_none());
-		self.capture_descendant()?;
+		self.capture_descendant(child)?;
 		self.failed = true;
 		fail_lifecycle(self.failure)
 	}
@@ -980,7 +1057,7 @@ impl CommandWrapper for FailAfterDescendantOnce {
 			return Ok(child);
 		}
 		assert!(child.take_pty_controller().is_none());
-		self.capture_descendant()?;
+		self.capture_descendant(child.as_mut())?;
 		self.failed = true;
 		if self.stage == LifecycleStage::WrapChild {
 			fail_lifecycle(self.failure)
@@ -1009,6 +1086,7 @@ async fn armed_job_reaps_descendants_after_later_conpty_failures() -> io::Result
 				let directory = tempfile::tempdir()?;
 				let release = directory.path().join("release-descendant");
 				let pid_file = directory.path().join("descendant-pid");
+				let stage_file = directory.path().join("diagnostic-stage");
 				let _release_on_drop = ReleaseOnDrop(release.clone());
 				let descendant = Arc::new(Mutex::new(None));
 				let fail = FailAfterDescendantOnce {
@@ -1016,12 +1094,14 @@ async fn armed_job_reaps_descendants_after_later_conpty_failures() -> io::Result
 					stage,
 					failed: false,
 					pid_file: pid_file.clone(),
+					stage_file: stage_file.clone(),
 					descendant: Arc::clone(&descendant),
 				};
 				let mut command = helper("tree")?;
 				command
 					.env("PW_RELEASE", &release)
 					.env("PW_DESCENDANT_PID", &pid_file)
+					.env(HELPER_DIAGNOSTIC_STAGE_FILE, &stage_file)
 					.wrap(Pty::default());
 				if job_outer {
 					command.wrap(fail).wrap(JobObject);
