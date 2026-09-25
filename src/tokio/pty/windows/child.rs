@@ -473,6 +473,36 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn start_kill_succeeds_after_natural_exit() {
+		let mut native = spawn_exit_259();
+		let mut child = wrap(&native, false);
+		let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(status.code(), Some(259));
+		child.start_kill().unwrap();
+		assert_eq!(child.try_wait().unwrap(), Some(status));
+		assert_eq!(child.wait().await.unwrap(), status);
+		assert_eq!(wait_native(&mut native), status);
+	}
+
+	#[tokio::test]
+	async fn kill_succeeds_after_natural_exit() {
+		let mut native = spawn_exit_259();
+		let mut child = wrap(&native, false);
+		let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(status.code(), Some(259));
+		Pin::from(ChildWrapper::kill(&mut child)).await.unwrap();
+		assert_eq!(child.try_wait().unwrap(), Some(status));
+		assert_eq!(child.wait().await.unwrap(), status);
+		assert_eq!(wait_native(&mut native), status);
+	}
+
+	#[tokio::test]
 	async fn kills_and_reaps_the_direct_process() {
 		let mut native = spawn_long_running();
 		let mut child = wrap(&native, false);
