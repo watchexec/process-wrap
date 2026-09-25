@@ -1009,8 +1009,20 @@ struct FailAfterDescendantOnce {
 }
 
 #[cfg(feature = "job-object")]
-impl FailAfterDescendantOnce {
-	fn capture_descendant(&self, child: &mut dyn ChildWrapper) -> io::Result<()> {
+#[derive(Debug)]
+struct FailAfterDescendantChild {
+	inner: Box<dyn ChildWrapper>,
+	failure: LifecycleFailure,
+	stage: LifecycleStage,
+	pid_file: PathBuf,
+	stage_file: PathBuf,
+	descendant: Arc<Mutex<Option<ProcessExitGuard>>>,
+}
+
+#[cfg(feature = "job-object")]
+impl FailAfterDescendantChild {
+	fn capture_descendant(&mut self) -> io::Result<()> {
+		assert!(self.inner_mut().take_pty_controller().is_none());
 		let deadline = Instant::now() + TIMEOUT;
 		let pid = loop {
 			if let Ok(pid) = std::fs::read_to_string(&self.pid_file)
@@ -1021,7 +1033,7 @@ impl FailAfterDescendantOnce {
 			if Instant::now() >= deadline {
 				return Err(descendant_pid_timeout_error(
 					last_diagnostic_stage(&self.stage_file),
-					child.try_wait(),
+					self.inner_mut().try_wait(),
 				));
 			}
 			std::thread::sleep(Duration::from_millis(10));
@@ -1029,45 +1041,71 @@ impl FailAfterDescendantOnce {
 		*self.descendant.lock().unwrap() = Some(ProcessExitGuard::open(pid)?);
 		Ok(())
 	}
+
+	fn fail_after_descendant(&mut self) -> io::Result<()> {
+		self.capture_descendant()?;
+		fail_lifecycle(self.failure)
+	}
+}
+
+#[cfg(feature = "job-object")]
+impl ChildWrapper for FailAfterDescendantChild {
+	fn inner(&self) -> &dyn ChildWrapper {
+		self.inner.as_ref()
+	}
+
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+		self.inner.as_mut()
+	}
+
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+		self.inner
+	}
+
+	fn finalize_spawn_layer(&mut self) -> io::Result<()> {
+		if self.stage == LifecycleStage::FinalizeSpawn {
+			self.fail_after_descendant()
+		} else {
+			Ok(())
+		}
+	}
+
+	fn disarm_spawn_cleanup_layer(&mut self) -> io::Result<()> {
+		if self.stage == LifecycleStage::DisarmSpawnCleanup {
+			self.fail_after_descendant()
+		} else {
+			Ok(())
+		}
+	}
+
+	fn disarm_job_object_layer(&mut self) -> io::Result<()> {
+		if self.stage == LifecycleStage::DisarmJobObject {
+			self.fail_after_descendant()
+		} else {
+			Ok(())
+		}
+	}
 }
 
 #[cfg(feature = "job-object")]
 impl CommandWrapper for FailAfterDescendantOnce {
-	fn post_spawn(
-		&mut self,
-		_attempt: &mut SpawnAttempt,
-		child: &mut dyn ChildWrapper,
-		_command: &Command,
-	) -> io::Result<()> {
-		if self.stage != LifecycleStage::PostSpawn || self.failed {
-			return Ok(());
-		}
-		assert!(child.take_pty_controller().is_none());
-		self.capture_descendant(child)?;
-		self.failed = true;
-		fail_lifecycle(self.failure)
-	}
-
 	fn wrap_child(
 		&mut self,
-		mut child: Box<dyn ChildWrapper>,
+		child: Box<dyn ChildWrapper>,
 		_command: &Command,
 	) -> io::Result<Box<dyn ChildWrapper>> {
-		if self.failed || self.stage == LifecycleStage::PostSpawn {
+		if self.failed {
 			return Ok(child);
 		}
-		assert!(child.take_pty_controller().is_none());
-		self.capture_descendant(child.as_mut())?;
 		self.failed = true;
-		if self.stage == LifecycleStage::WrapChild {
-			fail_lifecycle(self.failure)
-		} else {
-			Ok(Box::new(FailFinalizationChild {
-				inner: child,
-				failure: self.failure,
-				stage: self.stage,
-			}))
-		}
+		Ok(Box::new(FailAfterDescendantChild {
+			inner: child,
+			failure: self.failure,
+			stage: self.stage,
+			pid_file: self.pid_file.clone(),
+			stage_file: self.stage_file.clone(),
+			descendant: Arc::clone(&self.descendant),
+		}))
 	}
 }
 
@@ -1075,8 +1113,6 @@ impl CommandWrapper for FailAfterDescendantOnce {
 #[tokio::test]
 async fn armed_job_reaps_descendants_after_later_conpty_failures() -> io::Result<()> {
 	for stage in [
-		LifecycleStage::PostSpawn,
-		LifecycleStage::WrapChild,
 		LifecycleStage::FinalizeSpawn,
 		LifecycleStage::DisarmSpawnCleanup,
 		LifecycleStage::DisarmJobObject,
