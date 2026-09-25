@@ -11,7 +11,7 @@ use super::{
 	super::{ControllerSlot, PtyController, PtySize},
 	api,
 	attributes::AttributeList,
-	console::{self, PseudoConsole, Release},
+	console::{self, PseudoConsole},
 	controller,
 	pipe::PipePair,
 	prepare,
@@ -44,13 +44,13 @@ pub(in crate::tokio::pty) fn spawn(
 	let process::SpawnedChild { mut child, cleanup } =
 		process::spawn(prepared, &attributes, input_server, output_server)?;
 	child.install_controller(Arc::clone(&controller));
+	release.release()?;
 
 	Ok(ProviderProduct::new(
 		Box::new(child),
 		Box::new(ConPtyTransaction {
 			cleanup,
 			controller,
-			release,
 		}),
 	))
 }
@@ -59,12 +59,10 @@ pub(in crate::tokio::pty) fn spawn(
 struct ConPtyTransaction {
 	cleanup: SpawnCleanup,
 	controller: Arc<ControllerSlot>,
-	release: Release,
 }
 
 impl SpawnTransaction for ConPtyTransaction {
 	fn commit(&mut self) -> io::Result<()> {
-		self.release.release()?;
 		self.cleanup.disarm();
 		Ok(())
 	}
