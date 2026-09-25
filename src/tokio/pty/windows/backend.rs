@@ -71,7 +71,6 @@ impl SpawnTransaction for ConPtyTransaction {
 
 	fn rollback(&mut self) -> io::Result<()> {
 		self.controller.rollback();
-		self.cleanup.rollback();
-		Ok(())
+		self.cleanup.rollback()
 	}
 }
