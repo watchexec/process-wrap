@@ -145,6 +145,23 @@ pub struct Pty {
 }
 
 impl Pty {
+	/// Check whether the selected PTY backend is available on this platform and runtime.
+	///
+	/// This does not validate a [`Pty`] configuration or attempt a spawn. A successful result only
+	/// reports backend capability; a particular spawn can still fail for its command, configuration,
+	/// or environment.
+	pub fn check_supported() -> io::Result<()> {
+		imp::check_available()
+	}
+
+	/// Return whether the selected PTY backend is available on this platform and runtime.
+	///
+	/// This is equivalent to [`Pty::check_supported`].is_ok(). A `true` result does not guarantee a
+	/// particular spawn will succeed.
+	pub fn is_supported() -> bool {
+		Self::check_supported().is_ok()
+	}
+
 	/// Construct a PTY provider with the requested initial terminal size.
 	pub fn new(size: PtySize) -> Self {
 		Self { size }
@@ -168,7 +185,7 @@ impl CommandWrapper for Pty {
 
 impl SpawnProvider for Pty {
 	fn check_available(&self) -> io::Result<()> {
-		imp::check_available()
+		Self::check_supported()
 	}
 
 	fn validate_command(&self, _command: &Command) -> io::Result<()> {

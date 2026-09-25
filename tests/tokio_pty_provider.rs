@@ -29,6 +29,26 @@ use process_wrap::tokio::{
 };
 use tokio::{io::AsyncReadExt, time::timeout};
 
+#[test]
+fn capability_queries_agree_on_supported_platforms() {
+	let checked = Pty::check_supported().is_ok();
+	assert!(checked);
+	assert_eq!(Pty::is_supported(), checked);
+}
+
+#[test]
+fn capability_queries_ignore_invalid_configuration_on_supported_platforms() {
+	let invalid = Pty::new(PtySize {
+		rows: 0,
+		columns: 0,
+		pixel_width: 0,
+		pixel_height: 0,
+	});
+
+	assert!(Pty::check_supported().is_ok());
+	assert!(invalid.check_available().is_ok());
+}
+
 fn controller(child: &mut Box<dyn ChildWrapper>) -> PtyController {
 	child
 		.take_pty_controller()

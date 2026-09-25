@@ -22,7 +22,33 @@ use std::{
 	},
 };
 
-use process_wrap::tokio::{Command, CommandWrapper, Pty, PtySize, SpawnAttempt};
+use process_wrap::tokio::{Command, CommandWrapper, Pty, PtySize, SpawnAttempt, SpawnProvider};
+
+#[test]
+fn capability_queries_agree_on_unsupported_platforms() {
+	let checked = Pty::check_supported();
+	assert_eq!(checked.unwrap_err().kind(), io::ErrorKind::Unsupported);
+	assert!(!Pty::is_supported());
+}
+
+#[test]
+fn capability_queries_ignore_invalid_configuration_on_unsupported_platforms() {
+	let invalid = Pty::new(PtySize {
+		rows: 0,
+		columns: 0,
+		pixel_width: 0,
+		pixel_height: 0,
+	});
+
+	assert_eq!(
+		Pty::check_supported().unwrap_err().kind(),
+		io::ErrorKind::Unsupported
+	);
+	assert_eq!(
+		invalid.check_available().unwrap_err().kind(),
+		io::ErrorKind::Unsupported
+	);
+}
 
 #[test]
 fn spawning_is_explicitly_unsupported() {
