@@ -137,7 +137,7 @@ Keep the recovered Windows transport split by responsibility:
 - `src/tokio/pty/windows/program.rs` resolves executables deterministically and rejects direct batch execution.
 - `src/tokio/pty/windows/spawn.rs` performs exact `CreateProcessW` startup and arms process cleanup.
 - `src/tokio/pty/windows/mod.rs` composes those modules with the existing command and environment preparation.
-- `src/tokio/pty.rs` selects the Windows backend and exposes the public capability queries.
+- `src/tokio/pty.rs` selects the Windows backend.
 - `Cargo.toml` enables only the additional Win32 API features required by the transport.
 
 ### Task 2: Add PTY capability queries
