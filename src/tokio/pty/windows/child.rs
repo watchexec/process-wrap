@@ -10,15 +10,13 @@ use std::{
 	pin::Pin,
 	process::ExitStatus,
 	sync::{
-		Arc,
+		Arc, Mutex,
 		atomic::{AtomicBool, Ordering},
 	},
+	task::{Context, Poll, Waker},
 };
 
-use tokio::{
-	process::{ChildStderr, ChildStdin, ChildStdout},
-	task::{JoinHandle, spawn_blocking},
-};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 #[cfg(feature = "job-object")]
 use windows::Win32::System::Threading::ResumeThread;
 use windows::Win32::{
@@ -43,11 +41,134 @@ pub(super) struct ConPtyChild {
 	cleanup_armed: bool,
 	controller: Option<Arc<ControllerSlot>>,
 	exit_status: ChildExitStatus,
-	wait_task: Option<JoinHandle<io::Result<ExitStatus>>>,
+	wait_task: Option<WaitTask>,
 	wait_cancel: Arc<AtomicBool>,
 	stdin: Option<ChildStdin>,
 	stdout: Option<ChildStdout>,
 	stderr: Option<ChildStderr>,
+}
+
+#[derive(Debug)]
+struct WaitTask {
+	state: Arc<WaitState>,
+	_thread: std::thread::JoinHandle<()>,
+}
+
+#[derive(Debug, Default)]
+struct WaitState {
+	result: Mutex<WaitResult>,
+}
+
+#[derive(Debug, Default)]
+struct WaitResult {
+	result: Option<io::Result<ExitStatus>>,
+	waker: Option<Waker>,
+}
+
+impl WaitTask {
+	fn spawn(process: OwnedHandle, cancel: Arc<AtomicBool>) -> io::Result<Self> {
+		let state = Arc::new(WaitState::default());
+		let thread_state = Arc::clone(&state);
+		let thread = std::thread::Builder::new()
+			.name("process-wrap-conpty-wait".into())
+			.spawn(move || {
+				let result = loop {
+					if cancel.load(Ordering::Acquire) {
+						break Err(io::Error::new(
+							io::ErrorKind::Interrupted,
+							"ConPTY process wait was canceled because the child was dropped",
+						));
+					}
+					match process_status(HANDLE(process.as_raw_handle()), 50) {
+						Ok(Some(status)) => break Ok(status),
+						Ok(None) => {}
+						Err(error) => break Err(error),
+					}
+				};
+				thread_state.complete(result);
+			})?;
+		Ok(Self {
+			state,
+			_thread: thread,
+		})
+	}
+
+	fn clear_waker(&self) {
+		self.state
+			.result
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.waker
+			.take();
+	}
+
+	#[cfg(test)]
+	fn id(&self) -> std::thread::ThreadId {
+		self._thread.thread().id()
+	}
+}
+
+impl Future for WaitTask {
+	type Output = io::Result<ExitStatus>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let mut state = self
+			.state
+			.result
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		if let Some(result) = state.result.take() {
+			return Poll::Ready(result);
+		}
+		if state
+			.waker
+			.as_ref()
+			.is_none_or(|waker| !waker.will_wake(cx.waker()))
+		{
+			state.waker = Some(cx.waker().clone());
+		}
+		Poll::Pending
+	}
+}
+
+impl Drop for WaitTask {
+	fn drop(&mut self) {
+		self.clear_waker();
+	}
+}
+
+impl WaitState {
+	fn complete(&self, result: io::Result<ExitStatus>) {
+		let waker = {
+			let mut state = self
+				.result
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner);
+			state.result = Some(result);
+			state.waker.take()
+		};
+		if let Some(waker) = waker {
+			waker.wake();
+		}
+	}
+}
+
+struct RegisteredWait<'a> {
+	task: &'a mut WaitTask,
+}
+
+impl Future for RegisteredWait<'_> {
+	type Output = io::Result<ExitStatus>;
+
+	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		Pin::new(&mut *self.task).poll(cx)
+	}
+}
+
+impl Drop for RegisteredWait<'_> {
+	fn drop(&mut self) {
+		self.task.clear_waker();
+	}
 }
 
 impl ConPtyChild {
@@ -191,27 +312,17 @@ impl ChildWrapper for ConPtyChild {
 			if self.wait_task.is_none() {
 				let process = duplicate_handle(&self.process)?;
 				let cancel = Arc::clone(&self.wait_cancel);
-				self.wait_task = Some(spawn_blocking(move || {
-					loop {
-						if cancel.load(Ordering::Acquire) {
-							return Err(io::Error::new(
-								io::ErrorKind::Interrupted,
-								"ConPTY process wait was canceled because the child was dropped",
-							));
-						}
-						if let Some(status) = process_status(HANDLE(process.as_raw_handle()), 50)? {
-							return Ok(status);
-						}
-					}
-				}));
+				self.wait_task = Some(WaitTask::spawn(process, cancel)?);
 			}
-			let result = self
-				.wait_task
-				.as_mut()
-				.expect("an in-progress ConPTY wait must retain its task")
-				.await;
+			let result = RegisteredWait {
+				task: self
+					.wait_task
+					.as_mut()
+					.expect("an in-progress ConPTY wait must retain its task"),
+			}
+			.await;
 			self.wait_task.take();
-			let status = result.map_err(io::Error::other)??;
+			let status = result?;
 			self.exit_status = ChildExitStatus::Exited(status);
 			Ok(status)
 		})
@@ -412,8 +523,47 @@ mod tests {
 		assert_eq!(wait_native(&mut native), status);
 	}
 
+	#[test]
+	fn canceled_wait_does_not_block_runtime_shutdown_while_child_lives() {
+		let mut native = spawn_long_running();
+		let mut child = Some(wrap(&native, false));
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			assert!(
+				tokio::time::timeout(Duration::from_millis(20), child.as_mut().unwrap().wait(),)
+					.await
+					.is_err()
+			);
+		});
+
+		let (shutdown_finished, observe_shutdown) = std::sync::mpsc::channel();
+		let shutdown = std::thread::spawn(move || {
+			drop(runtime);
+			let _ = shutdown_finished.send(());
+		});
+		let runtime_stopped = observe_shutdown
+			.recv_timeout(Duration::from_secs(2))
+			.is_ok();
+		if !runtime_stopped {
+			drop(child.take());
+		}
+		shutdown.join().unwrap();
+		assert!(
+			runtime_stopped,
+			"dropping the runtime waited for the canceled child wait"
+		);
+
+		assert!(native.try_wait().unwrap().is_none());
+		drop(child.take());
+		native.kill().unwrap();
+		let _ = wait_native(&mut native);
+	}
+
 	#[tokio::test]
-	async fn dropping_after_a_canceled_wait_releases_the_blocking_task() {
+	async fn dropping_after_a_canceled_wait_releases_the_waiter_thread() {
 		let mut native = spawn_long_running();
 		let mut child = wrap(&native, false);
 		assert!(
@@ -428,7 +578,6 @@ mod tests {
 		drop(child);
 		let error = tokio::time::timeout(Duration::from_secs(5), task)
 			.await
-			.unwrap()
 			.unwrap()
 			.unwrap_err();
 		assert_eq!(error.kind(), io::ErrorKind::Interrupted);
