@@ -118,6 +118,8 @@ Document ConPTY support, its Windows build floor, and the descendant-aware EOF s
 
 ## Recovery and completion sequence
 
+### Task 1: Recover the historical ConPTY stack
+
 Treat the shared command family, exact state, attempt lifecycle, spawn providers, Tokio PTY wrapper, Unix transport, and exact Windows command model as the merged foundation on `main`.
 Recover the unpublished ConPTY work by rebasing its logical commits onto that foundation rather than merging the obsolete branch or reconstructing one squashed change.
 Preserve the feature sequence for executable resolution, dynamic API resolution, named pipes, startup ownership, child ownership, controller ownership, exact process creation, and provider integration.
@@ -137,8 +139,19 @@ Keep the recovered Windows transport split by responsibility:
 - `src/tokio/pty/windows/mod.rs` composes those modules with the existing command and environment preparation.
 - `src/tokio/pty.rs` selects the Windows backend and exposes the public capability queries.
 - `Cargo.toml` enables only the additional Win32 API features required by the transport.
-- `README.md` and crate-level documentation describe Windows support, its runtime floor, and the same ownership and lifecycle contract as the Unix backend.
 
-Add the capability-query API as a focused follow-up commit after the recovered historical series.
-Resolve current-`main` integration gaps in new focused commits rather than folding fixes into the recovered commits.
+### Task 2: Add PTY capability queries
+
+Add `Pty::check_supported() -> io::Result<()>` and `Pty::is_supported() -> bool` in `src/tokio/pty.rs` as side-effect-free associated functions.
+Delegate the provider availability callback to the same check so the public query and spawn path cannot drift.
+Keep size validation, command compatibility, wrapper compatibility, and spawn outcomes outside the capability result.
+
+### Task 3: Complete the Windows support documentation
+
+Update `README.md` and crate-level documentation to describe Windows ConPTY support, its Windows 11 24H2 build 26100 or Windows Server 2025 floor, and the same ownership and lifecycle contract as the Unix backend.
+Document capability queries as the supported way to select PTY conditionally without weakening later validation and spawn errors.
+
+### Task 4: Close the implementation plan
+
+Resolve any current-`main` integration gaps in new focused commits rather than folding fixes into the recovered commits.
 When every implementation promise in this plan is present, remove this plan in a standalone `unplan:` commit.
