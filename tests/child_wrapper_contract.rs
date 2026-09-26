@@ -54,7 +54,9 @@ mod std_frontend {
 
 	use process_wrap::std::ChildWrapper;
 	#[cfg(all(unix, any(feature = "process-group", feature = "process-session")))]
-	use process_wrap::std::{CommandWrap, CommandWrapper};
+	use process_wrap::std::{
+		ChildWrapperLayer, ChildWrapperSlots, CommandWrap, CommandWrapper, PendingChildWrapper,
+	};
 
 	#[derive(Debug)]
 	struct Layer {
@@ -227,36 +229,49 @@ mod std_frontend {
 
 	#[cfg(all(unix, any(feature = "process-group", feature = "process-session")))]
 	#[derive(Debug)]
-	struct MarkerChild(Box<dyn ChildWrapper>);
+	struct MarkerChild(Option<Box<dyn ChildWrapper>>);
+
+	#[cfg(all(unix, any(feature = "process-group", feature = "process-session")))]
+	impl ChildWrapperLayer for MarkerChild {
+		fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+			ChildWrapperSlots::new(&mut self.0)
+		}
+	}
 
 	#[cfg(all(unix, any(feature = "process-group", feature = "process-session")))]
 	impl CommandWrapper for MarkerCommand {
 		fn wrap_child(
 			&mut self,
-			child: Box<dyn ChildWrapper>,
+			_child: &mut dyn ChildWrapper,
 			_core: &CommandWrap,
-		) -> std::io::Result<Box<dyn ChildWrapper>> {
-			Ok(Box::new(MarkerChild(child)))
+		) -> std::io::Result<Option<PendingChildWrapper>> {
+			Ok(Some(PendingChildWrapper::new(MarkerChild(None))))
 		}
 	}
 
 	#[cfg(all(unix, any(feature = "process-group", feature = "process-session")))]
 	impl ChildWrapper for MarkerChild {
 		fn inner(&self) -> &dyn ChildWrapper {
-			self.0.as_ref()
+			self.0
+				.as_deref()
+				.expect("an installed marker layer owns its child")
 		}
 
 		fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-			self.0.as_mut()
+			self.0
+				.as_deref_mut()
+				.expect("an installed marker layer owns its child")
 		}
 
-		fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+		fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
 			self.0
+				.take()
+				.expect("an installed marker layer owns its child")
 		}
 
 		#[cfg(windows)]
 		fn process_handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
-			self.0.process_handle()
+			self.inner().process_handle()
 		}
 	}
 
@@ -555,7 +570,9 @@ mod tokio_frontend {
 
 	use process_wrap::tokio::ChildWrapper;
 	#[cfg(all(unix, any(feature = "process-group", feature = "process-session")))]
-	use process_wrap::tokio::{CommandWrap, CommandWrapper};
+	use process_wrap::tokio::{
+		ChildWrapperLayer, ChildWrapperSlots, CommandWrap, CommandWrapper, PendingChildWrapper,
+	};
 	use tokio::process::{Child, Command};
 
 	#[derive(Debug)]
@@ -729,36 +746,49 @@ mod tokio_frontend {
 
 	#[cfg(all(unix, any(feature = "process-group", feature = "process-session")))]
 	#[derive(Debug)]
-	struct MarkerChild(Box<dyn ChildWrapper>);
+	struct MarkerChild(Option<Box<dyn ChildWrapper>>);
+
+	#[cfg(all(unix, any(feature = "process-group", feature = "process-session")))]
+	impl ChildWrapperLayer for MarkerChild {
+		fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+			ChildWrapperSlots::new(&mut self.0)
+		}
+	}
 
 	#[cfg(all(unix, any(feature = "process-group", feature = "process-session")))]
 	impl CommandWrapper for MarkerCommand {
 		fn wrap_child(
 			&mut self,
-			child: Box<dyn ChildWrapper>,
+			_child: &mut dyn ChildWrapper,
 			_core: &CommandWrap,
-		) -> std::io::Result<Box<dyn ChildWrapper>> {
-			Ok(Box::new(MarkerChild(child)))
+		) -> std::io::Result<Option<PendingChildWrapper>> {
+			Ok(Some(PendingChildWrapper::new(MarkerChild(None))))
 		}
 	}
 
 	#[cfg(all(unix, any(feature = "process-group", feature = "process-session")))]
 	impl ChildWrapper for MarkerChild {
 		fn inner(&self) -> &dyn ChildWrapper {
-			self.0.as_ref()
+			self.0
+				.as_deref()
+				.expect("an installed marker layer owns its child")
 		}
 
 		fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-			self.0.as_mut()
+			self.0
+				.as_deref_mut()
+				.expect("an installed marker layer owns its child")
 		}
 
-		fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+		fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
 			self.0
+				.take()
+				.expect("an installed marker layer owns its child")
 		}
 
 		#[cfg(windows)]
 		fn process_handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
-			self.0.process_handle()
+			self.inner().process_handle()
 		}
 	}
 

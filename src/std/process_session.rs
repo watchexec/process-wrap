@@ -4,7 +4,7 @@ use nix::unistd::Pid;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
-use super::{CommandWrap, CommandWrapper, SpawnAttempt};
+use super::{CommandWrap, CommandWrapper, PendingChildWrapper, SpawnAttempt, core::ChildWrapper};
 
 /// Wrapper which creates a new session and group for the `Command`.
 ///
@@ -30,16 +30,14 @@ impl CommandWrapper for ProcessSession {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
-		mut inner: Box<dyn super::core::ChildWrapper>,
+		inner: &mut dyn ChildWrapper,
 		_core: &CommandWrap,
-	) -> Result<Box<dyn super::core::ChildWrapper>> {
+	) -> Result<Option<PendingChildWrapper>> {
 		let direct_pid = Pid::from_raw(i32::try_from(inner.id()).map_err(Error::other)?);
 		let exit_status = inner.try_wait()?;
 
-		Ok(Box::new(super::ProcessGroupChild::new(
-			inner,
-			direct_pid,
-			exit_status,
+		Ok(Some(PendingChildWrapper::new(
+			super::ProcessGroupChild::detached(direct_pid, exit_status),
 		)))
 	}
 }

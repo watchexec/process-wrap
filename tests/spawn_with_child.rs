@@ -7,25 +7,32 @@ macro_rules! spawn_with_child_tests {
 		$spawn_attempt:path,
 		$command_wrapper:path,
 		$child_wrapper:path,
+		$child_wrapper_layer:path,
+		$child_wrapper_slots:path,
+		$pending_child_wrapper:path,
 		$runtime:expr
 	) => {
 		mod $module {
 			use std::{
 				any::TypeId,
-				io,
+				io::{self, Read},
 				panic::{AssertUnwindSafe, catch_unwind, panic_any},
-				process::{Output, Stdio},
+				process::{ExitStatus, Output, Stdio},
 				sync::{
 					Arc, Mutex,
 					atomic::{AtomicUsize, Ordering},
+					mpsc,
 				},
 				thread::sleep,
 				time::{Duration, Instant},
 			};
 
 			use $child_wrapper as ChildWrapper;
+			use $child_wrapper_layer as ChildWrapperLayer;
+			use $child_wrapper_slots as ChildWrapperSlots;
 			use $command_wrap as CommandWrap;
 			use $command_wrapper as CommandWrapper;
+			use $pending_child_wrapper as PendingChildWrapper;
 			use $spawn_attempt as SpawnAttempt;
 
 			const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,11 +70,11 @@ macro_rules! spawn_with_child_tests {
 
 				fn wrap_child(
 					&mut self,
-					child: Box<dyn ChildWrapper>,
+					_child: &mut dyn ChildWrapper,
 					_core: &CommandWrap,
-				) -> io::Result<Box<dyn ChildWrapper>> {
+				) -> io::Result<Option<PendingChildWrapper>> {
 					self.0.lock().unwrap().push(Event::Wrap("first"));
-					Ok(Box::new(FirstChild(child)))
+					Ok(Some(PendingChildWrapper::new(FirstChild(None))))
 				}
 			}
 
@@ -96,55 +103,69 @@ macro_rules! spawn_with_child_tests {
 
 				fn wrap_child(
 					&mut self,
-					child: Box<dyn ChildWrapper>,
+					_child: &mut dyn ChildWrapper,
 					_core: &CommandWrap,
-				) -> io::Result<Box<dyn ChildWrapper>> {
+				) -> io::Result<Option<PendingChildWrapper>> {
 					self.0.lock().unwrap().push(Event::Wrap("second"));
-					Ok(Box::new(SecondChild(child)))
+					Ok(Some(PendingChildWrapper::new(SecondChild(None))))
 				}
 			}
 
 			#[derive(Debug)]
-			struct FirstChild(Box<dyn ChildWrapper>);
+			struct FirstChild(Option<Box<dyn ChildWrapper>>);
+
+			impl ChildWrapperLayer for FirstChild {
+				fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+					ChildWrapperSlots::new(&mut self.0)
+				}
+			}
 
 			impl ChildWrapper for FirstChild {
 				fn inner(&self) -> &dyn ChildWrapper {
-					self.0.as_ref()
+					self.0.as_deref().expect("the first layer is installed")
 				}
 
 				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-					self.0.as_mut()
+					self.0.as_deref_mut().expect("the first layer is installed")
 				}
 
-				fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-					self.0
+				fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+					self.0.take().expect("the first layer is installed")
 				}
 
 				#[cfg(windows)]
 				fn process_handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
-					self.0.process_handle()
+					self.inner().process_handle()
 				}
 			}
 
 			#[derive(Debug)]
-			struct SecondChild(Box<dyn ChildWrapper>);
+			struct SecondChild(Option<Box<dyn ChildWrapper>>);
+
+			impl ChildWrapperLayer for SecondChild {
+				fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+					ChildWrapperSlots::new(&mut self.0)
+				}
+			}
 
 			impl ChildWrapper for SecondChild {
 				fn inner(&self) -> &dyn ChildWrapper {
-					self.0.as_ref()
+					self.0.as_deref().expect("the second layer is installed")
 				}
 
 				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-					self.0.as_mut()
+					self.0
+						.as_deref_mut()
+						.expect("the second layer is installed")
 				}
 
-				fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-					self.0
+				fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+					self.0.take().expect("the second layer is installed")
 				}
 
 				#[cfg(windows)]
 				fn process_handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
-					self.0.process_handle()
+					self.inner().process_handle()
 				}
 			}
 
@@ -196,22 +217,34 @@ macro_rules! spawn_with_child_tests {
 
 			#[derive(Debug)]
 			struct PanickingLayer {
-				inner: Box<dyn ChildWrapper>,
+				inner: Option<Box<dyn ChildWrapper>>,
 				payload: Option<SecondaryPayload>,
+			}
+
+			impl ChildWrapperLayer for PanickingLayer {
+				fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+					ChildWrapperSlots::new(&mut self.inner)
+				}
 			}
 
 			impl ChildWrapper for PanickingLayer {
 				fn inner(&self) -> &dyn ChildWrapper {
-					self.inner.as_ref()
+					self.inner
+						.as_deref()
+						.expect("the panicking layer is installed")
 				}
 
 				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-					self.inner.as_mut()
+					self.inner
+						.as_deref_mut()
+						.expect("the panicking layer is installed")
 				}
 
 				fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
-					self.payload.take();
-					std::mem::replace(&mut self.inner, Box::new(CustomLeaf))
+					if let Some(payload) = self.payload.take() {
+						std::mem::forget(payload);
+					}
+					self.inner.take().expect("the panicking layer is installed")
 				}
 			}
 
@@ -229,16 +262,15 @@ macro_rules! spawn_with_child_tests {
 			impl CommandWrapper for AddPanickingLayer {
 				fn wrap_child(
 					&mut self,
-					child: Box<dyn ChildWrapper>,
+					_child: &mut dyn ChildWrapper,
 					_command: &CommandWrap,
-				) -> io::Result<Box<dyn ChildWrapper>> {
-					match self.0.lock().unwrap().take() {
-						Some(payload) => Ok(Box::new(PanickingLayer {
-							inner: child,
+				) -> io::Result<Option<PendingChildWrapper>> {
+					Ok(self.0.lock().unwrap().take().map(|payload| {
+						PendingChildWrapper::new(PanickingLayer {
+							inner: None,
 							payload: Some(payload),
-						})),
-						None => Ok(child),
-					}
+						})
+					}))
 				}
 			}
 
@@ -268,19 +300,22 @@ macro_rules! spawn_with_child_tests {
 			impl CommandWrapper for FailWrap {
 				fn wrap_child(
 					&mut self,
-					child: Box<dyn ChildWrapper>,
+					_child: &mut dyn ChildWrapper,
 					_command: &CommandWrap,
-				) -> io::Result<Box<dyn ChildWrapper>> {
-					match self.0.lock().unwrap().take() {
+				) -> io::Result<Option<PendingChildWrapper>> {
+					let failure = self
+						.0
+						.lock()
+						.unwrap_or_else(std::sync::PoisonError::into_inner)
+						.take();
+					match failure {
 						Some(WrapFailure::Error(identity)) => {
-							let _ = child;
 							Err(io::Error::other(WrapIdentityError(identity)))
 						}
 						Some(WrapFailure::Panic(identity)) => {
-							let _ = child;
 							panic_any(WrapIdentityPanic(identity));
 						}
-						None => Ok(child),
+						None => Ok(None),
 					}
 				}
 			}
@@ -339,11 +374,11 @@ macro_rules! spawn_with_child_tests {
 
 				fn wrap_child(
 					&mut self,
-					child: Box<dyn ChildWrapper>,
+					_child: &mut dyn ChildWrapper,
 					_core: &CommandWrap,
-				) -> io::Result<Box<dyn ChildWrapper>> {
+				) -> io::Result<Option<PendingChildWrapper>> {
 					self.visit(Phase::Wrap)?;
-					Ok(child)
+					Ok(None)
 				}
 			}
 
@@ -368,25 +403,91 @@ macro_rules! spawn_with_child_tests {
 				environment: (&str, &str),
 				timeout: Duration,
 			) -> (Output, bool) {
+				const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
 				struct ChildGuard(Option<std::process::Child>);
 
-				impl Drop for ChildGuard {
-					fn drop(&mut self) {
-						if let Some(mut child) = self.0.take() {
-							let _ = child.kill();
-							let _ = child.wait();
+				impl ChildGuard {
+					fn terminate_and_reap(&mut self) -> io::Result<ExitStatus> {
+						let child = self
+							.0
+							.as_mut()
+							.expect("the guarded subprocess remains available");
+						match child.kill() {
+							Ok(()) => {}
+							Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+							Err(error) => return Err(error),
+						}
+						let deadline = Instant::now() + REAP_TIMEOUT;
+						loop {
+							if let Some(status) = child.try_wait()? {
+								return Ok(status);
+							}
+							if Instant::now() >= deadline {
+								return Err(io::Error::new(
+									io::ErrorKind::TimedOut,
+									"isolated wrapping subprocess was not reaped after termination",
+								));
+							}
+							sleep(Duration::from_millis(5));
 						}
 					}
 				}
 
-				let child = std::process::Command::new(std::env::current_exe().unwrap())
+				impl Drop for ChildGuard {
+					fn drop(&mut self) {
+						if self.0.is_some() {
+							let _ = self.terminate_and_reap();
+						}
+					}
+				}
+
+				fn drain_pipe(
+					mut pipe: impl Read + Send + 'static,
+				) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+					let (sender, receiver) = mpsc::channel();
+					std::thread::spawn(move || {
+						let mut bytes = Vec::new();
+						let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+						let _ = sender.send(result);
+					});
+					receiver
+				}
+
+				fn collect_output(
+					status: ExitStatus,
+					stdout: mpsc::Receiver<io::Result<Vec<u8>>>,
+					stderr: mpsc::Receiver<io::Result<Vec<u8>>>,
+				) -> Output {
+					let deadline = Instant::now() + REAP_TIMEOUT;
+					let receive = |receiver: mpsc::Receiver<io::Result<Vec<u8>>>, label| {
+						let remaining = deadline.saturating_duration_since(Instant::now());
+						receiver
+							.recv_timeout(remaining)
+							.unwrap_or_else(|error| {
+								panic!("did not drain isolated {label}: {error}")
+							})
+							.unwrap_or_else(|error| {
+								panic!("could not read isolated {label}: {error}")
+							})
+					};
+					Output {
+						status,
+						stdout: receive(stdout, "stdout"),
+						stderr: receive(stderr, "stderr"),
+					}
+				}
+
+				let mut spawned = std::process::Command::new(std::env::current_exe().unwrap())
 					.args(["--exact", test_name, "--nocapture"])
 					.env(environment.0, environment.1)
 					.stdout(Stdio::piped())
 					.stderr(Stdio::piped())
 					.spawn()
 					.expect("start isolated wrapping regression");
-				let mut child = ChildGuard(Some(child));
+				let stdout = drain_pipe(spawned.stdout.take().expect("capture isolated stdout"));
+				let stderr = drain_pipe(spawned.stderr.take().expect("capture isolated stderr"));
+				let mut child = ChildGuard(Some(spawned));
 				let deadline = Instant::now() + timeout;
 				loop {
 					let status = child
@@ -395,22 +496,16 @@ macro_rules! spawn_with_child_tests {
 						.expect("the subprocess remains guarded while polling")
 						.try_wait()
 						.expect("poll isolated wrapping regression");
-					if status.is_some() {
-						let output = child
-							.0
-							.take()
-							.expect("take completed subprocess")
-							.wait_with_output()
-							.expect("collect isolated wrapping output");
-						return (output, false);
+					if let Some(status) = status {
+						child.0.take();
+						return (collect_output(status, stdout, stderr), false);
 					}
 					if Instant::now() >= deadline {
-						let mut expired = child.0.take().expect("take expired subprocess");
-						let _ = expired.kill();
-						let output = expired
-							.wait_with_output()
-							.expect("reap expired wrapping subprocess");
-						return (output, true);
+						let status = child
+							.terminate_and_reap()
+							.expect("terminate and reap expired wrapping subprocess");
+						child.0.take();
+						return (collect_output(status, stdout, stderr), true);
 					}
 					sleep(Duration::from_millis(5));
 				}
@@ -760,6 +855,9 @@ spawn_with_child_tests!(
 	process_wrap::std::SpawnAttempt,
 	process_wrap::std::CommandWrapper,
 	process_wrap::std::ChildWrapper,
+	process_wrap::std::ChildWrapperLayer,
+	process_wrap::std::ChildWrapperSlots,
+	process_wrap::std::PendingChildWrapper,
 	None
 );
 
@@ -770,6 +868,9 @@ spawn_with_child_tests!(
 	process_wrap::tokio::SpawnAttempt,
 	process_wrap::tokio::CommandWrapper,
 	process_wrap::tokio::ChildWrapper,
+	process_wrap::tokio::ChildWrapperLayer,
+	process_wrap::tokio::ChildWrapperSlots,
+	process_wrap::tokio::PendingChildWrapper,
 	Some(
 		tokio::runtime::Builder::new_current_thread()
 			.enable_all()

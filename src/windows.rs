@@ -139,6 +139,343 @@ mod job_wait_tests {
 	}
 }
 
+#[cfg(test)]
+pub(crate) mod test_support {
+	use std::{
+		cell::RefCell,
+		fs,
+		io::{Error, ErrorKind, Result},
+		os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle},
+		panic::panic_any,
+		path::{Path, PathBuf},
+		process::{Command, Stdio},
+		sync::{
+			Arc, Mutex,
+			atomic::{AtomicUsize, Ordering},
+		},
+		thread::sleep,
+		time::{Duration, Instant},
+	};
+
+	use windows::Win32::{
+		Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+		System::Threading::{
+			OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+			WaitForSingleObject,
+		},
+	};
+
+	use crate::SpawnTransaction;
+
+	pub const DIRECT_HELPER: &str = "windows::test_support::final_owner_direct_child_helper";
+	const DESCENDANT_HELPER: &str = "windows::test_support::final_owner_descendant_helper";
+	const DESCENDANT_PID_ENV: &str = "PROCESS_WRAP_FINAL_OWNER_DESCENDANT_PID";
+	const MARKER_ENV: &str = "PROCESS_WRAP_FINAL_OWNER_MARKER";
+	const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+	const MARKER_DELAY: Duration = Duration::from_millis(750);
+
+	#[derive(Debug)]
+	pub struct OwnerError(pub Arc<()>);
+
+	impl std::fmt::Display for OwnerError {
+		fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+			formatter.write_str("final JobObject owner failed")
+		}
+	}
+
+	impl std::error::Error for OwnerError {}
+
+	#[derive(Debug)]
+	pub struct OwnerPanic(pub Arc<()>);
+
+	pub enum OwnerFailure {
+		Error(Arc<()>),
+		Panic(Arc<()>),
+	}
+
+	thread_local! {
+		static OWNER_FAILURE: RefCell<Option<OwnerFailure>> = const { RefCell::new(None) };
+	}
+
+	pub fn arm_owner_failure(failure: OwnerFailure) {
+		OWNER_FAILURE.with(|slot| {
+			assert!(slot.borrow_mut().replace(failure).is_none());
+		});
+	}
+
+	pub fn fail_final_owner() -> Result<()> {
+		OWNER_FAILURE.with(|slot| match slot.borrow_mut().take() {
+			Some(OwnerFailure::Error(identity)) => Err(Error::other(OwnerError(identity))),
+			Some(OwnerFailure::Panic(identity)) => panic_any(OwnerPanic(identity)),
+			None => Ok(()),
+		})
+	}
+
+	pub fn clear_owner_failure() -> bool {
+		OWNER_FAILURE.with(|slot| slot.borrow_mut().take().is_some())
+	}
+
+	#[derive(Debug)]
+	pub struct ProcessGuard {
+		handle: OwnedHandle,
+		armed: bool,
+	}
+
+	impl ProcessGuard {
+		pub fn open(pid: u32) -> Result<Self> {
+			// SAFETY: the requested rights operate on the process identified by `pid`; success is
+			// immediately converted into an owned handle.
+			let handle =
+				unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, pid) }
+					.map_err(Error::other)?;
+			// SAFETY: `OpenProcess` returned a newly owned process handle.
+			let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+			Ok(Self {
+				handle,
+				armed: true,
+			})
+		}
+
+		pub fn clone_from(handle: BorrowedHandle<'_>) -> Result<Self> {
+			Ok(Self {
+				handle: handle.try_clone_to_owned()?,
+				armed: true,
+			})
+		}
+
+		pub fn disarm(&mut self) {
+			self.armed = false;
+		}
+
+		pub fn wait_for_exit(&mut self, label: &str) -> Result<()> {
+			let deadline = Instant::now() + EXIT_TIMEOUT;
+			loop {
+				// SAFETY: `self.handle` remains live and is used only for a nonblocking wait.
+				match unsafe { WaitForSingleObject(HANDLE(self.handle.as_raw_handle()), 0) } {
+					WAIT_OBJECT_0 => {
+						self.disarm();
+						return Ok(());
+					}
+					WAIT_TIMEOUT if Instant::now() < deadline => {
+						sleep(Duration::from_millis(10));
+					}
+					WAIT_TIMEOUT => {
+						return Err(Error::new(
+							ErrorKind::TimedOut,
+							format!("{label} survived final-owner cleanup"),
+						));
+					}
+					_ => return Err(Error::last_os_error()),
+				}
+			}
+		}
+	}
+
+	impl Drop for ProcessGuard {
+		fn drop(&mut self) {
+			if !self.armed {
+				return;
+			}
+			// SAFETY: this guard owns a live handle with termination and synchronization rights.
+			let _ = unsafe { TerminateProcess(HANDLE(self.handle.as_raw_handle()), 1) };
+			// SAFETY: the same handle remains live; the finite timeout bounds fallback cleanup.
+			let _ = unsafe { WaitForSingleObject(HANDLE(self.handle.as_raw_handle()), 1_000) };
+		}
+	}
+
+	#[derive(Clone, Debug)]
+	pub struct TreePaths {
+		pub descendant_pid: PathBuf,
+		pub marker: PathBuf,
+	}
+
+	impl TreePaths {
+		pub fn new(directory: &Path) -> Self {
+			Self {
+				descendant_pid: directory.join("descendant.pid"),
+				marker: directory.join("delayed-marker"),
+			}
+		}
+
+		pub fn direct_command(&self) -> Result<Command> {
+			let mut command = Command::new(std::env::current_exe()?);
+			command
+				.args(["--exact", DIRECT_HELPER, "--ignored", "--nocapture"])
+				.env(DESCENDANT_PID_ENV, &self.descendant_pid)
+				.env(MARKER_ENV, &self.marker)
+				.stdin(Stdio::null())
+				.stdout(Stdio::null())
+				.stderr(Stdio::null());
+			Ok(command)
+		}
+	}
+
+	#[derive(Debug, Default)]
+	pub struct LifecycleState {
+		pub commits: AtomicUsize,
+		pub rollbacks: AtomicUsize,
+		pub residue_drops: AtomicUsize,
+		pub payload_drops: Arc<AtomicUsize>,
+		pub direct: Mutex<Option<ProcessGuard>>,
+		pub descendant: Mutex<Option<ProcessGuard>>,
+	}
+
+	#[derive(Debug)]
+	struct ResiduePayload(Arc<AtomicUsize>);
+
+	impl Drop for ResiduePayload {
+		fn drop(&mut self) {
+			self.0.fetch_add(1, Ordering::SeqCst);
+			panic_any("a quarantined committed-residue payload was dropped");
+		}
+	}
+
+	#[derive(Debug)]
+	pub struct PanickingCommittedTransaction {
+		state: Arc<LifecycleState>,
+		rollback_guard: Option<ProcessGuard>,
+		committed: bool,
+	}
+
+	impl PanickingCommittedTransaction {
+		pub fn new(state: Arc<LifecycleState>, rollback_guard: ProcessGuard) -> Self {
+			Self {
+				state,
+				rollback_guard: Some(rollback_guard),
+				committed: false,
+			}
+		}
+	}
+
+	impl SpawnTransaction for PanickingCommittedTransaction {
+		fn commit(&mut self) -> Result<()> {
+			self.state.commits.fetch_add(1, Ordering::SeqCst);
+			self.committed = true;
+			if let Some(guard) = self.rollback_guard.as_mut() {
+				guard.disarm();
+			}
+			Ok(())
+		}
+
+		fn rollback(&mut self) -> Result<()> {
+			self.state.rollbacks.fetch_add(1, Ordering::SeqCst);
+			self.rollback_guard.take();
+			Ok(())
+		}
+	}
+
+	impl Drop for PanickingCommittedTransaction {
+		fn drop(&mut self) {
+			if self.committed {
+				self.state.residue_drops.fetch_add(1, Ordering::SeqCst);
+				panic_any(ResiduePayload(Arc::clone(&self.state.payload_drops)));
+			}
+		}
+	}
+
+	pub fn publish_process_guards(
+		state: &Arc<LifecycleState>,
+		handle: BorrowedHandle<'_>,
+	) -> Result<ProcessGuard> {
+		let external = ProcessGuard::clone_from(handle)?;
+		let rollback = ProcessGuard::clone_from(handle)?;
+		*state
+			.direct
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(external);
+		Ok(rollback)
+	}
+
+	pub fn observe_descendant(paths: &TreePaths, state: &Arc<LifecycleState>) -> Result<()> {
+		let deadline = Instant::now() + EXIT_TIMEOUT;
+		let pid = loop {
+			if let Ok(pid) = fs::read_to_string(&paths.descendant_pid)
+				.and_then(|pid| pid.trim().parse().map_err(Error::other))
+			{
+				break pid;
+			}
+			if Instant::now() >= deadline {
+				return Err(Error::new(
+					ErrorKind::TimedOut,
+					"the final-owner descendant did not report its process ID",
+				));
+			}
+			sleep(Duration::from_millis(10));
+		};
+		let guard = ProcessGuard::open(pid)?;
+		*state
+			.descendant
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(guard);
+		Ok(())
+	}
+
+	pub fn assert_tree_terminated(paths: &TreePaths, state: &Arc<LifecycleState>) -> Result<()> {
+		let mut direct = state
+			.direct
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.take()
+			.ok_or_else(|| Error::other("the provider did not publish its direct child handle"))?;
+		let mut descendant = state
+			.descendant
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.take()
+			.ok_or_else(|| Error::other("the hook did not publish its descendant handle"))?;
+		direct.wait_for_exit("the direct child")?;
+		descendant.wait_for_exit("the descendant")?;
+
+		let marker_deadline = Instant::now() + MARKER_DELAY + Duration::from_millis(250);
+		while Instant::now() < marker_deadline {
+			if paths.marker.exists() {
+				return Err(Error::other(
+					"the terminated descendant wrote its delayed marker",
+				));
+			}
+			sleep(Duration::from_millis(10));
+		}
+		if paths.marker.exists() {
+			return Err(Error::other(
+				"the terminated descendant wrote its delayed marker",
+			));
+		}
+		Ok(())
+	}
+
+	#[test]
+	#[ignore = "subprocess helper"]
+	fn final_owner_direct_child_helper() -> Result<()> {
+		let descendant_pid = std::env::var_os(DESCENDANT_PID_ENV)
+			.ok_or_else(|| Error::other("the descendant PID path is missing"))?;
+		let marker = std::env::var_os(MARKER_ENV)
+			.ok_or_else(|| Error::other("the delayed-marker path is missing"))?;
+		let mut descendant = Command::new(std::env::current_exe()?)
+			.args(["--exact", DESCENDANT_HELPER, "--ignored", "--nocapture"])
+			.env(DESCENDANT_PID_ENV, descendant_pid)
+			.env(MARKER_ENV, marker)
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.spawn()?;
+		let _ = descendant.wait()?;
+		Ok(())
+	}
+
+	#[test]
+	#[ignore = "subprocess helper"]
+	fn final_owner_descendant_helper() -> Result<()> {
+		let descendant_pid = std::env::var_os(DESCENDANT_PID_ENV)
+			.ok_or_else(|| Error::other("the descendant PID path is missing"))?;
+		let marker = std::env::var_os(MARKER_ENV)
+			.ok_or_else(|| Error::other("the delayed-marker path is missing"))?;
+		fs::write(descendant_pid, std::process::id().to_string())?;
+		sleep(MARKER_DELAY);
+		fs::File::create(marker)?;
+		Ok(())
+	}
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct JobHandle(pub HANDLE);
 

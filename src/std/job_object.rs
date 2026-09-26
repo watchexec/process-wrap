@@ -24,7 +24,10 @@ use crate::{
 
 #[cfg(feature = "creation-flags")]
 use super::CreationFlags;
-use super::{ChildWrapper, CommandWrap, CommandWrapper, SpawnAttempt};
+use super::{
+	ChildWrapper, ChildWrapperLayer, ChildWrapperSlots, CommandWrap, CommandWrapper,
+	PendingChildWrapper, PreparedChild, SpawnAttempt,
+};
 
 /// Wrapper which creates a job object context for a `Command`.
 ///
@@ -62,7 +65,7 @@ fn terminate_child(child: &mut dyn ChildWrapper) {
 
 #[derive(Debug)]
 struct PreparedJobObject {
-	job_port: JobPort,
+	job_port: Option<JobPort>,
 }
 
 impl JobObject {
@@ -111,7 +114,9 @@ impl JobObject {
 			}
 		}
 
-		Ok(PreparedJobObject { job_port })
+		Ok(PreparedJobObject {
+			job_port: Some(job_port),
+		})
 	}
 }
 
@@ -134,61 +139,81 @@ impl CommandWrapper for JobObject {
 
 	fn wrap_prepared_child(
 		&mut self,
-		inner: Box<dyn ChildWrapper>,
-		prepared: Option<Box<dyn Any + Send>>,
+		_inner: &mut dyn ChildWrapper,
+		prepared: Option<&PreparedChild>,
 		_core: &CommandWrap,
-	) -> Result<Box<dyn ChildWrapper>> {
+	) -> Result<Option<PendingChildWrapper>> {
 		let prepared = prepared.expect("JobObject child preparation always produces state");
-		let prepared = match prepared.downcast::<PreparedJobObject>() {
-			Ok(prepared) => *prepared,
-			Err(_) => unreachable!("JobObject prepared state retains its concrete type"),
-		};
-		Ok(Box::new(JobObjectChild::new(
-			inner,
-			prepared.job_port,
+		assert!(
+			prepared
+				.with::<PreparedJobObject, _>(|prepared| prepared.job_port.is_some())
+				.expect("JobObject prepared state retains its concrete type"),
+			"JobObject prepared state retains its job handles"
+		);
+		Ok(Some(PendingChildWrapper::new(JobObjectChild::detached(
 			false,
-		)))
-	}
-
-	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self, inner)))]
-	fn wrap_child(
-		&mut self,
-		mut inner: Box<dyn ChildWrapper>,
-		core: &CommandWrap,
-	) -> Result<Box<dyn ChildWrapper>> {
-		let prepared = self.prepare_job(inner.as_mut(), core)?;
-		let mut child = JobObjectChild::new(inner, prepared.job_port, false);
-		child.disarm_job_object_layer()?;
-		Ok(Box::new(child))
+		))))
 	}
 }
 
 /// Wrapper for `Child` which waits on all processes within the job.
 #[derive(Debug)]
 pub struct JobObjectChild {
-	inner: Box<dyn ChildWrapper>,
+	inner: Option<Box<dyn ChildWrapper>>,
+	prepared: Option<PreparedChild>,
 	exit_status: ChildExitStatus,
 	job_drained: bool,
-	job_port: JobPort,
 	final_kill_on_drop: bool,
 	spawn_finalized: bool,
 }
 
 impl JobObjectChild {
-	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(job_port)))]
-	pub(crate) fn new(
-		inner: Box<dyn ChildWrapper>,
-		job_port: JobPort,
-		final_kill_on_drop: bool,
-	) -> Self {
+	pub(crate) fn detached(final_kill_on_drop: bool) -> Self {
 		Self {
-			inner,
+			inner: None,
+			prepared: None,
 			exit_status: ChildExitStatus::Running,
 			job_drained: false,
-			job_port,
 			final_kill_on_drop,
 			spawn_finalized: false,
 		}
+	}
+
+	fn inner_ref(&self) -> &dyn ChildWrapper {
+		self.inner
+			.as_deref()
+			.expect("an installed JobObject layer owns its child")
+	}
+
+	fn inner_mut_ref(&mut self) -> &mut dyn ChildWrapper {
+		self.inner
+			.as_deref_mut()
+			.expect("an installed JobObject layer owns its child")
+	}
+
+	fn prepared(&self) -> &PreparedChild {
+		self.prepared
+			.as_ref()
+			.expect("an installed JobObject layer owns its prepared state")
+	}
+
+	fn with_job_port<R>(&self, inspect: impl FnOnce(&JobPort) -> R) -> R {
+		self.prepared()
+			.with::<PreparedJobObject, _>(|prepared| {
+				inspect(
+					prepared
+						.job_port
+						.as_ref()
+						.expect("the installed JobObject layer retains its job handles"),
+				)
+			})
+			.expect("JobObject prepared state retains its concrete type")
+	}
+}
+
+impl ChildWrapperLayer for JobObjectChild {
+	fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+		ChildWrapperSlots::new(&mut self.inner).with_prepared(&mut self.prepared)
 	}
 }
 
@@ -228,63 +253,83 @@ fn wait_for_exit_and_job_drain_with(
 
 impl ChildWrapper for JobObjectChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		self.inner.as_ref()
+		self.inner_ref()
 	}
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		self.inner.as_mut()
+		self.inner_mut_ref()
 	}
-	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-		let Self {
-			inner,
-			job_port,
-			final_kill_on_drop,
-			spawn_finalized,
-			..
-		} = *self;
-		if spawn_finalized && final_kill_on_drop {
-			// manually drop the completion port
-			let its = std::mem::ManuallyDrop::new(job_port);
-			// SAFETY: `its` owns the completion-port handle and suppresses `JobPort::drop`.
-			unsafe { CloseHandle(HANDLE(its.completion_port.as_raw_handle())) }.ok();
-			// we leave the job handle unclosed, otherwise the Child is useless
-			// (as closing it may terminate the job)
+	fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+		let inner = self
+			.inner
+			.take()
+			.expect("an installed JobObject layer owns its child");
+		if self.spawn_finalized && self.final_kill_on_drop {
+			self.prepared()
+				.with_mut::<PreparedJobObject, _>(|prepared| {
+					let job_port = prepared
+						.job_port
+						.take()
+						.expect("the installed JobObject layer retains its job handles");
+					// Manually close the completion port while retaining the job handle. Closing a
+					// kill-on-close job here would make the extracted child unusable.
+					let job_port = std::mem::ManuallyDrop::new(job_port);
+					// SAFETY: `job_port` owns the completion-port handle and suppresses `JobPort::drop`.
+					unsafe { CloseHandle(HANDLE(job_port.completion_port.as_raw_handle())) }.ok();
+				})
+				.expect("JobObject prepared state retains its concrete type");
 		}
-		// Before spawn finalization, dropping the still-armed job instead guarantees that removing this
-		// layer cannot let descendants escape a later lifecycle failure.
+		// Before spawn finalization, dropping the still-armed prepared job instead guarantees that
+		// removing this layer cannot let descendants escape a later lifecycle failure.
 
 		inner
 	}
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
-		self.inner.try_process_handle()
+		self.inner_ref().try_process_handle()
 	}
 	fn owns_job_object_cleanup_layer(&self) -> bool {
 		true
 	}
 	fn disarm_job_object_layer(&mut self) -> Result<()> {
-		set_job_kill_on_drop(self.job_port.job, self.final_kill_on_drop)?;
+		#[cfg(test)]
+		crate::windows::test_support::fail_final_owner()?;
+		let final_kill_on_drop = self.final_kill_on_drop;
+		self.with_job_port(|job_port| set_job_kill_on_drop(job_port.job, final_kill_on_drop))?;
 		self.spawn_finalized = true;
 		Ok(())
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn start_kill(&mut self) -> Result<()> {
-		terminate_job(self.job_port.job, 1)
+		self.with_job_port(|job_port| terminate_job(job_port.job, 1))
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wait(&mut self) -> Result<ExitStatus> {
+		let prepared = self.prepared().clone();
 		let Self {
 			inner,
 			exit_status,
 			job_drained,
-			job_port,
 			..
 		} = self;
+		let inner = inner
+			.as_deref_mut()
+			.expect("an installed JobObject layer owns its child");
 		wait_for_exit_and_job_drain_with(
 			exit_status,
 			job_drained,
 			|| inner.wait(),
-			|timeout| poll_job_drain(job_port.job, job_port.completion_port.as_handle(), timeout),
+			|timeout| {
+				prepared
+					.with::<PreparedJobObject, _>(|prepared| {
+						let job_port = prepared
+							.job_port
+							.as_ref()
+							.expect("the installed JobObject layer retains its job handles");
+						poll_job_drain(job_port.job, job_port.completion_port.as_handle(), timeout)
+					})
+					.expect("JobObject prepared state retains its concrete type")
+			},
 			Instant::now,
 			std::thread::sleep,
 			|_| {},
@@ -294,19 +339,22 @@ impl ChildWrapper for JobObjectChild {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
 		if matches!(self.exit_status, ChildExitStatus::Running) {
-			let Some(status) = self.inner.try_wait()? else {
+			let Some(status) = self.inner_mut_ref().try_wait()? else {
 				return Ok(None);
 			};
 			self.exit_status = ChildExitStatus::Exited(status);
 		}
 
 		if !self.job_drained
-			&& poll_job_drain(
-				self.job_port.job,
-				self.job_port.completion_port.as_handle(),
-				Duration::ZERO,
-			)?
-			.is_break()
+			&& self
+				.with_job_port(|job_port| {
+					poll_job_drain(
+						job_port.job,
+						job_port.completion_port.as_handle(),
+						Duration::ZERO,
+					)
+				})?
+				.is_break()
 		{
 			self.job_drained = true;
 		}
@@ -322,12 +370,160 @@ impl ChildWrapper for JobObjectChild {
 mod tests {
 	use std::{
 		cell::{Cell, RefCell},
-		os::windows::process::ExitStatusExt,
-		sync::mpsc,
+		os::windows::{io::AsHandle, process::CommandExt, process::ExitStatusExt},
+		panic::{AssertUnwindSafe, catch_unwind},
+		sync::{Arc, atomic::Ordering, mpsc},
 		thread,
 	};
 
+	use windows::Win32::System::Threading::CREATE_SUSPENDED;
+
+	use crate::std::{ProviderProduct, SpawnProvider};
+	use crate::windows::test_support::{
+		LifecycleState, OwnerError, OwnerFailure, OwnerPanic, PanickingCommittedTransaction,
+		TreePaths, arm_owner_failure, assert_tree_terminated, clear_owner_failure,
+		observe_descendant, publish_process_guards,
+	};
+
 	use super::*;
+
+	#[derive(Debug)]
+	struct TreeProvider {
+		paths: TreePaths,
+		state: Arc<LifecycleState>,
+	}
+
+	impl SpawnProvider for TreeProvider {
+		fn spawn(
+			&self,
+			attempt: &mut SpawnAttempt,
+			_command: &CommandWrap,
+		) -> Result<ProviderProduct> {
+			let policy = attempt.windows_spawn_policy();
+			assert!(policy.has_job_object());
+			assert!(policy.is_temporarily_suspended());
+			let mut command = self.paths.direct_command()?;
+			command.creation_flags(CREATE_SUSPENDED.0);
+			let child = command.spawn()?;
+			let rollback_guard = publish_process_guards(&self.state, child.as_handle())?;
+			Ok(ProviderProduct::new(
+				Box::new(child),
+				Box::new(PanickingCommittedTransaction::new(
+					Arc::clone(&self.state),
+					rollback_guard,
+				)),
+			))
+		}
+	}
+
+	#[derive(Debug)]
+	struct TreeProviderWrapper(TreeProvider);
+
+	impl CommandWrapper for TreeProviderWrapper {
+		fn spawn_provider(&self) -> Option<&dyn SpawnProvider> {
+			Some(&self.0)
+		}
+	}
+
+	#[derive(Debug)]
+	struct ObserveTree {
+		paths: TreePaths,
+		state: Arc<LifecycleState>,
+	}
+
+	impl CommandWrapper for ObserveTree {
+		fn post_spawn(
+			&mut self,
+			_attempt: &mut SpawnAttempt,
+			_child: &mut dyn ChildWrapper,
+			_command: &CommandWrap,
+		) -> Result<()> {
+			observe_descendant(&self.paths, &self.state)
+		}
+	}
+
+	fn primary_owner_failure_preserved(
+		outcome: std::thread::Result<Result<Box<dyn ChildWrapper>>>,
+		identity: &Arc<()>,
+		was_panic: bool,
+	) -> bool {
+		if was_panic {
+			let payload = match outcome {
+				Err(payload) => payload,
+				Ok(_) => return false,
+			};
+			match payload.downcast::<OwnerPanic>() {
+				Ok(payload) => Arc::ptr_eq(&payload.0, identity),
+				Err(secondary) => {
+					std::mem::forget(secondary);
+					false
+				}
+			}
+		} else {
+			let result = match outcome {
+				Ok(result) => result,
+				Err(secondary) => {
+					std::mem::forget(secondary);
+					return false;
+				}
+			};
+			let error = match result {
+				Err(error) => error,
+				Ok(_) => return false,
+			};
+			error
+				.get_ref()
+				.and_then(|error| error.downcast_ref::<OwnerError>())
+				.is_some_and(|error| Arc::ptr_eq(&error.0, identity))
+		}
+	}
+
+	#[test]
+	fn final_owner_failures_terminate_the_real_job_tree_and_preserve_identity() -> Result<()> {
+		for was_panic in [false, true] {
+			let directory = tempfile::tempdir()?;
+			let paths = TreePaths::new(directory.path());
+			let state = Arc::new(LifecycleState::default());
+			let identity = Arc::new(());
+			let failure = if was_panic {
+				OwnerFailure::Panic(Arc::clone(&identity))
+			} else {
+				OwnerFailure::Error(Arc::clone(&identity))
+			};
+			arm_owner_failure(failure);
+
+			let mut command = CommandWrap::new("provider-owned-program");
+			command
+				.wrap(JobObject)
+				.wrap(ObserveTree {
+					paths: paths.clone(),
+					state: Arc::clone(&state),
+				})
+				.wrap(TreeProviderWrapper(TreeProvider {
+					paths: paths.clone(),
+					state: Arc::clone(&state),
+				}));
+			let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
+			let failure_was_not_consumed = clear_owner_failure();
+			let primary_preserved = primary_owner_failure_preserved(outcome, &identity, was_panic);
+			let tree_result = assert_tree_terminated(&paths, &state);
+
+			assert!(
+				!failure_was_not_consumed,
+				"the final owner hook did not run"
+			);
+			assert!(
+				primary_preserved,
+				"cleanup replaced the final owner failure"
+			);
+			assert_eq!(state.commits.load(Ordering::SeqCst), 1);
+			assert_eq!(state.rollbacks.load(Ordering::SeqCst), 0);
+			assert_eq!(state.residue_drops.load(Ordering::SeqCst), 1);
+			assert_eq!(state.payload_drops.load(Ordering::SeqCst), 0);
+			tree_result?;
+		}
+		Ok(())
+	}
 
 	#[test]
 	fn sustained_nonterminal_wakes_preserve_poll_cadence() -> Result<()> {

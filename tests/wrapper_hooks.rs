@@ -8,6 +8,7 @@ macro_rules! wrapper_hook_tests {
 		$spawn_attempt:path,
 		$command_wrapper:path,
 		$child_wrapper:path,
+		$pending_child_wrapper:path,
 		$runtime:expr
 	) => {
 		mod $module {
@@ -23,6 +24,7 @@ macro_rules! wrapper_hook_tests {
 			use $child_wrapper as ChildWrapper;
 			use $command_wrap as CommandWrap;
 			use $command_wrapper as CommandWrapper;
+			use $pending_child_wrapper as PendingChildWrapper;
 			use $spawn_attempt as SpawnAttempt;
 
 			const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -76,11 +78,11 @@ macro_rules! wrapper_hook_tests {
 
 				fn wrap_child(
 					&mut self,
-					child: Box<dyn ChildWrapper>,
+					_child: &mut dyn ChildWrapper,
 					core: &CommandWrap,
-				) -> io::Result<Box<dyn ChildWrapper>> {
+				) -> io::Result<Option<PendingChildWrapper>> {
 					self.observe(Phase::Wrap, core);
-					Ok(child)
+					Ok(None)
 				}
 			}
 
@@ -119,11 +121,11 @@ macro_rules! wrapper_hook_tests {
 
 				fn wrap_child(
 					&mut self,
-					child: Box<dyn ChildWrapper>,
+					_child: &mut dyn ChildWrapper,
 					core: &CommandWrap,
-				) -> io::Result<Box<dyn ChildWrapper>> {
+				) -> io::Result<Option<PendingChildWrapper>> {
 					self.observe(Phase::Wrap, core);
-					Ok(child)
+					Ok(None)
 				}
 			}
 
@@ -191,11 +193,11 @@ macro_rules! wrapper_hook_tests {
 
 				fn wrap_child(
 					&mut self,
-					child: Box<dyn ChildWrapper>,
+					_child: &mut dyn ChildWrapper,
 					core: &CommandWrap,
-				) -> io::Result<Box<dyn ChildWrapper>> {
+				) -> io::Result<Option<PendingChildWrapper>> {
 					self.visit(Phase::Wrap, core)?;
-					Ok(child)
+					Ok(None)
 				}
 			}
 
@@ -234,11 +236,11 @@ macro_rules! wrapper_hook_tests {
 
 				fn wrap_child(
 					&mut self,
-					child: Box<dyn ChildWrapper>,
+					_child: &mut dyn ChildWrapper,
 					core: &CommandWrap,
-				) -> io::Result<Box<dyn ChildWrapper>> {
+				) -> io::Result<Option<PendingChildWrapper>> {
 					self.observe(Phase::Wrap, core);
-					Ok(child)
+					Ok(None)
 				}
 			}
 
@@ -427,6 +429,7 @@ wrapper_hook_tests!(
 	process_wrap::std::SpawnAttempt,
 	process_wrap::std::CommandWrapper,
 	process_wrap::std::ChildWrapper,
+	process_wrap::std::PendingChildWrapper,
 	None
 );
 
@@ -438,6 +441,7 @@ wrapper_hook_tests!(
 	process_wrap::tokio::SpawnAttempt,
 	process_wrap::tokio::CommandWrapper,
 	process_wrap::tokio::ChildWrapper,
+	process_wrap::tokio::PendingChildWrapper,
 	Some(
 		tokio::runtime::Builder::new_current_thread()
 			.enable_all()

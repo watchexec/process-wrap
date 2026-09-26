@@ -26,8 +26,9 @@ use process_wrap::tokio::JobObject;
 #[cfg(feature = "kill-on-drop")]
 use process_wrap::tokio::KillOnDrop;
 use process_wrap::tokio::{
-	ChildWrapper, Command, CommandWrapper, ProviderProduct, Pty, PtyController, PtyOutput, PtySize,
-	SpawnAttempt, SpawnProvider,
+	ChildWrapper, ChildWrapperLayer, ChildWrapperSlots, Command, CommandWrapper,
+	PendingChildWrapper, ProviderProduct, Pty, PtyController, PtyOutput, PtySize, SpawnAttempt,
+	SpawnProvider,
 };
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
@@ -1229,22 +1230,34 @@ fn fail_lifecycle<T>(failure: LifecycleFailure) -> io::Result<T> {
 
 #[derive(Debug)]
 struct FailFinalizationChild {
-	inner: Box<dyn ChildWrapper>,
+	inner: Option<Box<dyn ChildWrapper>>,
 	failure: LifecycleFailure,
 	stage: LifecycleStage,
 }
 
+impl ChildWrapperLayer for FailFinalizationChild {
+	fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+		ChildWrapperSlots::new(&mut self.inner)
+	}
+}
+
 impl ChildWrapper for FailFinalizationChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		self.inner.as_ref()
+		self.inner
+			.as_deref()
+			.expect("an installed finalization layer owns its child")
 	}
 
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		self.inner.as_mut()
+		self.inner
+			.as_deref_mut()
+			.expect("an installed finalization layer owns its child")
 	}
 
-	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+	fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
 		self.inner
+			.take()
+			.expect("an installed finalization layer owns its child")
 	}
 
 	fn finalize_spawn_layer(&mut self) -> io::Result<()> {
@@ -1308,22 +1321,22 @@ impl CommandWrapper for FailLifecycleOnce {
 
 	fn wrap_child(
 		&mut self,
-		mut child: Box<dyn ChildWrapper>,
+		child: &mut dyn ChildWrapper,
 		_command: &Command,
-	) -> io::Result<Box<dyn ChildWrapper>> {
+	) -> io::Result<Option<PendingChildWrapper>> {
 		if self.failed || self.stage == LifecycleStage::PostSpawn {
-			return Ok(child);
+			return Ok(None);
 		}
-		self.capture(child.as_mut())?;
+		self.capture(child)?;
 		self.failed = true;
 		if self.stage == LifecycleStage::WrapChild {
 			fail_lifecycle(self.failure)
 		} else {
-			Ok(Box::new(FailFinalizationChild {
-				inner: child,
+			Ok(Some(PendingChildWrapper::new(FailFinalizationChild {
+				inner: None,
 				failure: self.failure,
 				stage: self.stage,
-			}))
+			})))
 		}
 	}
 }
@@ -1527,19 +1540,31 @@ async fn non_pty_children_have_no_controller() -> io::Result<()> {
 }
 
 #[derive(Debug)]
-struct TransparentChild(Box<dyn ChildWrapper>);
+struct TransparentChild(Option<Box<dyn ChildWrapper>>);
+
+impl ChildWrapperLayer for TransparentChild {
+	fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+		ChildWrapperSlots::new(&mut self.0)
+	}
+}
 
 impl ChildWrapper for TransparentChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		self.0.as_ref()
+		self.0
+			.as_deref()
+			.expect("an installed transparent layer owns its child")
 	}
 
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		self.0.as_mut()
+		self.0
+			.as_deref_mut()
+			.expect("an installed transparent layer owns its child")
 	}
 
-	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+	fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
 		self.0
+			.take()
+			.expect("an installed transparent layer owns its child")
 	}
 }
 
@@ -1563,12 +1588,12 @@ impl CommandWrapper for ObserveControllerLifecycle {
 
 	fn wrap_child(
 		&mut self,
-		mut child: Box<dyn ChildWrapper>,
+		child: &mut dyn ChildWrapper,
 		_command: &Command,
-	) -> io::Result<Box<dyn ChildWrapper>> {
+	) -> io::Result<Option<PendingChildWrapper>> {
 		assert!(child.take_pty_controller().is_none());
 		self.wrap_child.store(true, Ordering::SeqCst);
-		Ok(Box::new(TransparentChild(child)))
+		Ok(Some(PendingChildWrapper::new(TransparentChild(None))))
 	}
 }
 

@@ -14,7 +14,10 @@ use tracing::instrument;
 
 use crate::{ChildExitStatus, unix::ProcessGroupTarget};
 
-use super::{ChildWrapper, CommandWrap, CommandWrapper, SpawnAttempt};
+use super::{
+	ChildWrapper, ChildWrapperLayer, ChildWrapperSlots, CommandWrap, CommandWrapper,
+	PendingChildWrapper, SpawnAttempt,
+};
 
 /// Wrapper which sets the process group of a `Command`.
 ///
@@ -60,23 +63,30 @@ impl ProcessGroup {
 /// unrelated group.
 #[derive(Debug)]
 pub struct ProcessGroupChild {
-	inner: Box<dyn ChildWrapper>,
+	inner: Option<Box<dyn ChildWrapper>>,
 	exit_status: ChildExitStatus,
 	pgid: Pid,
 }
 
 impl ProcessGroupChild {
-	#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
-	pub(crate) fn new(
-		inner: Box<dyn ChildWrapper>,
-		pgid: Pid,
-		exit_status: Option<ExitStatus>,
-	) -> Self {
+	pub(crate) fn detached(pgid: Pid, exit_status: Option<ExitStatus>) -> Self {
 		Self {
-			inner,
+			inner: None,
 			exit_status: exit_status.map_or(ChildExitStatus::Running, ChildExitStatus::Exited),
 			pgid,
 		}
+	}
+
+	fn inner_ref(&self) -> &dyn ChildWrapper {
+		self.inner
+			.as_deref()
+			.expect("an installed process-group layer owns its child")
+	}
+
+	fn inner_mut_ref(&mut self) -> &mut dyn ChildWrapper {
+		self.inner
+			.as_deref_mut()
+			.expect("an installed process-group layer owns its child")
 	}
 
 	/// Get the process group ID of this child process.
@@ -96,9 +106,9 @@ impl CommandWrapper for ProcessGroup {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wrap_child(
 		&mut self,
-		mut inner: Box<dyn ChildWrapper>,
+		inner: &mut dyn ChildWrapper,
 		_core: &CommandWrap,
-	) -> Result<Box<dyn ChildWrapper>> {
+	) -> Result<Option<PendingChildWrapper>> {
 		let mut direct_id = inner.id();
 		#[cfg(feature = "pty")]
 		if direct_id.is_none() {
@@ -119,37 +129,49 @@ impl CommandWrapper for ProcessGroup {
 		};
 		let exit_status = inner.try_wait()?;
 
-		Ok(Box::new(ProcessGroupChild::new(inner, pgid, exit_status)))
+		Ok(Some(PendingChildWrapper::new(ProcessGroupChild::detached(
+			pgid,
+			exit_status,
+		))))
 	}
 }
 
 impl ProcessGroupChild {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn signal_imp(&self, sig: Signal) -> Result<()> {
-		if matches!(self.exit_status, ChildExitStatus::Exited(_)) || self.inner.id().is_none() {
+		if matches!(self.exit_status, ChildExitStatus::Exited(_)) || self.inner_ref().id().is_none()
+		{
 			return Ok(());
 		}
 		killpg(self.pgid, sig).map_err(Error::from)
 	}
 }
 
+impl ChildWrapperLayer for ProcessGroupChild {
+	fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+		ChildWrapperSlots::new(&mut self.inner)
+	}
+}
+
 impl ChildWrapper for ProcessGroupChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		self.inner.as_ref()
+		self.inner_ref()
 	}
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		self.inner.as_mut()
+		self.inner_mut_ref()
 	}
-	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+	fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
 		self.inner
+			.take()
+			.expect("an installed process-group layer owns its child")
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn start_kill(&mut self) -> Result<()> {
-		if matches!(self.exit_status, ChildExitStatus::Running) {
-			if let Some(status) = self.inner.try_wait()? {
-				self.exit_status = ChildExitStatus::Exited(status);
-			}
+		if matches!(self.exit_status, ChildExitStatus::Running)
+			&& let Some(status) = self.inner_mut_ref().try_wait()?
+		{
+			self.exit_status = ChildExitStatus::Exited(status);
 		}
 		self.signal_imp(Signal::SIGKILL)
 	}
@@ -159,7 +181,7 @@ impl ChildWrapper for ProcessGroupChild {
 		Box::pin(async {
 			match self.exit_status {
 				ChildExitStatus::Running => {
-					let status = self.inner.wait().await?;
+					let status = self.inner_mut_ref().wait().await?;
 					self.exit_status = ChildExitStatus::Exited(status);
 					Ok(status)
 				}
@@ -172,7 +194,7 @@ impl ChildWrapper for ProcessGroupChild {
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
 		match self.exit_status {
 			ChildExitStatus::Running => {
-				let status = self.inner.try_wait()?;
+				let status = self.inner_mut_ref().try_wait()?;
 				if let Some(status) = status {
 					self.exit_status = ChildExitStatus::Exited(status);
 				}

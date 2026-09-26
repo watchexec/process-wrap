@@ -8,7 +8,7 @@ use std::{
 	path::{Path, PathBuf},
 	process::{Command, Command as StdCommand, ExitStatus},
 	sync::{
-		Arc,
+		Arc, Mutex,
 		atomic::{AtomicBool, AtomicUsize, Ordering},
 		mpsc,
 	},
@@ -89,25 +89,78 @@ fn opaque_child() -> (
 }
 
 #[derive(Debug)]
+struct NoopTransaction;
+
+impl SpawnTransaction for NoopTransaction {
+	fn commit(&mut self) -> Result<()> {
+		Ok(())
+	}
+
+	fn rollback(&mut self) -> Result<()> {
+		Ok(())
+	}
+}
+
+#[derive(Debug)]
+struct OpaqueProvider(Mutex<Option<Box<dyn ChildWrapper>>>);
+
+impl SpawnProvider for OpaqueProvider {
+	fn spawn(
+		&self,
+		_attempt: &mut SpawnAttempt,
+		_command: &CommandWrap,
+	) -> Result<ProviderProduct> {
+		let child = self
+			.0
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.take()
+			.expect("the opaque provider is used once");
+		Ok(ProviderProduct::new(child, Box::new(NoopTransaction)))
+	}
+}
+
+#[derive(Debug)]
+struct OpaqueProviderWrapper(OpaqueProvider);
+
+impl CommandWrapper for OpaqueProviderWrapper {
+	fn spawn_provider(&self) -> Option<&dyn SpawnProvider> {
+		Some(&self.0)
+	}
+}
+
+#[derive(Debug)]
 struct TransparentChild {
-	inner: Box<dyn ChildWrapper>,
+	inner: Option<Box<dyn ChildWrapper>>,
+}
+
+impl ChildWrapperLayer for TransparentChild {
+	fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+		ChildWrapperSlots::new(&mut self.inner)
+	}
 }
 
 impl ChildWrapper for TransparentChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		self.inner.as_ref()
+		self.inner
+			.as_deref()
+			.expect("an installed transparent layer owns its child")
 	}
 
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		self.inner.as_mut()
+		self.inner
+			.as_deref_mut()
+			.expect("an installed transparent layer owns its child")
 	}
 
-	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+	fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
 		self.inner
+			.take()
+			.expect("an installed transparent layer owns its child")
 	}
 
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
-		self.inner.process_handle()
+		self.inner().process_handle()
 	}
 }
 
@@ -117,29 +170,43 @@ struct Transparent;
 impl CommandWrapper for Transparent {
 	fn wrap_child(
 		&mut self,
-		child: Box<dyn ChildWrapper>,
+		_child: &mut dyn ChildWrapper,
 		_core: &CommandWrap,
-	) -> Result<Box<dyn ChildWrapper>> {
-		Ok(Box::new(TransparentChild { inner: child }))
+	) -> Result<Option<PendingChildWrapper>> {
+		Ok(Some(PendingChildWrapper::new(TransparentChild {
+			inner: None,
+		})))
 	}
 }
 
 #[derive(Debug)]
 struct LegacyTransparentChild {
-	inner: Box<dyn ChildWrapper>,
+	inner: Option<Box<dyn ChildWrapper>>,
+}
+
+impl ChildWrapperLayer for LegacyTransparentChild {
+	fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+		ChildWrapperSlots::new(&mut self.inner)
+	}
 }
 
 impl ChildWrapper for LegacyTransparentChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		self.inner.as_ref()
+		self.inner
+			.as_deref()
+			.expect("an installed legacy layer owns its child")
 	}
 
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		self.inner.as_mut()
+		self.inner
+			.as_deref_mut()
+			.expect("an installed legacy layer owns its child")
 	}
 
-	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+	fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
 		self.inner
+			.take()
+			.expect("an installed legacy layer owns its child")
 	}
 }
 
@@ -254,28 +321,42 @@ struct LegacyTransparent;
 impl CommandWrapper for LegacyTransparent {
 	fn wrap_child(
 		&mut self,
-		child: Box<dyn ChildWrapper>,
+		_child: &mut dyn ChildWrapper,
 		_core: &CommandWrap,
-	) -> Result<Box<dyn ChildWrapper>> {
-		Ok(Box::new(LegacyTransparentChild { inner: child }))
+	) -> Result<Option<PendingChildWrapper>> {
+		Ok(Some(PendingChildWrapper::new(LegacyTransparentChild {
+			inner: None,
+		})))
 	}
 }
 
 #[repr(transparent)]
 #[derive(Debug)]
-struct LegacyInlineChild(std::process::Child);
+struct LegacyInlineChild(Option<Box<dyn ChildWrapper>>);
+
+impl ChildWrapperLayer for LegacyInlineChild {
+	fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+		ChildWrapperSlots::new(&mut self.0)
+	}
+}
 
 impl ChildWrapper for LegacyInlineChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		&self.0
+		self.0
+			.as_deref()
+			.expect("an installed legacy layer owns its child")
 	}
 
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		&mut self.0
+		self.0
+			.as_deref_mut()
+			.expect("an installed legacy layer owns its child")
 	}
 
-	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-		Box::new(self.0)
+	fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+		self.0
+			.take()
+			.expect("an installed legacy layer owns its child")
 	}
 }
 
@@ -285,13 +366,10 @@ struct LegacyInline;
 impl CommandWrapper for LegacyInline {
 	fn wrap_child(
 		&mut self,
-		child: Box<dyn ChildWrapper>,
+		_child: &mut dyn ChildWrapper,
 		_core: &CommandWrap,
-	) -> Result<Box<dyn ChildWrapper>> {
-		// SAFETY: `LegacyInline` adds no cleanup or supervision state.
-		let child = unsafe { child.try_into_inner_child() }
-			.map_err(|_| std::io::Error::other("legacy inline wrapper expected a native child"))?;
-		Ok(Box::new(LegacyInlineChild(child)))
+	) -> Result<Option<PendingChildWrapper>> {
+		Ok(Some(PendingChildWrapper::new(LegacyInlineChild(None))))
 	}
 }
 
@@ -317,8 +395,13 @@ fn opaque_child_defaults_to_no_process_handle_without_traversing() {
 #[test]
 fn job_object_rejects_an_opaque_child_and_cleans_it_up() {
 	let (child, inner_calls, killed, waited) = opaque_child();
-	let core = CommandWrap::with_new("cmd.exe", |_| {});
-	let error = JobObject.wrap_child(child, &core).unwrap_err();
+	let mut command = CommandWrap::new("provider-owned-program");
+	command
+		.wrap(JobObject)
+		.wrap(OpaqueProviderWrapper(OpaqueProvider(Mutex::new(Some(
+			child,
+		)))));
+	let error = command.spawn().unwrap_err();
 
 	assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 	assert_eq!(inner_calls.load(Ordering::SeqCst), 1);
@@ -334,7 +417,7 @@ fn transparent_child_delegates_the_native_process_handle() -> Result<()> {
 		.expect("a native child exposes its process handle")
 		.as_raw_handle();
 	let mut child: Box<dyn ChildWrapper> = Box::new(TransparentChild {
-		inner: Box::new(native),
+		inner: Some(Box::new(native)),
 	});
 	let delegated_handle = child
 		.process_handle()
@@ -371,10 +454,18 @@ fn job_object_finds_terminal_capabilities_below_multiple_legacy_layers() -> Resu
 		resumes: Arc::clone(&resumes),
 	});
 	let child: Box<dyn ChildWrapper> = Box::new(LegacyTransparentChild {
-		inner: Box::new(LegacyTransparentChild { inner: terminal }),
+		inner: Some(Box::new(LegacyTransparentChild {
+			inner: Some(terminal),
+		})),
 	});
-	let core = CommandWrap::new("cmd.exe");
-	let mut child = JobObject.wrap_child(child, &core)?;
+	let mut child = Some(child);
+	let mut command = CommandWrap::new("cmd.exe");
+	command.wrap(JobObject);
+	let mut child = command.spawn_with_child(|_| {
+		Ok(child
+			.take()
+			.expect("the custom spawner is invoked exactly once"))
+	})?;
 
 	assert_eq!(resumes.load(Ordering::SeqCst), 1);
 	assert!(child.process_handle().is_some());

@@ -94,6 +94,210 @@ macro_rules! Wrap {
 			}
 		}
 
+		#[cfg(windows)]
+		#[doc(hidden)]
+		#[derive(Clone)]
+		pub struct PreparedChild {
+			value: ::std::sync::Arc<
+				::std::sync::Mutex<Option<Box<dyn ::std::any::Any + Send>>>,
+			>,
+		}
+
+		#[cfg(windows)]
+		impl ::std::fmt::Debug for PreparedChild {
+			fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+				formatter.debug_struct("PreparedChild").finish_non_exhaustive()
+			}
+		}
+
+		#[cfg(windows)]
+		impl PreparedChild {
+			fn new(value: Box<dyn ::std::any::Any + Send>) -> Self {
+				Self {
+					value: ::std::sync::Arc::new(::std::sync::Mutex::new(Some(value))),
+				}
+			}
+
+			/// Inspect prepared state without taking ownership from process-wrap.
+			#[doc(hidden)]
+			pub fn with<T: ::std::any::Any, R>(&self, inspect: impl FnOnce(&T) -> R) -> Option<R> {
+				let value = self
+					.value
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner);
+				value.as_deref()?.downcast_ref::<T>().map(inspect)
+			}
+
+			/// Mutate prepared state without taking ownership from process-wrap.
+			#[doc(hidden)]
+			pub fn with_mut<T: ::std::any::Any, R>(
+				&self,
+				mutate: impl FnOnce(&mut T) -> R,
+			) -> Option<R> {
+				let mut value = self
+					.value
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner);
+				value.as_deref_mut()?.downcast_mut::<T>().map(mutate)
+			}
+
+			fn take(&self) -> Option<Box<dyn ::std::any::Any + Send>> {
+				self.value
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.take()
+			}
+
+			fn has_layer_owner(&self) -> bool {
+				::std::sync::Arc::strong_count(&self.value) > 1
+			}
+		}
+
+		/// Empty ownership slots for a child layer returned by a wrapping hook.
+		///
+		/// A layer keeps these slots empty while its hook runs. Process-wrap fills them only after the
+		/// hook returns successfully, so failure cleanup remains outside caller-defined callbacks.
+		pub struct ChildWrapperSlots<'a> {
+			child: &'a mut Option<Box<dyn $childer>>,
+			#[cfg(windows)]
+			prepared: Option<&'a mut Option<PreparedChild>>,
+		}
+
+		impl<'a> ChildWrapperSlots<'a> {
+			/// Describe a detached layer's empty child slot.
+			pub fn new(child: &'a mut Option<Box<dyn $childer>>) -> Self {
+				Self {
+					child,
+					#[cfg(windows)]
+					prepared: None,
+				}
+			}
+
+			/// Describe the empty prepared-state slot paired with this layer.
+			#[cfg(windows)]
+			#[doc(hidden)]
+			pub fn with_prepared(mut self, prepared: &'a mut Option<PreparedChild>) -> Self {
+				self.prepared = Some(prepared);
+				self
+			}
+		}
+
+		/// A detached child layer whose ownership slots process-wrap fills after its hook returns.
+		///
+		/// Implement this trait for a layer returned through [`PendingChildWrapper::new`]. The layer's
+		/// child slot must be empty until process-wrap installs the current child.
+		pub trait ChildWrapperLayer: $childer {
+			/// Expose this detached layer's empty ownership slots.
+			fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_>;
+		}
+
+		/// A child layer awaiting failure-atomic installation by process-wrap.
+		///
+		/// Wrapping hooks return this value instead of taking ownership of the current child. If a hook
+		/// succeeds, process-wrap installs that child into the layer's declared empty slot.
+		pub struct PendingChildWrapper {
+			layer: Box<dyn $childer>,
+			install: fn(
+				&mut dyn $childer,
+				&mut Option<Box<dyn $childer>>,
+				#[cfg(windows)] Option<&PreparedChild>,
+			) -> ::std::io::Result<()>,
+		}
+
+		impl ::std::fmt::Debug for PendingChildWrapper {
+			fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+				self.layer.fmt(formatter)
+			}
+		}
+
+		impl PendingChildWrapper {
+			/// Return a detached child layer for failure-atomic installation.
+			///
+			/// `layer.child_wrapper_slots()` must expose an empty child slot. Process-wrap validates the
+			/// slot and fills it after the wrapping callback has returned.
+			pub fn new<L>(layer: L) -> Self
+			where
+				L: ChildWrapperLayer + 'static,
+			{
+				Self {
+					layer: Box::new(layer),
+					install: Self::install_layer::<L>,
+				}
+			}
+
+			fn install_layer<L>(
+				layer: &mut dyn $childer,
+				child: &mut Option<Box<dyn $childer>>,
+				#[cfg(windows)] prepared: Option<&PreparedChild>,
+			) -> ::std::io::Result<()>
+			where
+				L: ChildWrapperLayer + 'static,
+			{
+				let layer = (layer as &mut dyn ::std::any::Any)
+					.downcast_mut::<L>()
+					.expect("a pending child layer retains its concrete type");
+				let slots = layer.child_wrapper_slots();
+				if slots.child.is_some() {
+					return Err(::std::io::Error::new(
+						::std::io::ErrorKind::InvalidInput,
+						"a pending child layer must have an empty child slot",
+					));
+				}
+				#[cfg(windows)]
+				match (prepared, slots.prepared) {
+					(Some(prepared), Some(slot)) if slot.is_none() => {
+						*slot = Some(prepared.clone());
+					}
+					(Some(_), _) => {
+						return Err(::std::io::Error::new(
+							::std::io::ErrorKind::InvalidInput,
+							"prepared child state requires an empty matching layer slot",
+						));
+					}
+					(None, Some(slot)) if slot.is_some() => {
+						return Err(::std::io::Error::new(
+							::std::io::ErrorKind::InvalidInput,
+							"a pending prepared-state slot must be empty",
+						));
+					}
+					(None, _) => {}
+				}
+				*slots.child = Some(child.take().expect("the lifecycle retains child custody"));
+				Ok(())
+			}
+
+			fn install(
+				&mut self,
+				child: &mut Option<Box<dyn $childer>>,
+				#[cfg(windows)] prepared: Option<&PreparedChild>,
+			) -> ::std::io::Result<()> {
+				(self.install)(
+					self.layer.as_mut(),
+					child,
+					#[cfg(windows)]
+					prepared,
+				)
+			}
+
+			fn into_child(self) -> Box<dyn $childer> {
+				self.layer
+			}
+		}
+
+		enum SpawnFailure {
+			Error(::std::io::Error),
+			Panic(Box<dyn ::std::any::Any + Send>),
+		}
+
+		impl SpawnFailure {
+			fn finish<T>(self) -> ::std::io::Result<T> {
+				match self {
+					Self::Error(error) => Err(error),
+					Self::Panic(payload) => ::std::panic::resume_unwind(payload),
+				}
+			}
+		}
+
 		#[derive(Debug)]
 		enum ProviderTransactionState {
 			Armed(Box<dyn crate::SpawnTransaction>),
@@ -126,13 +330,19 @@ macro_rules! Wrap {
 				}
 			}
 
-			fn transfer(&mut self, child: Box<dyn $childer>) -> Box<dyn $childer> {
+			fn transfer(
+				&mut self,
+				child: Box<dyn $childer>,
+				#[cfg(windows)] prepared: Vec<Option<PreparedChild>>,
+			) -> Box<dyn $childer> {
 				let Self::Committed(transaction) = ::std::mem::replace(self, Self::Transferred) else {
 					unreachable!("only committed transaction residue can transfer to a child");
 				};
 				Box::new(CommittedProviderChild {
 					child,
 					residue: ::std::sync::Arc::new(::std::sync::Mutex::new(transaction)),
+					#[cfg(windows)]
+					prepared,
 				})
 			}
 		}
@@ -140,6 +350,8 @@ macro_rules! Wrap {
 		struct CommittedProviderChild {
 			child: Box<dyn $childer>,
 			residue: ::std::sync::Arc<::std::sync::Mutex<Box<dyn crate::SpawnTransaction>>>,
+			#[cfg(windows)]
+			prepared: Vec<Option<PreparedChild>>,
 		}
 
 		impl ::std::fmt::Debug for CommittedProviderChild {
@@ -158,7 +370,12 @@ macro_rules! Wrap {
 			}
 
 			fn into_inner(self: Box<Self>) -> Box<dyn $childer> {
-				let Self { child, residue: _ } = *self;
+				let Self {
+					child,
+					residue: _,
+					#[cfg(windows)]
+					prepared: _,
+				} = *self;
 				child
 			}
 
@@ -177,6 +394,8 @@ macro_rules! Wrap {
 					Box::new(Self {
 						child,
 						residue: ::std::sync::Arc::clone(&self.residue),
+						#[cfg(windows)]
+						prepared: self.prepared.clone(),
 					}) as Box<dyn $childer>
 				})
 			}
@@ -393,17 +612,25 @@ macro_rules! Wrap {
 				Ok(())
 			}
 
+			fn capture_io<T>(
+				invoke: impl FnOnce() -> ::std::io::Result<T>,
+			) -> ::std::result::Result<T, SpawnFailure> {
+				match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(invoke)) {
+					Ok(Ok(value)) => Ok(value),
+					Ok(Err(error)) => Err(SpawnFailure::Error(error)),
+					Err(payload) => Err(SpawnFailure::Panic(payload)),
+				}
+			}
+
 			#[cfg(windows)]
 			#[inline]
 			fn run_prepare_child(
 				&mut self,
 				attempt: &mut SpawnAttempt,
 				child: &mut dyn $childer,
-			) -> ::std::io::Result<
-				Vec<Option<Box<dyn ::std::any::Any + Send>>>,
-			> {
+				prepared: &mut Vec<Option<PreparedChild>>,
+			) -> ::std::result::Result<(), SpawnFailure> {
 				let len = self.wrapper_registry().wrappers.len();
-				let mut prepared = Vec::with_capacity(len);
 				for index in 0..len {
 					#[cfg(feature = "tracing")]
 					{
@@ -415,12 +642,15 @@ macro_rules! Wrap {
 							.0;
 						::tracing::debug!(?id, "prepare_child");
 					}
-					prepared.push(self.with_wrapper_at(index, |wrapper, command| {
-						wrapper.prepare_child(attempt, child, command)
-					})?);
+					let value = Self::capture_io(|| {
+						self.with_wrapper_at(index, |wrapper, command| {
+							wrapper.prepare_child(attempt, child, command)
+						})
+					})?;
+					prepared.push(value.map(PreparedChild::new));
 				}
 
-				Ok(prepared)
+				Ok(())
 			}
 
 			#[inline]
@@ -428,7 +658,7 @@ macro_rules! Wrap {
 				&mut self,
 				attempt: &mut SpawnAttempt,
 				child: &mut dyn $childer,
-			) -> ::std::io::Result<()> {
+			) -> ::std::result::Result<(), SpawnFailure> {
 				let len = self.wrapper_registry().wrappers.len();
 				for index in 0..len {
 					#[cfg(feature = "tracing")]
@@ -441,8 +671,10 @@ macro_rules! Wrap {
 							.0;
 						::tracing::debug!(?id, "post_spawn");
 					}
-					self.with_wrapper_at(index, |wrapper, command| {
-						wrapper.post_spawn(attempt, child, command)
+					Self::capture_io(|| {
+						self.with_wrapper_at(index, |wrapper, command| {
+							wrapper.post_spawn(attempt, child, command)
+						})
 					})?;
 				}
 
@@ -452,11 +684,10 @@ macro_rules! Wrap {
 			#[inline]
 			fn run_wrap_child(
 				&mut self,
-				mut child: Box<dyn $childer>,
-				#[cfg(windows)] mut prepared: Vec<
-					Option<Box<dyn ::std::any::Any + Send>>,
-				>,
-			) -> ::std::io::Result<Box<dyn $childer>> {
+				child: &mut Option<Box<dyn $childer>>,
+				pending: &mut Option<PendingChildWrapper>,
+				#[cfg(windows)] prepared: &[Option<PreparedChild>],
+			) -> ::std::result::Result<(), SpawnFailure> {
 				let len = self.wrapper_registry().wrappers.len();
 				for index in 0..len {
 					#[cfg(feature = "tracing")]
@@ -469,36 +700,76 @@ macro_rules! Wrap {
 							.0;
 						::tracing::debug!(?id, "wrap_child");
 					}
-					child = self.with_wrapper_at(index, |wrapper, command| {
-						#[cfg(windows)]
-						{
-							wrapper.wrap_prepared_child(
-								child,
-								prepared[index].take(),
-								command,
-							)
-						}
-						#[cfg(not(windows))]
-						{
-							wrapper.wrap_child(child, command)
-						}
+					let layer = Self::capture_io(|| {
+						self.with_wrapper_at(index, |wrapper, command| {
+							let child = child
+								.as_deref_mut()
+								.expect("process-wrap retains child custody between wrapping hooks");
+							#[cfg(windows)]
+							{
+								wrapper.wrap_prepared_child(child, prepared[index].as_ref(), command)
+							}
+							#[cfg(not(windows))]
+							{
+								wrapper.wrap_child(child, command)
+							}
+						})
 					})?;
+					*pending = layer;
+
+					if let Some(layer) = pending.as_mut() {
+						Self::capture_io(|| {
+							layer.install(
+								child,
+								#[cfg(windows)]
+								prepared[index].as_ref(),
+							)
+						})?;
+						let layer = pending
+							.take()
+							.expect("the installed child layer remains in custody");
+						debug_assert!(child.is_none());
+						*child = Some(layer.into_child());
+					} else {
+						#[cfg(windows)]
+						if prepared[index].is_some() {
+							return Err(SpawnFailure::Error(::std::io::Error::new(
+								::std::io::ErrorKind::InvalidInput,
+								"prepared child state requires a matching child layer",
+							)));
+						}
+					}
 				}
 
-				Ok(child)
+				Ok(())
 			}
 
 			fn finish_spawn(
 				&mut self,
 				attempt: &mut SpawnAttempt,
-				mut child: Box<dyn $childer>,
+				child: Box<dyn $childer>,
 			) -> ::std::io::Result<Box<dyn $childer>> {
+				let mut child = Some(child);
+				let mut pending = None;
 				#[cfg(windows)]
-				let mut cleanup = if attempt.starts_suspended() {
-					let handle = match child.as_ref().try_process_handle() {
+				let mut prepared = Vec::with_capacity(self.wrapper_registry().wrappers.len());
+				#[cfg(windows)]
+				let mut cleanup = match Self::capture_io(|| {
+					if !attempt.starts_suspended() {
+						return Ok(None);
+					}
+					let handle = match child
+						.as_ref()
+						.expect("the native lifecycle retains child custody")
+						.as_ref()
+						.try_process_handle()
+					{
 						Some(handle) => handle,
 						None => {
-							let _ = child.start_kill();
+							let _ = child
+								.as_deref_mut()
+								.expect("the native lifecycle retains child custody")
+								.start_kill();
 							return Err(::std::io::Error::new(
 								::std::io::ErrorKind::Unsupported,
 								"child wrapper does not expose a Windows process handle",
@@ -506,39 +777,91 @@ macro_rules! Wrap {
 						}
 					};
 					match crate::command::WindowsSpawnCleanup::new(handle) {
-						Ok(cleanup) => Some(cleanup),
+						Ok(cleanup) => Ok(Some(cleanup)),
 						Err(error) => {
 							let _ = crate::command::terminate_process_and_wait(handle);
-							return Err(error);
+							Err(error)
 						}
 					}
-				} else {
-					None
+				}) {
+					Ok(cleanup) => cleanup,
+					Err(failure) => {
+						Self::cleanup_pending_child(&mut pending);
+						Self::cleanup_child(&mut child);
+						Self::cleanup_prepared(&mut prepared);
+						return failure.finish::<Box<dyn $childer>>();
+					}
 				};
 
-				let result = (|| {
+				let result: ::std::result::Result<(), SpawnFailure> = (|| {
 					#[cfg(windows)]
-					let prepared = self.run_prepare_child(attempt, child.as_mut())?;
-					self.run_post_spawn(attempt, child.as_mut())?;
+					self.run_prepare_child(
+						attempt,
+						child
+							.as_deref_mut()
+							.expect("the native lifecycle retains child custody"),
+						&mut prepared,
+					)?;
+					self.run_post_spawn(
+						attempt,
+						child
+							.as_deref_mut()
+							.expect("the native lifecycle retains child custody"),
+					)?;
+					self.run_wrap_child(
+						&mut child,
+						&mut pending,
+						#[cfg(windows)]
+						&prepared,
+					)?;
 					#[cfg(windows)]
 					{
-						self.run_wrap_child(child, prepared)
+						let final_owner = Self::capture_io(|| {
+							child
+								.as_deref_mut()
+								.expect("the native lifecycle retains child custody")
+								.finalize_spawn_before_commit()
+						})?;
+						Self::capture_io(|| {
+							child
+								.as_deref_mut()
+								.expect("the native lifecycle retains child custody")
+								.finalize_spawn_final_owner(final_owner)
+						})?;
+						if prepared
+							.iter()
+							.flatten()
+							.any(|prepared| !prepared.has_layer_owner())
+						{
+							return Err(SpawnFailure::Error(::std::io::Error::new(
+								::std::io::ErrorKind::InvalidInput,
+								"a prepared child layer released its state before transfer",
+							)));
+						}
 					}
-					#[cfg(not(windows))]
-					{
-						self.run_wrap_child(child)
-					}
+					Ok(())
 				})();
-				#[cfg(windows)]
-				let result = result.and_then(|mut child| {
-					let final_owner = child.finalize_spawn_before_commit()?;
-					child.finalize_spawn_final_owner(final_owner)?;
-					if let Some(cleanup) = cleanup.as_mut() {
-						cleanup.disarm();
+
+				match result {
+					Ok(()) => {
+						#[cfg(windows)]
+						if let Some(cleanup) = cleanup.as_mut() {
+							cleanup.disarm();
+						}
+						Ok(child
+							.take()
+							.expect("the completed native lifecycle retains its child"))
 					}
-					Ok(child)
-				});
-				result
+					Err(failure) => {
+						#[cfg(windows)]
+						drop(cleanup.take());
+						Self::cleanup_pending_child(&mut pending);
+						Self::cleanup_child(&mut child);
+						#[cfg(windows)]
+						Self::cleanup_prepared(&mut prepared);
+						failure.finish::<Box<dyn $childer>>()
+					}
+				}
 			}
 
 			fn quarantine_cleanup_panic(result: ::std::thread::Result<()>) {
@@ -547,11 +870,36 @@ macro_rules! Wrap {
 				}
 			}
 
-			fn dispose_transaction(transaction: Box<dyn crate::SpawnTransaction>) {
+			fn dispose_value<T>(value: T) {
 				let disposal = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-					drop(transaction);
+					drop(value);
 				}));
 				Self::quarantine_cleanup_panic(disposal);
+			}
+
+			fn cleanup_pending_child(pending: &mut Option<PendingChildWrapper>) {
+				if let Some(pending) = pending.take() {
+					Self::dispose_value(pending);
+				}
+			}
+
+			fn cleanup_child(child: &mut Option<Box<dyn $childer>>) {
+				if let Some(child) = child.take() {
+					Self::dispose_value(child);
+				}
+			}
+
+			#[cfg(windows)]
+			fn cleanup_prepared(prepared: &mut [Option<PreparedChild>]) {
+				for prepared in prepared.iter_mut().filter_map(Option::take) {
+					if let Some(value) = prepared.take() {
+						Self::dispose_value(value);
+					}
+				}
+			}
+
+			fn dispose_transaction(transaction: Box<dyn crate::SpawnTransaction>) {
+				Self::dispose_value(transaction);
 			}
 
 			fn rollback_transaction(mut transaction: Box<dyn crate::SpawnTransaction>) {
@@ -578,33 +926,69 @@ macro_rules! Wrap {
 				attempt: &mut SpawnAttempt,
 				product: ProviderProduct,
 			) -> ::std::io::Result<Box<dyn $childer>> {
-				let (mut child, transaction) = product.into_parts();
+				let (child, transaction) = product.into_parts();
+				let mut child = Some(child);
+				let mut pending = None;
 				let mut transaction = ProviderTransactionState::new(transaction);
-				let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+				#[cfg(windows)]
+				let mut prepared = Vec::with_capacity(self.wrapper_registry().wrappers.len());
+				let result: ::std::result::Result<(), SpawnFailure> = (|| {
 					#[cfg(windows)]
-					let prepared = self.run_prepare_child(attempt, child.as_mut())?;
-					self.run_post_spawn(attempt, child.as_mut())?;
+					self.run_prepare_child(
+						attempt,
+						child
+							.as_deref_mut()
+							.expect("the provider lifecycle retains child custody"),
+						&mut prepared,
+					)?;
+					self.run_post_spawn(
+						attempt,
+						child
+							.as_deref_mut()
+							.expect("the provider lifecycle retains child custody"),
+					)?;
+					self.run_wrap_child(
+						&mut child,
+						&mut pending,
+						#[cfg(windows)]
+						&prepared,
+					)?;
 					#[cfg(windows)]
-					let mut child = self.run_wrap_child(child, prepared)?;
-					#[cfg(not(windows))]
-					let child = self.run_wrap_child(child)?;
+					let final_owner = Self::capture_io(|| {
+						child
+							.as_deref_mut()
+							.expect("the provider lifecycle retains child custody")
+							.finalize_spawn_before_commit()
+					})?;
+					Self::capture_io(|| transaction.commit())?;
 					#[cfg(windows)]
-					let final_owner = child.finalize_spawn_before_commit()?;
-					transaction.commit()?;
-					#[cfg(windows)]
-					child.finalize_spawn_final_owner(final_owner)?;
-					Ok(transaction.transfer(child))
-				}));
+					Self::capture_io(|| {
+						child
+							.as_deref_mut()
+							.expect("the provider lifecycle retains child custody")
+							.finalize_spawn_final_owner(final_owner)
+					})?;
+					Ok(())
+				})();
 
 				match result {
-					Ok(Ok(child)) => Ok(child),
-					Ok(Err(error)) => {
-						Self::cleanup_failed_transaction(&mut transaction);
-						Err(error)
+					Ok(()) => {
+						let child = child
+							.take()
+							.expect("the completed provider lifecycle retains its child");
+						Ok(transaction.transfer(
+							child,
+							#[cfg(windows)]
+							prepared,
+						))
 					}
-					Err(payload) => {
+					Err(failure) => {
 						Self::cleanup_failed_transaction(&mut transaction);
-						::std::panic::resume_unwind(payload)
+						Self::cleanup_pending_child(&mut pending);
+						Self::cleanup_child(&mut child);
+						#[cfg(windows)]
+						Self::cleanup_prepared(&mut prepared);
+						failure.finish::<Box<dyn $childer>>()
 					}
 				}
 			}
@@ -851,32 +1235,35 @@ macro_rules! Wrap {
 				Ok(())
 			}
 
-			/// Called to wrap a child into this command wrapper's child wrapper.
+			/// Called to describe a child layer after a transport creates the child.
 			///
-			/// If the wrapper needs to override methods on the child, it should create an instance of its
-			/// own type implementing `ChildWrapper` and return it here. Wrappers run in registration order
-			/// and stop at the first error or unwinding panic, so `.wrap(Foo).wrap(Bar)` produces an outer
-			/// `Bar(Foo(child))` layer. On the provider path, an error or unwinding panic triggers
-			/// best-effort transaction rollback.
+			/// Wrappers run in registration order. The current child remains borrowed from process-wrap while
+			/// this callback runs. To add a layer, return a [`PendingChildWrapper`] containing a
+			/// [`ChildWrapperLayer`] whose ownership slots are empty; process-wrap installs the current child
+			/// only after the callback has returned successfully. Returning `None` leaves the child unchanged.
+			/// This custody protocol keeps child destruction outside the callback boundary when a later hook
+			/// fails. `.wrap(Foo).wrap(Bar)` still produces an outer `Bar(Foo(child))` layer.
 			///
-			/// Default implementation: no-op (returns the child unchanged).
+			/// On the provider path, an error or unwinding panic triggers best-effort transaction rollback.
+			///
+			/// Default implementation: no-op (returns no layer).
 			fn wrap_child(
 				&mut self,
-				child: Box<dyn $childer>,
+				_child: &mut dyn $childer,
 				_command: &Command,
-			) -> ::std::io::Result<Box<dyn $childer>> {
-				Ok(child)
+			) -> ::std::io::Result<Option<PendingChildWrapper>> {
+				Ok(None)
 			}
 
-			/// Install a child wrapper using state returned by `prepare_child`.
+			/// Describe a child layer using state returned by `prepare_child`.
 			#[doc(hidden)]
 			#[cfg(windows)]
 			fn wrap_prepared_child(
 				&mut self,
-				child: Box<dyn $childer>,
-				prepared: Option<Box<dyn ::std::any::Any + Send>>,
+				child: &mut dyn $childer,
+				prepared: Option<&PreparedChild>,
 				command: &Command,
-			) -> ::std::io::Result<Box<dyn $childer>> {
+			) -> ::std::io::Result<Option<PendingChildWrapper>> {
 				debug_assert!(
 					prepared.is_none(),
 					"the default child preparation does not produce wrapper state"

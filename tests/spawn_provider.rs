@@ -7,6 +7,10 @@ macro_rules! spawn_provider_tests {
 		$spawn_attempt:path,
 		$command_wrapper:path,
 		$child_wrapper:path,
+		$child_wrapper_layer:path,
+		$child_wrapper_slots:path,
+		$pending_child_wrapper:path,
+		$prepared_child:path,
 		$provider_product:path,
 		$spawn_provider:path,
 		$runtime:expr
@@ -15,12 +19,13 @@ macro_rules! spawn_provider_tests {
 			use std::{
 				any::TypeId,
 				ffi::OsStr,
-				io,
+				io::{self, Read},
 				panic::{AssertUnwindSafe, catch_unwind, panic_any},
-				process::{Output, Stdio},
+				process::{ExitStatus, Output, Stdio},
 				sync::{
 					Arc, Mutex,
 					atomic::{AtomicBool, AtomicUsize, Ordering},
+					mpsc,
 				},
 				thread::sleep,
 				time::{Duration, Instant},
@@ -28,8 +33,15 @@ macro_rules! spawn_provider_tests {
 
 			use process_wrap::{CommandArg, SpawnTransaction};
 			use $child_wrapper as ChildWrapper;
+			#[cfg(windows)]
+			use $child_wrapper_layer as ChildWrapperLayer;
+			#[cfg(windows)]
+			use $child_wrapper_slots as ChildWrapperSlots;
 			use $command_wrap as CommandWrap;
 			use $command_wrapper as CommandWrapper;
+			use $pending_child_wrapper as PendingChildWrapper;
+			#[cfg(windows)]
+			use $prepared_child as PreparedChild;
 			use $provider_product as ProviderProduct;
 			use $spawn_attempt as SpawnAttempt;
 			use $spawn_provider as SpawnProvider;
@@ -136,6 +148,8 @@ macro_rules! spawn_provider_tests {
 				transaction_drop_behavior: Mutex<Option<TransactionDropBehavior>>,
 				child_drop_payload: Mutex<Option<PanickingDropPayload>>,
 				commit_primary_failure: Mutex<Option<PrimaryFailure>>,
+				#[cfg(windows)]
+				owner_primary_failure: Mutex<Option<PrimaryFailure>>,
 				transaction_debug_calls: AtomicUsize,
 				panic_in_transaction_debug: AtomicBool,
 				make_attempt_native_only: AtomicBool,
@@ -190,6 +204,16 @@ macro_rules! spawn_provider_tests {
 
 				fn take_commit_primary_failure(&self) -> Option<PrimaryFailure> {
 					self.commit_primary_failure.lock().unwrap().take()
+				}
+
+				#[cfg(windows)]
+				fn set_owner_primary_failure(&self, failure: PrimaryFailure) {
+					*self.owner_primary_failure.lock().unwrap() = Some(failure);
+				}
+
+				#[cfg(windows)]
+				fn take_owner_primary_failure(&self) -> Option<PrimaryFailure> {
+					self.owner_primary_failure.lock().unwrap().take()
 				}
 
 				#[cfg(windows)]
@@ -358,6 +382,51 @@ macro_rules! spawn_provider_tests {
 			}
 
 			#[cfg(windows)]
+			#[derive(Debug)]
+			struct PreparedLayer {
+				inner: Option<Box<dyn ChildWrapper>>,
+				prepared: Option<PreparedChild>,
+			}
+
+			#[cfg(windows)]
+			impl PreparedLayer {
+				fn detached() -> Self {
+					Self {
+						inner: None,
+						prepared: None,
+					}
+				}
+			}
+
+			#[cfg(windows)]
+			impl ChildWrapperLayer for PreparedLayer {
+				fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+					ChildWrapperSlots::new(&mut self.inner).with_prepared(&mut self.prepared)
+				}
+			}
+
+			#[cfg(windows)]
+			impl ChildWrapper for PreparedLayer {
+				fn inner(&self) -> &dyn ChildWrapper {
+					self.inner
+						.as_deref()
+						.expect("an installed prepared layer owns its child")
+				}
+
+				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+					self.inner
+						.as_deref_mut()
+						.expect("an installed prepared layer owns its child")
+				}
+
+				fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+					self.inner
+						.take()
+						.expect("an installed prepared layer owns its child")
+				}
+			}
+
+			#[cfg(windows)]
 			macro_rules! prepared_wrapper {
 				($name:ident, $label:literal) => {
 					#[derive(Debug)]
@@ -384,12 +453,11 @@ macro_rules! spawn_provider_tests {
 
 						fn wrap_prepared_child(
 							&mut self,
-							child: Box<dyn ChildWrapper>,
-							prepared: Option<Box<dyn std::any::Any + Send>>,
+							_child: &mut dyn ChildWrapper,
+							prepared: Option<&PreparedChild>,
 							_command: &CommandWrap,
-						) -> io::Result<Box<dyn ChildWrapper>> {
-							debug_assert!(prepared.is_none());
-							Ok(child)
+						) -> io::Result<Option<PendingChildWrapper>> {
+							Ok(prepared.map(|_| PendingChildWrapper::new(PreparedLayer::detached())))
 						}
 					}
 				};
@@ -412,7 +480,13 @@ macro_rules! spawn_provider_tests {
 					_child: &mut dyn ChildWrapper,
 					_command: &CommandWrap,
 				) -> io::Result<Option<Box<dyn std::any::Any + Send>>> {
-					match self.0.lock().unwrap().take() {
+					let failure = {
+						self.0
+							.lock()
+							.unwrap_or_else(std::sync::PoisonError::into_inner)
+							.take()
+					};
+					match failure {
 						Some(PrimaryFailure::Error(identity)) => {
 							Err(io::Error::other(IdentityError(identity)))
 						}
@@ -468,12 +542,44 @@ macro_rules! spawn_provider_tests {
 					if self.owns_job_cleanup {
 						self.shared.event(Event::DisarmOwner(self.name));
 						self.shared.fail(Point::DisarmOwner)?;
+						if let Some(failure) = self.shared.take_owner_primary_failure() {
+							match failure {
+								PrimaryFailure::Error(identity) => {
+									return Err(io::Error::other(IdentityError(identity)));
+								}
+								PrimaryFailure::Panic(identity) => panic_any(PrimaryPanic(identity)),
+							}
+						}
 						self.armed = false;
 					} else {
 						self.shared.event(Event::DisarmNonOwner(self.name));
 						self.shared.fail(Point::DisarmNonOwner)?;
 					}
 					Ok(())
+				}
+			}
+
+			#[cfg(windows)]
+			impl FinalizationChild {
+				fn child_slot(&mut self) -> &mut Option<Box<dyn ChildWrapper>> {
+					if self.inner.is_none() {
+						return &mut self.inner;
+					}
+					let inner = self
+						.inner
+						.as_deref_mut()
+						.expect("a prebuilt finalization chain has an inner layer");
+					let inner = (inner as &mut dyn std::any::Any)
+						.downcast_mut::<Self>()
+						.expect("a detached finalization chain contains only finalization layers");
+					inner.child_slot()
+				}
+			}
+
+			#[cfg(windows)]
+			impl ChildWrapperLayer for FinalizationChild {
+				fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+					ChildWrapperSlots::new(self.child_slot())
 				}
 			}
 
@@ -487,17 +593,14 @@ macro_rules! spawn_provider_tests {
 			}
 
 			#[cfg(windows)]
-			fn add_finalization_layers(
-				shared: Arc<Shared>,
-				child: Box<dyn ChildWrapper>,
-			) -> Box<dyn ChildWrapper> {
+			fn finalization_layer_chain(shared: Arc<Shared>) -> Option<FinalizationChild> {
 				shared
 					.finalization_layers()
 					.into_iter()
 					.rev()
-					.fold(child, |inner, layer| {
-						Box::new(FinalizationChild {
-							inner: Some(inner),
+					.fold(None, |inner, layer| {
+						Some(FinalizationChild {
+							inner: inner.map(|inner| Box::new(inner) as Box<dyn ChildWrapper>),
 							shared: Arc::clone(&shared),
 							name: layer.name,
 							owns_job_cleanup: layer.owns_job_cleanup,
@@ -760,14 +863,14 @@ macro_rules! spawn_provider_tests {
 
 				fn wrap_child(
 					&mut self,
-					child: Box<dyn ChildWrapper>,
+					child: &mut dyn ChildWrapper,
 					command: &CommandWrap,
-				) -> io::Result<Box<dyn ChildWrapper>> {
+				) -> io::Result<Option<PendingChildWrapper>> {
 					self.assert_hook_visibility(command);
-					assert_provider_child(child.as_ref());
+					assert_provider_child(child);
 					self.shared().event(Event::Wrap(self.name));
 					self.shared().fail(Point::Wrap)?;
-					Ok(child)
+					Ok(None)
 				}
 
 				fn spawn_provider(&self) -> Option<&dyn SpawnProvider> {
@@ -821,18 +924,20 @@ macro_rules! spawn_provider_tests {
 
 				fn wrap_child(
 					&mut self,
-					child: Box<dyn ChildWrapper>,
+					child: &mut dyn ChildWrapper,
 					command: &CommandWrap,
-				) -> io::Result<Box<dyn ChildWrapper>> {
+				) -> io::Result<Option<PendingChildWrapper>> {
 					self.assert_hook_visibility(command);
 					if self.expect_custom_child {
-						assert_provider_child(child.as_ref());
+						assert_provider_child(child);
 					}
 					self.shared.event(Event::Wrap("peer"));
 					self.shared.fail(Point::PeerWrap)?;
 					#[cfg(windows)]
-					let child = add_finalization_layers(Arc::clone(&self.shared), child);
-					Ok(child)
+					return Ok(finalization_layer_chain(Arc::clone(&self.shared))
+						.map(PendingChildWrapper::new));
+					#[cfg(not(windows))]
+					Ok(None)
 				}
 			}
 
@@ -1087,25 +1192,87 @@ macro_rules! spawn_provider_tests {
 				environment: (&str, &str),
 				timeout: Duration,
 			) -> (Output, bool) {
+				const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
 				struct ChildGuard(Option<std::process::Child>);
 
-				impl Drop for ChildGuard {
-					fn drop(&mut self) {
-						if let Some(mut child) = self.0.take() {
-							let _ = child.kill();
-							let _ = child.wait();
+				impl ChildGuard {
+					fn terminate_and_reap(&mut self) -> io::Result<ExitStatus> {
+						let child = self
+							.0
+							.as_mut()
+							.expect("the guarded subprocess remains available");
+						match child.kill() {
+							Ok(()) => {}
+							Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+							Err(error) => return Err(error),
+						}
+						let deadline = Instant::now() + REAP_TIMEOUT;
+						loop {
+							if let Some(status) = child.try_wait()? {
+								return Ok(status);
+							}
+							if Instant::now() >= deadline {
+								return Err(io::Error::new(
+									io::ErrorKind::TimedOut,
+									"isolated lifecycle subprocess was not reaped after termination",
+								));
+							}
+							sleep(Duration::from_millis(5));
 						}
 					}
 				}
 
-				let child = std::process::Command::new(std::env::current_exe().unwrap())
+				impl Drop for ChildGuard {
+					fn drop(&mut self) {
+						if self.0.is_some() {
+							let _ = self.terminate_and_reap();
+						}
+					}
+				}
+
+				fn drain_pipe(
+					mut pipe: impl Read + Send + 'static,
+				) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+					let (sender, receiver) = mpsc::channel();
+					std::thread::spawn(move || {
+						let mut bytes = Vec::new();
+						let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+						let _ = sender.send(result);
+					});
+					receiver
+				}
+
+				fn collect_output(
+					status: ExitStatus,
+					stdout: mpsc::Receiver<io::Result<Vec<u8>>>,
+					stderr: mpsc::Receiver<io::Result<Vec<u8>>>,
+				) -> Output {
+					let deadline = Instant::now() + REAP_TIMEOUT;
+					let receive = |receiver: mpsc::Receiver<io::Result<Vec<u8>>>, label| {
+						let remaining = deadline.saturating_duration_since(Instant::now());
+						receiver
+							.recv_timeout(remaining)
+							.unwrap_or_else(|error| panic!("did not drain isolated {label}: {error}"))
+							.unwrap_or_else(|error| panic!("could not read isolated {label}: {error}"))
+					};
+					Output {
+						status,
+						stdout: receive(stdout, "stdout"),
+						stderr: receive(stderr, "stderr"),
+					}
+				}
+
+				let mut spawned = std::process::Command::new(std::env::current_exe().unwrap())
 					.args(["--exact", test_name, "--nocapture"])
 					.env(environment.0, environment.1)
 					.stdout(Stdio::piped())
 					.stderr(Stdio::piped())
 					.spawn()
 					.expect("start isolated lifecycle regression");
-				let mut child = ChildGuard(Some(child));
+				let stdout = drain_pipe(spawned.stdout.take().expect("capture isolated stdout"));
+				let stderr = drain_pipe(spawned.stderr.take().expect("capture isolated stderr"));
+				let mut child = ChildGuard(Some(spawned));
 				let deadline = Instant::now() + timeout;
 				loop {
 					let status = child
@@ -1114,22 +1281,16 @@ macro_rules! spawn_provider_tests {
 						.expect("the subprocess remains guarded while polling")
 						.try_wait()
 						.expect("poll isolated lifecycle regression");
-					if status.is_some() {
-						let output = child
-							.0
-							.take()
-							.expect("take completed subprocess")
-							.wait_with_output()
-							.expect("collect isolated lifecycle output");
-						return (output, false);
+					if let Some(status) = status {
+						child.0.take();
+						return (collect_output(status, stdout, stderr), false);
 					}
 					if Instant::now() >= deadline {
-						let mut expired = child.0.take().expect("take expired subprocess");
-						let _ = expired.kill();
-						let output = expired
-							.wait_with_output()
-							.expect("reap expired lifecycle subprocess");
-						return (output, true);
+						let status = child
+							.terminate_and_reap()
+							.expect("terminate and reap expired lifecycle subprocess");
+						child.0.take();
+						return (collect_output(status, stdout, stderr), true);
 					}
 					sleep(Duration::from_millis(5));
 				}
@@ -2001,10 +2162,13 @@ macro_rules! spawn_provider_tests {
 				);
 				let events = shared.events();
 				assert!(!events.contains(&Event::Commit));
-				assert_eq!(events.last(), Some(&Event::Rollback));
+				assert!(events.contains(&Event::Rollback));
 				assert!(events.contains(&Event::DisarmNonOwner("nonowner")));
-				assert!(events.contains(&Event::OwnerDropped("outer-owner", true)));
-				assert!(events.contains(&Event::OwnerDropped("inner-owner", true)));
+				assert!(events.ends_with(&[
+					Event::Rollback,
+					Event::OwnerDropped("outer-owner", true),
+					Event::OwnerDropped("inner-owner", true),
+				]));
 			}
 
 			#[cfg(windows)]
@@ -2064,8 +2228,8 @@ macro_rules! spawn_provider_tests {
 					assert!(events.contains(&Event::Commit));
 					assert!(events.contains(&Event::DisarmOwner("owner")));
 					assert!(events.ends_with(&[
-						Event::OwnerDropped("owner", true),
 						Event::TransactionDrop,
+						Event::OwnerDropped("owner", true),
 					]));
 					assert!(!events.contains(&Event::Rollback));
 					assert_eq!(secondary_drops.load(Ordering::SeqCst), 0);
@@ -2077,6 +2241,95 @@ macro_rules! spawn_provider_tests {
 					expected.push(Event::OwnerDropped("owner", false));
 					assert_eq!(shared.events(), expected);
 				}
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn final_owner_failure_survives_child_prepared_and_residue_panics() {
+				const CHILD_ENV: &str = "PROCESS_WRAP_PROVIDER_FINAL_OWNER_CLEANUP_PANICS";
+				let module = stringify!($module);
+				let selected = std::env::var(CHILD_ENV).ok();
+				if selected.as_deref().is_none_or(|value| !value.starts_with(module)) {
+					for failure in ["error", "panic"] {
+						let child_value = format!("{module}:{failure}");
+						let (output, timed_out) = bounded_test_process(
+							concat!(
+								stringify!($module),
+								"::final_owner_failure_survives_child_prepared_and_residue_panics"
+							),
+							(CHILD_ENV, &child_value),
+							EXIT_TIMEOUT,
+						);
+						assert!(!timed_out, "final-owner cleanup exceeded its deadline");
+						assert!(
+							output.status.success(),
+							"cleanup replaced the final-owner {failure}:\nstdout:\n{}\nstderr:\n{}",
+							String::from_utf8_lossy(&output.stdout),
+							String::from_utf8_lossy(&output.stderr),
+						);
+					}
+					return;
+				}
+
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let shared = Arc::new(Shared::default());
+				let child_payload_drops = Arc::new(AtomicUsize::new(0));
+				let prepared_payload_drops = Arc::new(AtomicUsize::new(0));
+				let residue_payload_drops = Arc::new(AtomicUsize::new(0));
+				shared.set_child_drop_payload(PanickingDropPayload {
+					drops: Arc::clone(&child_payload_drops),
+				});
+				shared.set_transaction_drop_behavior(TransactionDropBehavior::PanicSecondary(
+					PanickingDropPayload {
+						drops: Arc::clone(&residue_payload_drops),
+					},
+				));
+				let layers = vec![finalization_layer("owner", true)];
+				shared.set_finalization_layers(layers.clone());
+				let identity = Arc::new(());
+				let failure = if selected
+					.as_deref()
+					.expect("the subprocess selected a failure")
+					.ends_with(":panic")
+				{
+					PrimaryFailure::Panic(Arc::clone(&identity))
+				} else {
+					PrimaryFailure::Error(Arc::clone(&identity))
+				};
+				let was_panic = matches!(&failure, PrimaryFailure::Panic(_));
+				shared.set_owner_primary_failure(failure);
+				let mut command = provider_command(Arc::clone(&shared), "provider");
+				command.wrap(FirstPrepared {
+					shared: Arc::clone(&shared),
+					payload: Mutex::new(Some(PanickingDropPayload {
+						drops: Arc::clone(&prepared_payload_drops),
+					})),
+				});
+
+				let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
+				assert_primary_failure_preserved(outcome, &identity, was_panic);
+				let events = shared.events();
+				assert_eq!(events.iter().filter(|event| **event == Event::Commit).count(), 1);
+				assert!(!events.contains(&Event::Rollback));
+				assert!(events.ends_with(&[
+					Event::Commit,
+					Event::DisarmOwner("owner"),
+					Event::TransactionDrop,
+					Event::OwnerDropped("owner", true),
+					Event::ChildDrop,
+					Event::PreparedDrop("first"),
+				]));
+				assert_eq!(child_payload_drops.load(Ordering::SeqCst), 0);
+				assert_eq!(prepared_payload_drops.load(Ordering::SeqCst), 0);
+				assert_eq!(residue_payload_drops.load(Ordering::SeqCst), 0);
+
+				shared.clear_events();
+				let child = command.spawn().expect("the command remains reusable");
+				drop(child);
+				let mut expected = successful_finalization_events("provider", &layers);
+				expected.push(Event::OwnerDropped("owner", false));
+				assert_eq!(shared.events(), expected);
 			}
 
 			#[cfg(windows)]
@@ -2249,6 +2502,9 @@ macro_rules! provider_capability_tests {
 		$spawn_attempt:path,
 		$command_wrapper:path,
 		$child_wrapper:path,
+		$child_wrapper_layer:path,
+		$child_wrapper_slots:path,
+		$pending_child_wrapper:path,
 		$provider_product:path,
 		$spawn_provider:path,
 		$native_command:path,
@@ -2272,8 +2528,11 @@ macro_rules! provider_capability_tests {
 
 			use process_wrap::SpawnTransaction;
 			use $child_wrapper as ChildWrapper;
+			use $child_wrapper_layer as ChildWrapperLayer;
+			use $child_wrapper_slots as ChildWrapperSlots;
 			use $command_wrap as CommandWrap;
 			use $command_wrapper as CommandWrapper;
+			use $pending_child_wrapper as PendingChildWrapper;
 			use $provider_product as ProviderProduct;
 			use $spawn_attempt as SpawnAttempt;
 			use $spawn_provider as SpawnProvider;
@@ -2364,24 +2623,36 @@ macro_rules! provider_capability_tests {
 			}
 
 			#[derive(Debug)]
-			struct OuterLayer(Box<dyn ChildWrapper>);
+			struct OuterLayer(Option<Box<dyn ChildWrapper>>);
+
+			impl ChildWrapperLayer for OuterLayer {
+				fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+					ChildWrapperSlots::new(&mut self.0)
+				}
+			}
 
 			impl ChildWrapper for OuterLayer {
 				fn inner(&self) -> &dyn ChildWrapper {
-					self.0.as_ref()
+					self.0
+						.as_deref()
+						.expect("an installed outer layer owns its child")
 				}
 
 				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-					self.0.as_mut()
+					self.0
+						.as_deref_mut()
+						.expect("an installed outer layer owns its child")
 				}
 
-				fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+				fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
 					self.0
+						.take()
+						.expect("an installed outer layer owns its child")
 				}
 
 				#[cfg(windows)]
 				fn process_handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
-					self.0.process_handle()
+					self.inner().process_handle()
 				}
 			}
 
@@ -2391,10 +2662,10 @@ macro_rules! provider_capability_tests {
 			impl CommandWrapper for OuterWrapper {
 				fn wrap_child(
 					&mut self,
-					child: Box<dyn ChildWrapper>,
+					_child: &mut dyn ChildWrapper,
 					_command: &CommandWrap,
-				) -> io::Result<Box<dyn ChildWrapper>> {
-					Ok(Box::new(OuterLayer(child)))
+				) -> io::Result<Option<PendingChildWrapper>> {
+					Ok(Some(PendingChildWrapper::new(OuterLayer(None))))
 				}
 			}
 
@@ -3098,6 +3369,10 @@ spawn_provider_tests!(
 	process_wrap::std::SpawnAttempt,
 	process_wrap::std::CommandWrapper,
 	process_wrap::std::ChildWrapper,
+	process_wrap::std::ChildWrapperLayer,
+	process_wrap::std::ChildWrapperSlots,
+	process_wrap::std::PendingChildWrapper,
+	process_wrap::std::PreparedChild,
 	process_wrap::std::ProviderProduct,
 	process_wrap::std::SpawnProvider,
 	None
@@ -3110,6 +3385,10 @@ spawn_provider_tests!(
 	process_wrap::tokio::SpawnAttempt,
 	process_wrap::tokio::CommandWrapper,
 	process_wrap::tokio::ChildWrapper,
+	process_wrap::tokio::ChildWrapperLayer,
+	process_wrap::tokio::ChildWrapperSlots,
+	process_wrap::tokio::PendingChildWrapper,
+	process_wrap::tokio::PreparedChild,
 	process_wrap::tokio::ProviderProduct,
 	process_wrap::tokio::SpawnProvider,
 	Some(
@@ -3127,6 +3406,9 @@ provider_capability_tests!(
 	process_wrap::std::SpawnAttempt,
 	process_wrap::std::CommandWrapper,
 	process_wrap::std::ChildWrapper,
+	process_wrap::std::ChildWrapperLayer,
+	process_wrap::std::ChildWrapperSlots,
+	process_wrap::std::PendingChildWrapper,
 	process_wrap::std::ProviderProduct,
 	process_wrap::std::SpawnProvider,
 	std::process::Command,
@@ -3143,6 +3425,9 @@ provider_capability_tests!(
 	process_wrap::tokio::SpawnAttempt,
 	process_wrap::tokio::CommandWrapper,
 	process_wrap::tokio::ChildWrapper,
+	process_wrap::tokio::ChildWrapperLayer,
+	process_wrap::tokio::ChildWrapperSlots,
+	process_wrap::tokio::PendingChildWrapper,
 	process_wrap::tokio::ProviderProduct,
 	process_wrap::tokio::SpawnProvider,
 	tokio::process::Command,

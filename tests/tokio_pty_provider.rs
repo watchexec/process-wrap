@@ -24,8 +24,8 @@ use std::{
 
 use nix::libc;
 use process_wrap::tokio::{
-	ChildWrapper, Command, CommandWrapper, ProviderProduct, Pty, PtyController, PtySize,
-	SpawnAttempt, SpawnProvider,
+	ChildWrapper, ChildWrapperLayer, ChildWrapperSlots, Command, CommandWrapper,
+	PendingChildWrapper, ProviderProduct, Pty, PtyController, PtySize, SpawnAttempt, SpawnProvider,
 };
 use tokio::{io::AsyncReadExt, time::timeout};
 
@@ -69,19 +69,31 @@ async fn output(child: &mut dyn ChildWrapper, controller: PtyController) -> io::
 }
 
 #[derive(Debug)]
-struct TransparentChild(Box<dyn ChildWrapper>);
+struct TransparentChild(Option<Box<dyn ChildWrapper>>);
+
+impl ChildWrapperLayer for TransparentChild {
+	fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+		ChildWrapperSlots::new(&mut self.0)
+	}
+}
 
 impl ChildWrapper for TransparentChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		self.0.as_ref()
+		self.0
+			.as_deref()
+			.expect("an installed transparent layer owns its child")
 	}
 
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		self.0.as_mut()
+		self.0
+			.as_deref_mut()
+			.expect("an installed transparent layer owns its child")
 	}
 
-	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+	fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
 		self.0
+			.take()
+			.expect("an installed transparent layer owns its child")
 	}
 }
 
@@ -91,27 +103,39 @@ struct Transparent;
 impl CommandWrapper for Transparent {
 	fn wrap_child(
 		&mut self,
-		child: Box<dyn ChildWrapper>,
+		_child: &mut dyn ChildWrapper,
 		_command: &Command,
-	) -> io::Result<Box<dyn ChildWrapper>> {
-		Ok(Box::new(TransparentChild(child)))
+	) -> io::Result<Option<PendingChildWrapper>> {
+		Ok(Some(PendingChildWrapper::new(TransparentChild(None))))
 	}
 }
 
 #[derive(Debug)]
-struct SecondTransparentChild(Box<dyn ChildWrapper>);
+struct SecondTransparentChild(Option<Box<dyn ChildWrapper>>);
+
+impl ChildWrapperLayer for SecondTransparentChild {
+	fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+		ChildWrapperSlots::new(&mut self.0)
+	}
+}
 
 impl ChildWrapper for SecondTransparentChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		self.0.as_ref()
+		self.0
+			.as_deref()
+			.expect("an installed transparent layer owns its child")
 	}
 
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		self.0.as_mut()
+		self.0
+			.as_deref_mut()
+			.expect("an installed transparent layer owns its child")
 	}
 
-	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+	fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
 		self.0
+			.take()
+			.expect("an installed transparent layer owns its child")
 	}
 }
 
@@ -121,10 +145,10 @@ struct SecondTransparent;
 impl CommandWrapper for SecondTransparent {
 	fn wrap_child(
 		&mut self,
-		child: Box<dyn ChildWrapper>,
+		_child: &mut dyn ChildWrapper,
 		_command: &Command,
-	) -> io::Result<Box<dyn ChildWrapper>> {
-		Ok(Box::new(SecondTransparentChild(child)))
+	) -> io::Result<Option<PendingChildWrapper>> {
+		Ok(Some(PendingChildWrapper::new(SecondTransparentChild(None))))
 	}
 }
 
@@ -245,15 +269,15 @@ struct InspectWrap {
 impl CommandWrapper for InspectWrap {
 	fn wrap_child(
 		&mut self,
-		mut child: Box<dyn ChildWrapper>,
+		child: &mut dyn ChildWrapper,
 		_command: &Command,
-	) -> io::Result<Box<dyn ChildWrapper>> {
+	) -> io::Result<Option<PendingChildWrapper>> {
 		assert!(child.take_pty_controller().is_none());
 		*self
 			.called
 			.lock()
 			.unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-		Ok(child)
+		Ok(None)
 	}
 }
 
@@ -577,14 +601,14 @@ impl CommandWrapper for FailAfterSpawn {
 
 	fn wrap_child(
 		&mut self,
-		child: Box<dyn ChildWrapper>,
+		child: &mut dyn ChildWrapper,
 		_command: &Command,
-	) -> io::Result<Box<dyn ChildWrapper>> {
+	) -> io::Result<Option<PendingChildWrapper>> {
 		if matches!(self.stage, Stage::WrapChild) {
-			self.record(child.as_ref());
+			self.record(child);
 			self.fail()
 		} else {
-			Ok(child)
+			Ok(None)
 		}
 	}
 }

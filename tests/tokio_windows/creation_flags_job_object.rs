@@ -123,11 +123,11 @@ struct FailWrapOnce {
 impl CommandWrapper for FailWrapOnce {
 	fn wrap_child(
 		&mut self,
-		child: Box<dyn ChildWrapper>,
+		_child: &mut dyn ChildWrapper,
 		_core: &CommandWrap,
-	) -> Result<Box<dyn ChildWrapper>> {
+	) -> Result<Option<PendingChildWrapper>> {
 		if self.failed {
-			return Ok(child);
+			return Ok(None);
 		}
 		self.failed = true;
 		match self.failure {
@@ -148,22 +148,34 @@ enum FailureHook {
 
 #[derive(Debug)]
 struct FailFinalizationChild {
-	inner: Box<dyn ChildWrapper>,
+	inner: Option<Box<dyn ChildWrapper>>,
 	failure: Failure,
 	hook: FailureHook,
 }
 
+impl ChildWrapperLayer for FailFinalizationChild {
+	fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+		ChildWrapperSlots::new(&mut self.inner)
+	}
+}
+
 impl ChildWrapper for FailFinalizationChild {
 	fn inner(&self) -> &dyn ChildWrapper {
-		self.inner.as_ref()
+		self.inner
+			.as_deref()
+			.expect("an installed finalization layer owns its child")
 	}
 
 	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-		self.inner.as_mut()
+		self.inner
+			.as_deref_mut()
+			.expect("an installed finalization layer owns its child")
 	}
 
-	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+	fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
 		self.inner
+			.take()
+			.expect("an installed finalization layer owns its child")
 	}
 
 	fn finalize_spawn_layer(&mut self) -> Result<()> {
@@ -204,7 +216,6 @@ impl ChildWrapper for FailFinalizationChild {
 struct FailAfterDescendant {
 	failure: Failure,
 	hook: FailureHook,
-	unwrap_child: bool,
 	pid_file: PathBuf,
 	guard: Arc<Mutex<Option<ProcessGuard>>>,
 }
@@ -261,13 +272,13 @@ impl CommandWrapper for FailAfterDescendant {
 
 	fn wrap_child(
 		&mut self,
-		child: Box<dyn ChildWrapper>,
+		child: &mut dyn ChildWrapper,
 		_core: &CommandWrap,
-	) -> Result<Box<dyn ChildWrapper>> {
+	) -> Result<Option<PendingChildWrapper>> {
 		if self.hook == FailureHook::PostSpawn {
-			return Ok(child);
+			return Ok(None);
 		}
-		resume_process_threads(child_id(child.as_ref())?)?;
+		resume_process_threads(child_id(child)?)?;
 		self.observe_descendant()?;
 		if matches!(
 			self.hook,
@@ -275,16 +286,11 @@ impl CommandWrapper for FailAfterDescendant {
 				| FailureHook::DisarmSpawnCleanup
 				| FailureHook::DisarmJobObject
 		) {
-			return Ok(Box::new(FailFinalizationChild {
-				inner: child,
+			return Ok(Some(PendingChildWrapper::new(FailFinalizationChild {
+				inner: None,
 				failure: self.failure,
 				hook: self.hook,
-			}));
-		}
-		if self.unwrap_child {
-			drop(child.into_inner());
-		} else {
-			drop(child);
+			})));
 		}
 		self.fail()
 	}
@@ -453,19 +459,18 @@ fn lifecycle_descendant_parent() {
 #[tokio::test]
 async fn armed_job_kills_descendants_after_later_failures() -> Result<()> {
 	let cases = [
-		(FailureHook::PostSpawn, false, false),
-		(FailureHook::WrapChild, false, false),
-		(FailureHook::WrapChild, true, false),
-		(FailureHook::WrapChild, true, true),
-		(FailureHook::FinalizeSpawn, false, false),
-		(FailureHook::FinalizeSpawn, true, false),
-		(FailureHook::DisarmSpawnCleanup, false, false),
-		(FailureHook::DisarmSpawnCleanup, true, false),
-		(FailureHook::DisarmJobObject, false, false),
-		(FailureHook::DisarmJobObject, true, false),
+		(FailureHook::PostSpawn, false),
+		(FailureHook::WrapChild, false),
+		(FailureHook::WrapChild, true),
+		(FailureHook::FinalizeSpawn, false),
+		(FailureHook::FinalizeSpawn, true),
+		(FailureHook::DisarmSpawnCleanup, false),
+		(FailureHook::DisarmSpawnCleanup, true),
+		(FailureHook::DisarmJobObject, false),
+		(FailureHook::DisarmJobObject, true),
 	];
 	for failure in [Failure::Error, Failure::Panic] {
-		for (hook, job_first, unwrap_child) in cases {
+		for (hook, job_first) in cases {
 			let pid_file = descendant_pid_file()?;
 			let guard = Arc::new(Mutex::new(None));
 			let mut command = CommandWrap::with_new(std::env::current_exe()?, |command| {
@@ -476,7 +481,6 @@ async fn armed_job_kills_descendants_after_later_failures() -> Result<()> {
 			let fail = FailAfterDescendant {
 				failure,
 				hook,
-				unwrap_child,
 				pid_file: pid_file.clone(),
 				guard: Arc::clone(&guard),
 			};
