@@ -372,6 +372,24 @@ async fn wait_for_process_exit(guard: ProcessExitGuard) -> io::Result<()> {
 	}
 }
 
+async fn wait_for_pid_file(path: &Path) -> io::Result<u32> {
+	let deadline = Instant::now() + TIMEOUT;
+	loop {
+		if let Ok(pid) = std::fs::read_to_string(path)
+			.and_then(|pid| pid.trim().parse().map_err(io::Error::other))
+		{
+			return Ok(pid);
+		}
+		if Instant::now() >= deadline {
+			return Err(io::Error::new(
+				io::ErrorKind::TimedOut,
+				"ConPTY descendant did not report its process ID",
+			));
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct MarkerSearch {
 	marker_start: Option<usize>,
@@ -597,7 +615,11 @@ fn conpty_child_helper() -> io::Result<()> {
 			let release = env::var_os("PW_RELEASE").ok_or_else(|| {
 				io::Error::new(io::ErrorKind::InvalidInput, "PW_RELEASE is unset")
 			})?;
-			drop(spawn_descendant(Path::new(&release))?);
+			let descendant = spawn_descendant(Path::new(&release))?;
+			if let Some(pid_file) = env::var_os("PW_DESCENDANT_PID") {
+				std::fs::write(pid_file, descendant.id().to_string())?;
+			}
+			drop(descendant);
 		}
 		"descendant" => {
 			let release = env::var_os("PW_RELEASE").ok_or_else(|| {
@@ -870,6 +892,51 @@ async fn direct_child_wait_is_independent_from_descendant_output_eof() -> io::Re
 	);
 	std::fs::File::create(&release)?;
 	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	Ok(())
+}
+
+#[cfg(feature = "job-object")]
+#[tokio::test]
+async fn job_object_waits_for_conpty_descendant_before_terminal_eof() -> io::Result<()> {
+	require_conpty!();
+	let directory = tempfile::tempdir()?;
+	let release = directory.path().join("release-descendant");
+	let pid_file = directory.path().join("descendant.pid");
+	let _release_on_drop = ReleaseOnDrop(release.clone());
+	let mut command = helper("descendant-parent")?;
+	command
+		.env("PW_RELEASE", &release)
+		.env("PW_DESCENDANT_PID", &pid_file)
+		.wrap(JobObject);
+
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
+	let direct_process = ProcessExitGuard::open(
+		child
+			.id()
+			.expect("a newly spawned ConPTY child exposes its process ID"),
+	)?;
+	let (input, mut output, _resize) = controller.into_parts();
+	let mut bytes = read_through(&mut output, b"PW-DESCENDANT-READY").await?;
+	let descendant_process = ProcessExitGuard::open(wait_for_pid_file(&pid_file).await?)?;
+	wait_for_process_exit(direct_process).await?;
+	assert_eq!(
+		child.try_wait()?,
+		None,
+		"ConPTY direct-child exit must remain pending while its job has a descendant"
+	);
+	assert!(
+		timeout(Duration::from_millis(100), child.wait())
+			.await
+			.is_err(),
+		"JobObject wait returned before the live ConPTY descendant or terminal output completed"
+	);
+
+	std::fs::File::create(&release)?;
+	drop(input);
+	let status = wait_and_drain(child.as_mut(), &mut output, &mut bytes).await?;
+	assert!(status.success());
+	assert_eq!(child.try_wait()?, Some(status));
+	wait_for_process_exit(descendant_process).await?;
 	Ok(())
 }
 

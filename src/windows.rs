@@ -11,7 +11,9 @@ use std::{
 use tracing::{debug, instrument};
 use windows::{
 	Win32::{
-		Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE},
+		Foundation::{
+			CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+		},
 		System::{
 			Diagnostics::ToolHelp::{
 				CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
@@ -20,13 +22,14 @@ use windows::{
 			IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED},
 			JobObjects::{
 				AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-				JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-				JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
-				SetInformationJobObject, TerminateJobObject,
+				JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+				JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
+				JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+				QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 			},
 			Threading::{
-				CREATE_SUSPENDED, GetProcessId, INFINITE, OpenThread, PROCESS_CREATION_FLAGS,
-				ResumeThread, THREAD_SUSPEND_RESUME,
+				CREATE_SUSPENDED, GetProcessId, OpenThread, PROCESS_CREATION_FLAGS, ResumeThread,
+				THREAD_SUSPEND_RESUME,
 			},
 		},
 	},
@@ -84,6 +87,41 @@ mod creation_flag_tests {
 		let policy = job_creation_flags(user_flags);
 		assert_eq!(policy.flags, user_flags);
 		assert!(!policy.resume_after_assignment);
+	}
+}
+
+#[cfg(test)]
+mod job_wait_tests {
+	use std::os::windows::io::AsHandle;
+
+	use windows::Win32::System::IO::{CreateIoCompletionPort, PostQueuedCompletionStatus};
+
+	use super::*;
+
+	const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
+
+	#[test]
+	fn nonterminal_completion_packet_does_not_report_job_drain() {
+		// SAFETY: these arguments create a new completion port which is immediately owned below.
+		let raw = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) }.unwrap();
+		// SAFETY: `raw` is a newly created, uniquely owned completion-port handle.
+		let port = unsafe { StdOwnedHandle::from_raw_handle(raw.0) };
+		// SAFETY: `port` owns a live completion port; the scalar payload does not borrow memory.
+		unsafe {
+			PostQueuedCompletionStatus(
+				HANDLE(port.as_raw_handle()),
+				JOB_OBJECT_MSG_NEW_PROCESS,
+				0,
+				None,
+			)
+		}
+		.unwrap();
+
+		assert_eq!(
+			poll_job_drain_with(port.as_handle(), Duration::ZERO, || Ok(false)).unwrap(),
+			ControlFlow::Continue(()),
+			"a new-process notification is only a wake hint, not proof that the job drained"
+		);
 	}
 }
 
@@ -264,35 +302,76 @@ pub(crate) fn terminate_job(job: JobHandle, exit_code: u32) -> Result<()> {
 	unsafe { TerminateJobObject(job.0, exit_code) }.map_err(Error::other)
 }
 
-/// Wait for a job to complete.
-#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
-pub(crate) fn wait_on_job(
+/// Maximum interval between authoritative JobObject accounting checks.
+pub(crate) const JOB_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn job_is_drained(job: JobHandle) -> Result<bool> {
+	let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+	// SAFETY: `job` is borrowed from a live `JobPort`; the information class requires exactly the
+	// writable accounting structure and byte count supplied here. The call returns before that stack
+	// storage is read or dropped.
+	unsafe {
+		QueryInformationJobObject(
+			Some(job.0),
+			JobObjectBasicAccountingInformation,
+			&mut accounting as *mut _ as _,
+			std::mem::size_of_val(&accounting)
+				.try_into()
+				.expect("job accounting information cannot exceed a DWORD"),
+			None,
+		)
+	}
+	.map_err(Error::other)?;
+	Ok(accounting.ActiveProcesses == 0)
+}
+
+fn poll_job_drain_with(
 	completion_port: BorrowedHandle<'_>,
-	timeout: Option<Duration>,
+	timeout: Duration,
+	mut is_drained: impl FnMut() -> Result<bool>,
 ) -> Result<ControlFlow<()>> {
-	let mut code: u32 = 0;
-	let mut key: usize = 0;
-	let mut overlapped = OVERLAPPED::default();
-	let mut lp_overlapped = &mut overlapped as *mut OVERLAPPED;
+	if is_drained()? {
+		return Ok(ControlFlow::Break(()));
+	}
+
+	let mut code = 0;
+	let mut key = 0;
+	let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
+	let timeout_ms = timeout.as_millis().try_into().unwrap_or(u32::MAX - 1);
 
 	// SAFETY: `completion_port` is lifetime-bound to a live owned handle, and every output pointer
-	// refers to live stack storage. On failure we inspect `code` and `key` only when a packet was
-	// dequeued, as indicated by a non-null `lp_overlapped`.
-	let result = unsafe {
+	// refers to initialized writable stack storage for the duration of the call. The finite timeout
+	// cannot equal `INFINITE`. A dequeued packet is only a wake hint; none of its scalar fields is
+	// treated as proof that the job drained.
+	let wake = unsafe {
 		GetQueuedCompletionStatus(
 			HANDLE(completion_port.as_raw_handle()),
 			&mut code,
 			&mut key,
-			&mut lp_overlapped as *mut _,
-			timeout.map_or(INFINITE, |d| d.as_millis().try_into().unwrap_or(INFINITE)),
+			&mut overlapped,
+			timeout_ms,
 		)
 	};
-
-	// ignore timing out errors unless the timeout was specified to INFINITE
-	// https://docs.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getqueuedcompletionstatus
-	if timeout.is_some() && result.is_err() && lp_overlapped.is_null() {
-		return Ok(ControlFlow::Continue(()));
+	if let Err(error) = wake
+		&& overlapped.is_null()
+		&& error.code() != HRESULT::from_win32(WAIT_TIMEOUT.0)
+	{
+		return Err(Error::other(error));
 	}
 
-	Ok(ControlFlow::Break(()))
+	if is_drained()? {
+		Ok(ControlFlow::Break(()))
+	} else {
+		Ok(ControlFlow::Continue(()))
+	}
+}
+
+/// Poll whether a job has no active processes, waiting at most `timeout` for a wake hint.
+#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
+pub(crate) fn poll_job_drain(
+	job: JobHandle,
+	completion_port: BorrowedHandle<'_>,
+	timeout: Duration,
+) -> Result<ControlFlow<()>> {
+	poll_job_drain_with(completion_port, timeout, || job_is_drained(job))
 }

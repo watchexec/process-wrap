@@ -16,8 +16,8 @@ use windows::Win32::{
 use crate::{
 	ChildExitStatus,
 	windows::{
-		JobPort, job_creation_flags, make_job_object, resume_threads, set_job_kill_on_drop,
-		terminate_job, wait_on_job,
+		JOB_POLL_INTERVAL, JobPort, job_creation_flags, make_job_object, poll_job_drain,
+		resume_threads, set_job_kill_on_drop, terminate_job,
 	},
 };
 
@@ -167,6 +167,7 @@ impl CommandWrapper for JobObject {
 pub struct JobObjectChild {
 	inner: Box<dyn ChildWrapper>,
 	exit_status: ChildExitStatus,
+	job_drained: bool,
 	job_port: JobPort,
 	final_kill_on_drop: bool,
 	spawn_finalized: bool,
@@ -182,6 +183,7 @@ impl JobObjectChild {
 		Self {
 			inner,
 			exit_status: ChildExitStatus::Running,
+			job_drained: false,
 			job_port,
 			final_kill_on_drop,
 			spawn_finalized: false,
@@ -236,26 +238,54 @@ impl ChildWrapper for JobObjectChild {
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wait(&mut self) -> Result<ExitStatus> {
-		if let ChildExitStatus::Exited(status) = &self.exit_status {
-			return Ok(*status);
+		let status = match self.exit_status {
+			ChildExitStatus::Running => {
+				// Direct-child exit and whole-job drain are separate states. Cache the direct status so
+				// repeated calls do not lose it while the job still contains descendants.
+				let status = self.inner.wait()?;
+				self.exit_status = ChildExitStatus::Exited(status);
+				status
+			}
+			ChildExitStatus::Exited(status) => status,
+		};
+
+		while !self.job_drained {
+			if poll_job_drain(
+				self.job_port.job,
+				self.job_port.completion_port.as_handle(),
+				JOB_POLL_INTERVAL,
+			)?
+			.is_break()
+			{
+				self.job_drained = true;
+			}
 		}
-
-		// always wait for parent to exit first, as by the time it does,
-		// it's likely that all its children have already exited.
-		let status = self.inner.wait()?;
-		self.exit_status = ChildExitStatus::Exited(status);
-
-		// nevertheless, now wait and make sure we reap all children.
-		let _ = wait_on_job(self.job_port.completion_port.as_handle(), None)?;
 		Ok(status)
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		let _ = wait_on_job(
-			self.job_port.completion_port.as_handle(),
-			Some(Duration::ZERO),
-		)?;
-		self.inner.try_wait()
+		if matches!(self.exit_status, ChildExitStatus::Running) {
+			let Some(status) = self.inner.try_wait()? else {
+				return Ok(None);
+			};
+			self.exit_status = ChildExitStatus::Exited(status);
+		}
+
+		if !self.job_drained
+			&& poll_job_drain(
+				self.job_port.job,
+				self.job_port.completion_port.as_handle(),
+				Duration::ZERO,
+			)?
+			.is_break()
+		{
+			self.job_drained = true;
+		}
+
+		match (self.exit_status, self.job_drained) {
+			(ChildExitStatus::Exited(status), true) => Ok(Some(status)),
+			_ => Ok(None),
+		}
 	}
 }
