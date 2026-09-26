@@ -519,7 +519,7 @@ async fn assert_group_signal(mut command: Command) -> io::Result<()> {
 		"stty -echo; trap '' HUP; trap 'exit 0' TERM; sleep 30 & printf ready; wait",
 	]);
 	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
-	assert_eq!(child.as_ref().type_id(), TypeId::of::<ProcessGroupChild>());
+	assert_eq!(child.inner().type_id(), TypeId::of::<ProcessGroupChild>());
 	assert!(child.try_wait()?.is_none());
 
 	let (input, mut output, _resize) = controller.into_parts();
@@ -588,7 +588,7 @@ async fn process_group_composes_when_registered_after_first_spawn() -> io::Resul
 
 	command.wrap(ProcessGroup::leader());
 	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
-	assert_eq!(child.as_ref().type_id(), TypeId::of::<ProcessGroupChild>());
+	assert_eq!(child.inner().type_id(), TypeId::of::<ProcessGroupChild>());
 	let (input, mut output, _resize) = controller.into_parts();
 	drop(input);
 	let (status, bytes) = wait_and_drain(child.as_mut(), &mut output).await?;

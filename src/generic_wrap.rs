@@ -62,7 +62,9 @@ macro_rules! Wrap {
 		/// armed, independently owned from the child chain, and able to undo this specific spawn until
 		/// process-wrap commits it. On Windows, that includes every ordinary child-finalization and
 		/// cleanup-disarm hook plus JobObject owner validation and non-owner disarming. Only the sole
-		/// JobObject owner hook, if present, runs after commit.
+		/// JobObject owner hook, if present, runs after commit. After that owner disarms, process-wrap
+		/// transfers the committed transaction residue in a private transparent layer with the returned
+		/// child.
 		#[derive(Debug)]
 		pub struct ProviderProduct {
 			child: Box<dyn $childer>,
@@ -74,8 +76,10 @@ macro_rules! Wrap {
 			///
 			/// Construct this only after the child has been created successfully. The transaction must own
 			/// everything needed to terminate and reap that child and release provider resources if a later
-			/// hook, pre-commit child-finalization step, or transaction commit fails or unwinds. These panic
-			/// guarantees do not apply to `panic=abort`.
+			/// hook, pre-commit child-finalization step, or transaction commit fails or unwinds. A successful
+			/// commit must release every rollback-only strong owner and independent liveness resource; the
+			/// remaining residue is transferred with the returned child. These panic guarantees do not apply
+			/// to `panic=abort`.
 			pub fn new(
 				child: Box<dyn $childer>,
 				transaction: Box<dyn crate::SpawnTransaction>,
@@ -90,6 +94,89 @@ macro_rules! Wrap {
 			}
 		}
 
+		#[derive(Debug)]
+		enum ProviderTransactionState {
+			Armed(Box<dyn crate::SpawnTransaction>),
+			Committed(Box<dyn crate::SpawnTransaction>),
+			Transferred,
+		}
+
+		impl ProviderTransactionState {
+			fn new(transaction: Box<dyn crate::SpawnTransaction>) -> Self {
+				Self::Armed(transaction)
+			}
+
+			fn commit(&mut self) -> ::std::io::Result<()> {
+				let Self::Armed(transaction) = self else {
+					unreachable!("only an armed provider transaction can commit");
+				};
+				transaction.commit()?;
+				let Self::Armed(transaction) = ::std::mem::replace(self, Self::Transferred) else {
+					unreachable!("the provider transaction remains armed until commit returns");
+				};
+				*self = Self::Committed(transaction);
+				Ok(())
+			}
+
+			fn take_for_failure(&mut self) -> Option<(bool, Box<dyn crate::SpawnTransaction>)> {
+				match ::std::mem::replace(self, Self::Transferred) {
+					Self::Armed(transaction) => Some((true, transaction)),
+					Self::Committed(transaction) => Some((false, transaction)),
+					Self::Transferred => None,
+				}
+			}
+
+			fn transfer(&mut self, child: Box<dyn $childer>) -> Box<dyn $childer> {
+				let Self::Committed(transaction) = ::std::mem::replace(self, Self::Transferred) else {
+					unreachable!("only committed transaction residue can transfer to a child");
+				};
+				Box::new(CommittedProviderChild {
+					child,
+					residue: ::std::sync::Arc::new(::std::sync::Mutex::new(transaction)),
+				})
+			}
+		}
+
+		#[derive(Debug)]
+		struct CommittedProviderChild {
+			child: Box<dyn $childer>,
+			residue: ::std::sync::Arc<::std::sync::Mutex<Box<dyn crate::SpawnTransaction>>>,
+		}
+
+		impl $childer for CommittedProviderChild {
+			fn inner(&self) -> &dyn $childer {
+				self.child.as_ref()
+			}
+
+			fn inner_mut(&mut self) -> &mut dyn $childer {
+				self.child.as_mut()
+			}
+
+			fn into_inner(self: Box<Self>) -> Box<dyn $childer> {
+				let Self { child, residue: _ } = *self;
+				child
+			}
+
+			#[cfg(windows)]
+			fn process_handle(&self) -> Option<::std::os::windows::io::BorrowedHandle<'_>> {
+				self.child.process_handle()
+			}
+
+			#[cfg(windows)]
+			fn resume_after_job_assignment(&mut self) -> Option<::std::io::Result<()>> {
+				self.child.resume_after_job_assignment()
+			}
+
+			fn try_clone(&self) -> Option<Box<dyn $childer>> {
+				self.child.try_clone().map(|child| {
+					Box::new(Self {
+						child,
+						residue: ::std::sync::Arc::clone(&self.residue),
+					}) as Box<dyn $childer>
+				})
+			}
+		}
+
 		/// An alternate transport for spawning this frontend's child contract.
 		///
 		/// Providers are exposed by command wrappers through [`CommandWrapper::spawn_provider`]. A
@@ -101,9 +188,15 @@ macro_rules! Wrap {
 		/// rejection, `validate_command`, every `pre_spawn` hook in registration order, native-only
 		/// attempt rejection, `validate_attempt`, and `spawn`. After `spawn` returns a product, every
 		/// `post_spawn` and child-wrapping hook runs in registration order. On Windows, process-wrap then
-		/// completes the pre-commit child phase while provider rollback remains armed, commits and drops
-		/// the transaction, and finally disarms the sole JobObject cleanup owner. `spawn_with` and
-		/// `spawn_with_child` reject a registered provider instead of bypassing it.
+		/// completes the pre-commit child phase while provider rollback remains armed, commits the
+		/// transaction, and disarms the sole JobObject cleanup owner. Successful commit ends failed-spawn
+		/// rollback. After the final owner succeeds, process-wrap transfers the committed transaction
+		/// residue in a private transparent layer with the returned child, so arbitrary residue
+		/// destruction occurs outside the spawn lifecycle. `spawn_with` and `spawn_with_child` reject a
+		/// registered provider instead of bypassing it.
+		///
+		/// A committed transaction residue must retain no armed cleanup or independent process,
+		/// terminal, controller, handle, pseudoconsole, or other liveness resource.
 		///
 		/// Rollback, wrapper restoration, and original panic-payload preservation apply only to
 		/// unwinding panics. With `panic=abort`, the process terminates before lifecycle recovery can
@@ -443,11 +536,36 @@ macro_rules! Wrap {
 				result
 			}
 
-			fn rollback_transaction(transaction: Box<dyn crate::SpawnTransaction>) {
-				let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-					let mut transaction = transaction;
+			fn quarantine_cleanup_panic(result: ::std::thread::Result<()>) {
+				if let Err(payload) = result {
+					::std::mem::forget(payload);
+				}
+			}
+
+			fn dispose_transaction(transaction: Box<dyn crate::SpawnTransaction>) {
+				let disposal = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+					drop(transaction);
+				}));
+				Self::quarantine_cleanup_panic(disposal);
+			}
+
+			fn rollback_transaction(mut transaction: Box<dyn crate::SpawnTransaction>) {
+				let rollback = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
 					let _ = transaction.rollback();
 				}));
+				Self::quarantine_cleanup_panic(rollback);
+				Self::dispose_transaction(transaction);
+			}
+
+			fn cleanup_failed_transaction(transaction: &mut ProviderTransactionState) {
+				let Some((armed, transaction)) = transaction.take_for_failure() else {
+					return;
+				};
+				if armed {
+					Self::rollback_transaction(transaction);
+				} else {
+					Self::dispose_transaction(transaction);
+				}
 			}
 
 			fn finish_provider_spawn(
@@ -456,7 +574,7 @@ macro_rules! Wrap {
 				product: ProviderProduct,
 			) -> ::std::io::Result<Box<dyn $childer>> {
 				let (mut child, transaction) = product.into_parts();
-				let mut transaction = Some(transaction);
+				let mut transaction = ProviderTransactionState::new(transaction);
 				let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
 					#[cfg(windows)]
 					let prepared = self.run_prepare_child(attempt, child.as_mut())?;
@@ -467,32 +585,20 @@ macro_rules! Wrap {
 					let child = self.run_wrap_child(child)?;
 					#[cfg(windows)]
 					let final_owner = child.finalize_spawn_before_commit()?;
-					transaction
-						.as_mut()
-						.expect("the provider transaction remains armed until commit")
-						.commit()?;
-					drop(
-						transaction
-							.take()
-							.expect("a committed provider transaction is still present"),
-					);
+					transaction.commit()?;
 					#[cfg(windows)]
 					child.finalize_spawn_final_owner(final_owner)?;
-					Ok(child)
+					Ok(transaction.transfer(child))
 				}));
 
 				match result {
 					Ok(Ok(child)) => Ok(child),
 					Ok(Err(error)) => {
-						if let Some(transaction) = transaction.take() {
-							Self::rollback_transaction(transaction);
-						}
+						Self::cleanup_failed_transaction(&mut transaction);
 						Err(error)
 					}
 					Err(payload) => {
-						if let Some(transaction) = transaction.take() {
-							Self::rollback_transaction(transaction);
-						}
+						Self::cleanup_failed_transaction(&mut transaction);
 						::std::panic::resume_unwind(payload)
 					}
 				}
@@ -538,8 +644,9 @@ macro_rules! Wrap {
 			///
 			/// With no alternate provider, this runs all `pre_spawn` hooks, spawns through the native
 			/// frontend, runs all capability-level `post_spawn` hooks, then stacks all
-			/// `wrap_child`s. A registered provider replaces only the native transport and commits its
-			/// cleanup transaction after the same complete hook chain succeeds.
+			/// `wrap_child`s. A registered provider replaces only the native transport, commits its cleanup
+			/// transaction after the same complete hook chain succeeds, and returns the child with the
+			/// committed transaction residue in a private transparent layer.
 			pub fn spawn(&mut self) -> ::std::io::Result<Box<dyn $childer>> {
 				if let Some(provider_index) = self.select_spawn_provider()? {
 					return self.spawn_with_provider(provider_index);

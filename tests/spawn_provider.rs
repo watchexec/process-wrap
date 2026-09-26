@@ -651,7 +651,8 @@ macro_rules! spawn_provider_tests {
 					_child: &mut dyn ChildWrapper,
 					_command: &CommandWrap,
 				) -> io::Result<()> {
-					match self.0.lock().unwrap().take() {
+					let failure = self.0.lock().unwrap().take();
+					match failure {
 						Some(PrimaryFailure::Error(identity)) => {
 							Err(io::Error::other(IdentityError(identity)))
 						}
@@ -890,7 +891,7 @@ macro_rules! spawn_provider_tests {
 				let mut command = provider_command(Arc::clone(&shared), "provider");
 
 				let child = command.spawn().unwrap();
-				assert_eq!(child.as_ref().type_id(), TypeId::of::<CustomChild>());
+				assert_eq!(child.inner().type_id(), TypeId::of::<CustomChild>());
 				assert_eq!(shared.events(), successful_events("provider"));
 			}
 
@@ -1718,6 +1719,218 @@ macro_rules! tokio_wait_for_child {
 	};
 }
 
+macro_rules! provider_capability_tests {
+	(
+		$module:ident,
+		$command_wrap:path,
+		$spawn_attempt:path,
+		$command_wrapper:path,
+		$child_wrapper:path,
+		$provider_product:path,
+		$spawn_provider:path,
+		$native_command:path,
+		$native_child:path,
+		$wait_for_child:ident,
+		$runtime:expr
+	) => {
+		mod $module {
+			use std::{
+				any::TypeId,
+				io,
+				process::Stdio,
+				sync::{
+					Arc,
+					atomic::{AtomicUsize, Ordering},
+				},
+				thread::sleep,
+				time::{Duration, Instant},
+			};
+
+			use process_wrap::SpawnTransaction;
+			use $child_wrapper as ChildWrapper;
+			use $command_wrap as CommandWrap;
+			use $command_wrapper as CommandWrapper;
+			use $provider_product as ProviderProduct;
+			use $spawn_attempt as SpawnAttempt;
+			use $spawn_provider as SpawnProvider;
+
+			#[derive(Debug)]
+			struct CompletedTransaction {
+				drops: Arc<AtomicUsize>,
+				committed: bool,
+			}
+
+			impl SpawnTransaction for CompletedTransaction {
+				fn commit(&mut self) -> io::Result<()> {
+					self.committed = true;
+					Ok(())
+				}
+
+				fn rollback(&mut self) -> io::Result<()> {
+					Ok(())
+				}
+			}
+
+			impl Drop for CompletedTransaction {
+				fn drop(&mut self) {
+					assert!(
+						self.committed,
+						"the completed-child transaction must commit"
+					);
+					self.drops.fetch_add(1, Ordering::SeqCst);
+				}
+			}
+
+			#[derive(Debug)]
+			struct Provider {
+				drops: Arc<AtomicUsize>,
+			}
+
+			impl SpawnProvider for Provider {
+				fn spawn(
+					&self,
+					_attempt: &mut SpawnAttempt,
+					_command: &CommandWrap,
+				) -> io::Result<ProviderProduct> {
+					let mut command = <$native_command>::new(std::env::current_exe()?);
+					command
+						.args([
+							"--exact",
+							concat!(stringify!($module), "::completed_child_process"),
+							"--nocapture",
+						])
+						.stdin(Stdio::piped())
+						.stdout(Stdio::piped())
+						.stderr(Stdio::piped());
+					let mut child = command.spawn()?;
+					let deadline = Instant::now() + Duration::from_secs(5);
+					while child.try_wait()?.is_none() {
+						if Instant::now() >= deadline {
+							return Err(io::Error::new(
+								io::ErrorKind::TimedOut,
+								"capability child did not exit",
+							));
+						}
+						sleep(Duration::from_millis(5));
+					}
+					Ok(ProviderProduct::new(
+						Box::new(child),
+						Box::new(CompletedTransaction {
+							drops: Arc::clone(&self.drops),
+							committed: false,
+						}),
+					))
+				}
+			}
+
+			#[derive(Debug)]
+			struct ProviderWrapper(Provider);
+
+			impl CommandWrapper for ProviderWrapper {
+				fn spawn_provider(&self) -> Option<&dyn SpawnProvider> {
+					Some(&self.0)
+				}
+			}
+
+			#[derive(Debug)]
+			struct OuterLayer(Box<dyn ChildWrapper>);
+
+			impl ChildWrapper for OuterLayer {
+				fn inner(&self) -> &dyn ChildWrapper {
+					self.0.as_ref()
+				}
+
+				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+					self.0.as_mut()
+				}
+
+				fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+					self.0
+				}
+
+				#[cfg(windows)]
+				fn process_handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+					self.0.process_handle()
+				}
+			}
+
+			#[derive(Debug)]
+			struct OuterWrapper;
+
+			impl CommandWrapper for OuterWrapper {
+				fn wrap_child(
+					&mut self,
+					child: Box<dyn ChildWrapper>,
+					_command: &CommandWrap,
+				) -> io::Result<Box<dyn ChildWrapper>> {
+					Ok(Box::new(OuterLayer(child)))
+				}
+			}
+
+			fn runtime() -> Option<tokio::runtime::Runtime> {
+				$runtime
+			}
+
+			fn command(drops: Arc<AtomicUsize>) -> CommandWrap {
+				let mut command = CommandWrap::new("provider-owned-program");
+				command
+					.wrap(ProviderWrapper(Provider { drops }))
+					.wrap(OuterWrapper);
+				command
+			}
+
+			#[test]
+			fn completed_child_process() {}
+
+			#[test]
+			#[cfg_attr(miri, ignore = "requires native child processes")]
+			fn committed_sidecar_delegates_the_complete_native_child_contract() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let drops = Arc::new(AtomicUsize::new(0));
+				let mut command = command(Arc::clone(&drops));
+
+				let mut child = command.spawn().expect("spawn completed provider child");
+				assert_eq!(drops.load(Ordering::SeqCst), 0);
+				assert_eq!(child.inner().type_id(), TypeId::of::<OuterLayer>());
+				assert_eq!(
+					child.inner().inner().type_id(),
+					TypeId::of::<$native_child>()
+				);
+				assert!(child.stdin().is_some());
+				assert!(child.stdout().is_some());
+				assert!(child.stderr().is_some());
+				let native_id = child
+					.try_inner_child()
+					.expect("traverse to immutable native child")
+					.id();
+				assert_eq!(child.id(), native_id);
+				// SAFETY: the process is complete and the forwarding layer owns no supervision state.
+				assert!(unsafe { child.try_inner_child_mut() }.is_some());
+				let first = $wait_for_child!(runtime, child).expect("first repeated wait");
+				let second = $wait_for_child!(runtime, child).expect("second repeated wait");
+				assert_eq!(first, second);
+				assert_eq!(child.try_wait().expect("repeat try_wait"), Some(first));
+				assert!(child.try_clone().is_none());
+				#[cfg(windows)]
+				assert!(child.try_process_handle().is_some());
+				drop(child);
+				assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+				let child = command.spawn().expect("spawn child for native extraction");
+				// SAFETY: the process is complete, the transaction has no cleanup resources after commit,
+				// and the forwarding layer owns no supervision state.
+				let mut child =
+					unsafe { child.try_into_inner_child() }.expect("extract native child");
+				assert_eq!(drops.load(Ordering::SeqCst), 2);
+				let first = $wait_for_child!(runtime, child).expect("wait extracted native child");
+				let second = $wait_for_child!(runtime, child).expect("repeat extracted child wait");
+				assert_eq!(first, second);
+			}
+		}
+	};
+}
+
 macro_rules! real_provider_tests {
 	(
 		$module:ident,
@@ -2308,6 +2521,41 @@ spawn_provider_tests!(
 	process_wrap::tokio::ChildWrapper,
 	process_wrap::tokio::ProviderProduct,
 	process_wrap::tokio::SpawnProvider,
+	Some(
+		tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap()
+	)
+);
+
+#[cfg(feature = "std")]
+provider_capability_tests!(
+	std_provider_capabilities,
+	process_wrap::std::CommandWrap,
+	process_wrap::std::SpawnAttempt,
+	process_wrap::std::CommandWrapper,
+	process_wrap::std::ChildWrapper,
+	process_wrap::std::ProviderProduct,
+	process_wrap::std::SpawnProvider,
+	std::process::Command,
+	std::process::Child,
+	std_wait_for_child,
+	None
+);
+
+#[cfg(feature = "tokio1")]
+provider_capability_tests!(
+	tokio_provider_capabilities,
+	process_wrap::tokio::CommandWrap,
+	process_wrap::tokio::SpawnAttempt,
+	process_wrap::tokio::CommandWrapper,
+	process_wrap::tokio::ChildWrapper,
+	process_wrap::tokio::ProviderProduct,
+	process_wrap::tokio::SpawnProvider,
+	tokio::process::Command,
+	tokio::process::Child,
+	tokio_wait_for_child,
 	Some(
 		tokio::runtime::Builder::new_current_thread()
 			.enable_all()
