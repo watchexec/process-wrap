@@ -142,7 +142,7 @@ impl CommandWrapper for JobObject {
 		&mut self,
 		_inner: &mut dyn ChildWrapper,
 		prepared: Option<PreparedChildRef<'_>>,
-		core: &CommandWrap,
+		_core: &CommandWrap,
 	) -> Result<Option<PendingChildWrapper>> {
 		let prepared = prepared.expect("JobObject child preparation always produces state");
 		assert!(
@@ -150,7 +150,7 @@ impl CommandWrapper for JobObject {
 			"JobObject prepared state retains its concrete type"
 		);
 		#[cfg(feature = "kill-on-drop")]
-		let final_kill_on_drop = core.has_wrap::<KillOnDrop>();
+		let final_kill_on_drop = _core.has_wrap::<KillOnDrop>();
 		#[cfg(not(feature = "kill-on-drop"))]
 		let final_kill_on_drop = false;
 		Ok(Some(PendingChildWrapper::new(JobObjectChild::detached(
