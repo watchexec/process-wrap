@@ -2,8 +2,7 @@
 
 use std::{
 	io,
-	sync::{Arc, Mutex, OnceLock},
-	thread::JoinHandle,
+	sync::{Arc, Mutex},
 };
 
 #[cfg(feature = "tracing")]
@@ -163,19 +162,6 @@ pub(super) fn coordinate(size: PtySize) -> io::Result<COORD> {
 }
 
 fn schedule_close(close: api::ClosePseudoConsole, handle: HPCON) {
-	static CLOSE_THREADS: OnceLock<Mutex<Vec<JoinHandle<()>>>> = OnceLock::new();
-	let threads = CLOSE_THREADS.get_or_init(|| Mutex::new(Vec::new()));
-	let mut threads = threads.lock().unwrap_or_else(|poison| poison.into_inner());
-	let mut index = 0;
-	while index < threads.len() {
-		if threads[index].is_finished() {
-			let finished = threads.swap_remove(index);
-			let _ = finished.join();
-		} else {
-			index += 1;
-		}
-	}
-
 	let close_thread = std::thread::Builder::new()
 		.name("process-wrap-conpty-close".into())
 		.spawn(move || {
@@ -183,7 +169,11 @@ fn schedule_close(close: api::ClosePseudoConsole, handle: HPCON) {
 			unsafe { close(handle) };
 		});
 	match close_thread {
-		Ok(close_thread) => threads.push(close_thread),
+		Ok(close_thread) => {
+			// Dropping a JoinHandle detaches its thread. The worker exclusively owns the raw HPCON
+			// transferred into its closure and will close it without blocking this caller.
+			drop(close_thread);
+		}
 		Err(error) => {
 			// Calling ClosePseudoConsole here could indefinitely block a reactor or arbitrary dropping
 			// thread on older Windows versions. Leaking is the only safe fallback after thread creation
