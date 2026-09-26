@@ -249,9 +249,13 @@ struct CleanupDiagnostic {
 #[cfg(feature = "tracing")]
 #[derive(Default)]
 struct DiagnosticState {
+	// At most one of `emitting` and `queued` is true. `queued` reserves exactly one shared-state
+	// clone for the retry queue, including the short interval before that clone is inserted.
 	next_id: u64,
 	pending: Vec<CleanupDiagnostic>,
 	dispatch: Option<tracing::Dispatch>,
+	emitting: bool,
+	queued: bool,
 }
 
 #[derive(Clone, Default)]
@@ -297,30 +301,72 @@ impl PendingDiagnostics {
 		let _ = (action, error);
 	}
 
-	fn is_empty(&self) -> bool {
+	fn try_begin_emit(&self, queued_retry: bool) -> bool {
 		#[cfg(feature = "tracing")]
 		{
-			self.state
+			let mut state = self
+				.state
 				.lock()
-				.unwrap_or_else(std::sync::PoisonError::into_inner)
-				.pending
-				.is_empty()
+				.unwrap_or_else(std::sync::PoisonError::into_inner);
+			if queued_retry {
+				if !state.queued {
+					return false;
+				}
+				debug_assert!(!state.emitting);
+				state.queued = false;
+			} else if state.queued {
+				return false;
+			}
+			if state.pending.is_empty() || state.emitting {
+				return false;
+			}
+			state.emitting = true;
+			true
 		}
 		#[cfg(not(feature = "tracing"))]
 		{
-			true
+			let _ = queued_retry;
+			false
 		}
 	}
 
-	fn emit(&self) {
+	fn emission_start_failed(&self) -> bool {
 		#[cfg(feature = "tracing")]
 		{
-			let pending = self
+			let mut state = self
 				.state
 				.lock()
-				.unwrap_or_else(std::sync::PoisonError::into_inner)
-				.pending
-				.clone();
+				.unwrap_or_else(std::sync::PoisonError::into_inner);
+			debug_assert!(state.emitting);
+			debug_assert!(!state.queued);
+			state.emitting = false;
+			if state.pending.is_empty() || state.queued {
+				false
+			} else {
+				state.queued = true;
+				true
+			}
+		}
+		#[cfg(not(feature = "tracing"))]
+		{
+			false
+		}
+	}
+
+	/// Emit one snapshot. Returns true after atomically reserving a later retry for entries that
+	/// panicked or arrived while this emitter was active.
+	fn emit(&self) -> bool {
+		#[cfg(feature = "tracing")]
+		{
+			let pending = {
+				let state = self
+					.state
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner);
+				debug_assert!(state.emitting);
+				debug_assert!(!state.queued);
+				state.pending.clone()
+			};
 			let mut emitted = Vec::with_capacity(pending.len());
 			for diagnostic in pending {
 				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -338,13 +384,28 @@ impl PendingDiagnostics {
 					emitted.push(diagnostic.id);
 				}
 			}
+			let mut state = self
+				.state
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner);
 			if !emitted.is_empty() {
-				self.state
-					.lock()
-					.unwrap_or_else(std::sync::PoisonError::into_inner)
+				state
 					.pending
 					.retain(|diagnostic| !emitted.contains(&diagnostic.id));
 			}
+			debug_assert!(state.emitting);
+			debug_assert!(!state.queued);
+			state.emitting = false;
+			if state.pending.is_empty() || state.queued {
+				false
+			} else {
+				state.queued = true;
+				true
+			}
+		}
+		#[cfg(not(feature = "tracing"))]
+		{
+			false
 		}
 	}
 
@@ -362,8 +423,8 @@ impl PendingDiagnostics {
 ///
 /// `process` is `Some` from construction until `Drop`; moving this value transfers that ownership
 /// unchanged between the caller, reaper handoff cell, reaper thread, and quarantine. Only `Drop`
-/// takes and closes the handle. Pending diagnostics move with this owner or share their state only
-/// with an off-caller emitter after the handle has reached a durable owner.
+/// takes and closes the handle. Pending diagnostics move with this owner or share their state with
+/// an off-caller emitter and retry queue only after the handle has reached a durable owner.
 struct ReapHandle {
 	process: Option<OwnedHandle>,
 	diagnostics: PendingDiagnostics,
@@ -406,12 +467,6 @@ impl ReapHandle {
 	fn pending_diagnostics(&self) -> PendingDiagnostics {
 		self.diagnostics.clone()
 	}
-
-	fn release(self) -> PendingDiagnostics {
-		let diagnostics = self.pending_diagnostics();
-		drop(self);
-		diagnostics
-	}
 }
 
 impl Drop for ReapHandle {
@@ -438,6 +493,8 @@ trait CleanupOperations: Clone + Send + Sync + 'static {
 	/// Start an off-caller diagnostic task. Returning an error means the task was not started.
 	fn spawn_diagnostic(&self, task: Box<dyn FnOnce() + Send>) -> io::Result<()>;
 
+	fn queue_diagnostics(&self, diagnostics: PendingDiagnostics);
+	fn take_queued_diagnostics(&self) -> Vec<PendingDiagnostics>;
 	fn quarantine(&self, process: ReapHandle);
 	fn take_quarantined(&self) -> Vec<ReapHandle>;
 }
@@ -483,6 +540,21 @@ impl CleanupOperations for WindowsCleanupOperations {
 			.map(drop)
 	}
 
+	fn queue_diagnostics(&self, diagnostics: PendingDiagnostics) {
+		queued_diagnostics()
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.push(diagnostics);
+	}
+
+	fn take_queued_diagnostics(&self) -> Vec<PendingDiagnostics> {
+		std::mem::take(
+			&mut *queued_diagnostics()
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner),
+		)
+	}
+
 	fn quarantine(&self, process: ReapHandle) {
 		quarantined_processes()
 			.lock()
@@ -497,6 +569,11 @@ impl CleanupOperations for WindowsCleanupOperations {
 				.unwrap_or_else(std::sync::PoisonError::into_inner),
 		)
 	}
+}
+
+fn queued_diagnostics() -> &'static Mutex<Vec<PendingDiagnostics>> {
+	static QUEUED: OnceLock<Mutex<Vec<PendingDiagnostics>>> = OnceLock::new();
+	QUEUED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn quarantined_processes() -> &'static Mutex<Vec<ReapHandle>> {
@@ -518,6 +595,7 @@ fn terminate_and_reap_with<O: CleanupOperations>(
 	operations: O,
 ) -> io::Result<()> {
 	process.diagnostics.bind_current_dispatch();
+	retry_queued_diagnostics(operations.clone());
 	let retry_error = retry_quarantined(operations.clone());
 	let termination_error = operations.terminate(process.raw()).err();
 
@@ -549,17 +627,21 @@ fn terminate_and_reap_with<O: CleanupOperations>(
 fn retry_quarantined<O: CleanupOperations>(operations: O) -> Option<io::Error> {
 	let mut first_error = None;
 	for process in operations.take_quarantined() {
-		if let Err(failure) = start_reaper(process, operations.clone()) {
-			let ReaperStartError { error, process } = failure;
-			process.add_diagnostic(
-				"failed to retry a quarantined ConPTY rollback process",
-				&error,
-			);
-			let diagnostics = process.pending_diagnostics();
-			operations.quarantine(process);
-			schedule_diagnostics(diagnostics, operations.clone());
-			if first_error.is_none() {
-				first_error = Some(error);
+		let diagnostics = process.pending_diagnostics();
+		match start_reaper(process, operations.clone()) {
+			Ok(()) => schedule_diagnostics(diagnostics, operations.clone()),
+			Err(failure) => {
+				let ReaperStartError { error, process } = failure;
+				process.add_diagnostic(
+					"failed to retry a quarantined ConPTY rollback process",
+					&error,
+				);
+				let diagnostics = process.pending_diagnostics();
+				operations.quarantine(process);
+				schedule_diagnostics(diagnostics, operations.clone());
+				if first_error.is_none() {
+					first_error = Some(error);
+				}
 			}
 		}
 	}
@@ -567,8 +649,12 @@ fn retry_quarantined<O: CleanupOperations>(operations: O) -> Option<io::Error> {
 }
 
 fn defer_reap<O: CleanupOperations>(process: ReapHandle, operations: O) -> io::Result<()> {
+	let diagnostics = process.pending_diagnostics();
 	match start_reaper(process, operations.clone()) {
-		Ok(()) => Ok(()),
+		Ok(()) => {
+			schedule_diagnostics(diagnostics, operations);
+			Ok(())
+		}
 		Err(failure) => {
 			let ReaperStartError { error, process } = failure;
 			process.add_diagnostic(
@@ -583,14 +669,33 @@ fn defer_reap<O: CleanupOperations>(process: ReapHandle, operations: O) -> io::R
 	}
 }
 
-fn schedule_diagnostics<O: CleanupOperations>(diagnostics: PendingDiagnostics, operations: O) {
-	if diagnostics.is_empty() {
-		return;
+fn retry_queued_diagnostics<O: CleanupOperations>(operations: O) {
+	for diagnostics in operations.take_queued_diagnostics() {
+		if diagnostics.try_begin_emit(true) {
+			start_diagnostic_worker(diagnostics, operations.clone());
+		}
 	}
-	let task = Box::new(move || diagnostics.emit());
-	// A failure here cannot be diagnosed recursively without risking the same thread-creation error.
-	// The diagnostics remain shared with the quarantined exact-handle owner for a later retry.
-	let _ = operations.spawn_diagnostic(task);
+}
+
+fn schedule_diagnostics<O: CleanupOperations>(diagnostics: PendingDiagnostics, operations: O) {
+	if diagnostics.try_begin_emit(false) {
+		start_diagnostic_worker(diagnostics, operations);
+	}
+}
+
+fn start_diagnostic_worker<O: CleanupOperations>(diagnostics: PendingDiagnostics, operations: O) {
+	let task_diagnostics = diagnostics.clone();
+	let task_operations = operations.clone();
+	let task = Box::new(move || {
+		if task_diagnostics.emit() {
+			task_operations.queue_diagnostics(task_diagnostics);
+		}
+	});
+	if operations.spawn_diagnostic(task).is_err() && diagnostics.emission_start_failed() {
+		// Diagnosing this recursively could repeat the same thread-creation failure. The state was
+		// atomically returned to queued/non-emitting and is retried by a later cleanup opportunity.
+		operations.queue_diagnostics(diagnostics);
+	}
 }
 
 fn start_reaper<O: CleanupOperations>(
@@ -610,7 +715,7 @@ fn start_reaper<O: CleanupOperations>(
 			.take()
 			.expect("a started ConPTY reaper receives the exact handle once");
 		match task_operations.wait(process.raw(), INFINITE) {
-			Ok(WaitOutcome::Signaled) => process.release().emit(),
+			Ok(WaitOutcome::Signaled) => drop(process),
 			Ok(WaitOutcome::Timeout) => {
 				let error = io::Error::other(
 					"an infinite ConPTY rollback reaper wait unexpectedly timed out",
@@ -621,7 +726,7 @@ fn start_reaper<O: CleanupOperations>(
 				);
 				let diagnostics = process.pending_diagnostics();
 				task_operations.quarantine(process);
-				diagnostics.emit();
+				schedule_diagnostics(diagnostics, task_operations.clone());
 			}
 			Err(error) => {
 				process.add_diagnostic(
@@ -630,7 +735,7 @@ fn start_reaper<O: CleanupOperations>(
 				);
 				let diagnostics = process.pending_diagnostics();
 				task_operations.quarantine(process);
-				diagnostics.emit();
+				schedule_diagnostics(diagnostics, task_operations.clone());
 			}
 		}
 	});
@@ -686,6 +791,7 @@ mod tests {
 	enum SubscriberBehavior {
 		Block,
 		Panic,
+		Record,
 	}
 
 	#[cfg(feature = "tracing")]
@@ -718,14 +824,21 @@ mod tests {
 		}
 
 		fn wait_for_events(&self, count: usize) {
+			assert!(
+				self.observe_events(count),
+				"cleanup diagnostic was not emitted"
+			);
+		}
+
+		fn observe_events(&self, count: usize) -> bool {
 			let deadline = std::time::Instant::now() + Duration::from_secs(2);
 			while self.event_count() < count {
-				assert!(
-					std::time::Instant::now() < deadline,
-					"cleanup diagnostic was not emitted"
-				);
+				if std::time::Instant::now() >= deadline {
+					return false;
+				}
 				std::thread::sleep(Duration::from_millis(1));
 			}
+			true
 		}
 
 		fn event_count(&self) -> usize {
@@ -780,6 +893,7 @@ mod tests {
 					}
 				}
 				SubscriberBehavior::Panic => panic!("injected cleanup diagnostic panic"),
+				SubscriberBehavior::Record => {}
 			}
 		}
 
@@ -829,9 +943,14 @@ mod tests {
 		reaper_results: Mutex<VecDeque<WaitPlan>>,
 		spawn_failures: AtomicUsize,
 		spawn_calls: AtomicUsize,
+		diagnostic_spawn_failures: AtomicUsize,
+		diagnostic_spawn_calls: AtomicUsize,
+		active_diagnostic_threads: AtomicUsize,
+		max_active_diagnostic_threads: AtomicUsize,
 		waits: Mutex<Vec<WaitRecord>>,
 		gate: Mutex<ReaperGate>,
 		gate_changed: Condvar,
+		queued_diagnostics: Mutex<Vec<PendingDiagnostics>>,
 		quarantine: Mutex<Vec<ReapHandle>>,
 	}
 
@@ -853,9 +972,14 @@ mod tests {
 					reaper_results: Mutex::new(VecDeque::new()),
 					spawn_failures: AtomicUsize::new(spawn_failures),
 					spawn_calls: AtomicUsize::new(0),
+					diagnostic_spawn_failures: AtomicUsize::new(0),
+					diagnostic_spawn_calls: AtomicUsize::new(0),
+					active_diagnostic_threads: AtomicUsize::new(0),
+					max_active_diagnostic_threads: AtomicUsize::new(0),
 					waits: Mutex::new(Vec::new()),
 					gate: Mutex::new(ReaperGate::default()),
 					gate_changed: Condvar::new(),
+					queued_diagnostics: Mutex::new(Vec::new()),
 					quarantine: Mutex::new(Vec::new()),
 				}),
 			}
@@ -888,6 +1012,11 @@ mod tests {
 		}
 
 		#[cfg(feature = "tracing")]
+		fn queued_diagnostics_len(&self) -> usize {
+			self.state.queued_diagnostics.lock().unwrap().len()
+		}
+
+		#[cfg(feature = "tracing")]
 		fn quarantined_diagnostic_count(&self) -> usize {
 			self.state
 				.quarantine
@@ -900,6 +1029,42 @@ mod tests {
 
 		fn spawn_calls(&self) -> usize {
 			self.state.spawn_calls.load(Ordering::SeqCst)
+		}
+
+		#[cfg(feature = "tracing")]
+		fn set_diagnostic_spawn_failures(&self, failures: usize) {
+			self.state
+				.diagnostic_spawn_failures
+				.store(failures, Ordering::SeqCst);
+		}
+
+		#[cfg(feature = "tracing")]
+		fn diagnostic_spawn_calls(&self) -> usize {
+			self.state.diagnostic_spawn_calls.load(Ordering::SeqCst)
+		}
+
+		#[cfg(feature = "tracing")]
+		fn active_diagnostic_threads(&self) -> usize {
+			self.state.active_diagnostic_threads.load(Ordering::SeqCst)
+		}
+
+		#[cfg(feature = "tracing")]
+		fn wait_for_no_diagnostic_threads(&self) {
+			let deadline = std::time::Instant::now() + Duration::from_secs(2);
+			while self.active_diagnostic_threads() != 0 {
+				assert!(
+					std::time::Instant::now() < deadline,
+					"diagnostic emitters did not finish"
+				);
+				std::thread::sleep(Duration::from_millis(1));
+			}
+		}
+
+		#[cfg(feature = "tracing")]
+		fn max_active_diagnostic_threads(&self) -> usize {
+			self.state
+				.max_active_diagnostic_threads
+				.load(Ordering::SeqCst)
 		}
 	}
 
@@ -964,10 +1129,50 @@ mod tests {
 		}
 
 		fn spawn_diagnostic(&self, task: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+			self.state
+				.diagnostic_spawn_calls
+				.fetch_add(1, Ordering::SeqCst);
+			let fail = self
+				.state
+				.diagnostic_spawn_failures
+				.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+					remaining.checked_sub(1)
+				})
+				.is_ok();
+			if fail {
+				return Err(io::Error::other(
+					"injected ConPTY diagnostic thread start failure",
+				));
+			}
+			let state = Arc::clone(&self.state);
 			std::thread::Builder::new()
 				.name("test-process-wrap-conpty-diagnostic".into())
-				.spawn(task)
+				.spawn(move || {
+					let active = state
+						.active_diagnostic_threads
+						.fetch_add(1, Ordering::SeqCst)
+						+ 1;
+					state
+						.max_active_diagnostic_threads
+						.fetch_max(active, Ordering::SeqCst);
+					task();
+					state
+						.active_diagnostic_threads
+						.fetch_sub(1, Ordering::SeqCst);
+				})
 				.map(drop)
+		}
+
+		fn queue_diagnostics(&self, diagnostics: PendingDiagnostics) {
+			self.state
+				.queued_diagnostics
+				.lock()
+				.unwrap()
+				.push(diagnostics);
+		}
+
+		fn take_queued_diagnostics(&self) -> Vec<PendingDiagnostics> {
+			std::mem::take(&mut *self.state.queued_diagnostics.lock().unwrap())
 		}
 
 		fn quarantine(&self, process: ReapHandle) {
@@ -1116,7 +1321,7 @@ mod tests {
 
 	#[cfg(feature = "tracing")]
 	#[test]
-	fn blocking_diagnostic_subscriber_cannot_block_cleanup_or_handle_release() {
+	fn blocking_diagnostic_subscriber_runs_before_signal_without_blocking_cleanup_or_reaping() {
 		let operations = TestOperations::new(Some(5), [WaitPlan::Timeout], 0);
 		let (process, raw, released) = tracked_handle();
 		let subscriber = SubscriberState::new(SubscriberBehavior::Block);
@@ -1143,13 +1348,110 @@ mod tests {
 		assert_eq!(completion.unwrap().unwrap_err().raw_os_error(), Some(5));
 		caller.join().unwrap();
 		operations.wait_for_reaper();
-		assert_eq!(subscriber.event_count(), 0);
+		subscriber.wait_for_event();
+		assert_eq!(operations.diagnostic_spawn_calls(), 1);
+		assert_eq!(operations.max_active_diagnostic_threads(), 1);
+		assert_eq!(subscriber.event_count(), 1);
 		assert_not_released(&released);
 
 		operations.signal_reapers();
-		subscriber.wait_for_event();
 		assert_released(&released, raw);
 		subscriber.release();
+		operations.wait_for_no_diagnostic_threads();
+		assert_eq!(subscriber.event_count(), 1);
+	}
+
+	#[cfg(feature = "tracing")]
+	#[test]
+	fn repeated_start_failures_keep_one_blocked_diagnostic_emitter() {
+		let operations = TestOperations::new(
+			None,
+			[WaitPlan::Timeout, WaitPlan::Signaled, WaitPlan::Signaled],
+			2,
+		);
+		let subscriber = SubscriberState::new(SubscriberBehavior::Block);
+		let dispatch = diagnostic_dispatch(Arc::clone(&subscriber));
+		let (process, raw, released) = tracked_handle();
+
+		tracing::dispatcher::with_default(&dispatch, || {
+			terminate_and_reap_with(process, operations.clone())
+		})
+		.unwrap_err();
+		subscriber.wait_for_event();
+		assert_eq!(operations.quarantine_len(), 1);
+		assert_not_released(&released);
+
+		let (second, second_raw, second_released) = tracked_handle();
+		tracing::dispatcher::with_default(&dispatch, || {
+			terminate_and_reap_with(second, operations.clone())
+		})
+		.unwrap_err();
+		assert_released(&second_released, second_raw);
+		let spawn_calls_while_blocked = operations.diagnostic_spawn_calls();
+		let max_active_while_blocked = operations.max_active_diagnostic_threads();
+		assert_eq!(operations.quarantine_len(), 1);
+		assert_not_released(&released);
+
+		subscriber.release();
+		operations.wait_for_no_diagnostic_threads();
+
+		let (third, third_raw, third_released) = tracked_handle();
+		tracing::dispatcher::with_default(&dispatch, || {
+			terminate_and_reap_with(third, operations.clone())
+		})
+		.unwrap();
+		operations.wait_for_reaper();
+		subscriber.wait_for_events(2);
+		assert_released(&third_released, third_raw);
+
+		operations.signal_reapers();
+		assert_released(&released, raw);
+		assert_eq!(spawn_calls_while_blocked, 1);
+		assert_eq!(max_active_while_blocked, 1);
+		assert_eq!(operations.max_active_diagnostic_threads(), 1);
+		assert_eq!(subscriber.event_count(), 2);
+	}
+
+	#[cfg(feature = "tracing")]
+	#[test]
+	fn diagnostic_start_failure_retries_once_while_reaper_remains_unsignaled() {
+		let operations = TestOperations::new(Some(5), [WaitPlan::Timeout, WaitPlan::Signaled], 0);
+		operations.set_diagnostic_spawn_failures(1);
+		let subscriber = SubscriberState::new(SubscriberBehavior::Record);
+		let dispatch = diagnostic_dispatch(Arc::clone(&subscriber));
+		let (process, raw, released) = tracked_handle();
+
+		let error = tracing::dispatcher::with_default(&dispatch, || {
+			terminate_and_reap_with(process, operations.clone())
+		})
+		.unwrap_err();
+		assert_eq!(error.raw_os_error(), Some(5));
+		operations.wait_for_reaper();
+		assert_eq!(operations.diagnostic_spawn_calls(), 1);
+		assert_eq!(operations.queued_diagnostics_len(), 1);
+		assert_eq!(subscriber.event_count(), 0);
+		assert_not_released(&released);
+
+		let (next, next_raw, next_released) = tracked_handle();
+		tracing::dispatcher::with_default(&dispatch, || {
+			terminate_and_reap_with(next, operations.clone())
+		})
+		.unwrap();
+		assert_released(&next_released, next_raw);
+		let emitted_before_signal = subscriber.observe_events(1);
+		operations.wait_for_no_diagnostic_threads();
+		assert_not_released(&released);
+
+		operations.signal_reapers();
+		assert_released(&released, raw);
+		assert!(
+			emitted_before_signal,
+			"a later cleanup did not retry the retained diagnostic"
+		);
+		assert_eq!(operations.diagnostic_spawn_calls(), 2);
+		assert_eq!(operations.queued_diagnostics_len(), 0);
+		assert_eq!(operations.max_active_diagnostic_threads(), 1);
+		assert_eq!(subscriber.event_count(), 1);
 	}
 
 	#[cfg(feature = "tracing")]
@@ -1223,6 +1525,8 @@ mod tests {
 		.unwrap_err();
 		assert_eq!(error.to_string(), "injected ConPTY reaper start failure");
 		subscriber.wait_for_events(1);
+		operations.wait_for_no_diagnostic_threads();
+		assert_eq!(operations.queued_diagnostics_len(), 1);
 		assert_eq!(operations.quarantine_len(), 1);
 		assert_eq!(operations.quarantined_diagnostic_count(), 1);
 		assert_not_released(&released);
@@ -1236,7 +1540,11 @@ mod tests {
 			retry_error.to_string(),
 			"injected ConPTY reaper start failure"
 		);
-		subscriber.wait_for_events(3);
+		subscriber.wait_for_events(2);
+		operations.wait_for_no_diagnostic_threads();
+		let events_after_second_attempt = subscriber.event_count();
+		assert!(events_after_second_attempt <= 3);
+		assert_eq!(operations.queued_diagnostics_len(), 1);
 		assert_eq!(operations.quarantine_len(), 1);
 		assert_eq!(operations.quarantined_diagnostic_count(), 2);
 		assert_released(&second_released, second_raw);
@@ -1248,12 +1556,13 @@ mod tests {
 		})
 		.unwrap();
 		operations.wait_for_reaper();
+		subscriber.wait_for_events(events_after_second_attempt + 2);
+		operations.wait_for_no_diagnostic_threads();
 		assert_eq!(operations.quarantine_len(), 0);
 		assert_released(&third_released, third_raw);
 		assert_not_released(&released);
 
 		operations.signal_reapers();
-		subscriber.wait_for_events(5);
 		assert_released(&released, raw);
 	}
 
@@ -1273,6 +1582,8 @@ mod tests {
 		operations.wait_for_reaper();
 		operations.signal_reapers();
 		subscriber.wait_for_events(1);
+		operations.wait_for_no_diagnostic_threads();
+		assert_eq!(operations.queued_diagnostics_len(), 1);
 		assert_eq!(operations.quarantine_len(), 1);
 		assert_eq!(operations.quarantined_diagnostic_count(), 1);
 		assert_not_released(&released);
