@@ -842,6 +842,28 @@ macro_rules! spawn_provider_tests {
 			}
 
 			#[test]
+			fn commit_panic_rolls_back_preserves_payload_and_allows_reuse() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let shared = Arc::new(Shared::default());
+				shared.fail_once(Point::Commit, Failure::Panic("commit failed"));
+				let mut command = provider_command(Arc::clone(&shared), "provider");
+
+				assert_failure(
+					&mut command,
+					Failure::Panic("commit failed"),
+					"commit failed",
+				);
+				let mut expected = successful_events("provider");
+				expected.push(Event::Rollback);
+				assert_eq!(shared.events(), expected);
+
+				shared.clear_events();
+				let _child = command.spawn().unwrap();
+				assert_eq!(shared.events(), successful_events("provider"));
+			}
+
+			#[test]
 			fn successful_provider_can_be_reused() {
 				let runtime = runtime();
 				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
