@@ -1,5 +1,8 @@
 #![cfg(all(any(feature = "std", feature = "tokio1"), any(unix, windows)))]
 
+#[path = "support/bounded_process.rs"]
+mod bounded_process;
+
 macro_rules! spawn_with_child_tests {
 	(
 		$module:ident,
@@ -15,18 +18,17 @@ macro_rules! spawn_with_child_tests {
 		mod $module {
 			use std::{
 				any::TypeId,
-				io::{self, Read},
+				io,
 				panic::{AssertUnwindSafe, catch_unwind, panic_any},
-				process::{ExitStatus, Output, Stdio},
 				sync::{
 					Arc, Mutex,
 					atomic::{AtomicUsize, Ordering},
-					mpsc,
 				},
 				thread::sleep,
 				time::{Duration, Instant},
 			};
 
+			use super::bounded_process;
 			use $child_wrapper as ChildWrapper;
 			use $child_wrapper_layer as ChildWrapperLayer;
 			use $child_wrapper_slots as ChildWrapperSlots;
@@ -402,113 +404,13 @@ macro_rules! spawn_with_child_tests {
 				test_name: &str,
 				environment: (&str, &str),
 				timeout: Duration,
-			) -> (Output, bool) {
-				const REAP_TIMEOUT: Duration = Duration::from_secs(5);
-
-				struct ChildGuard(Option<std::process::Child>);
-
-				impl ChildGuard {
-					fn terminate_and_reap(&mut self) -> io::Result<ExitStatus> {
-						let child = self
-							.0
-							.as_mut()
-							.expect("the guarded subprocess remains available");
-						match child.kill() {
-							Ok(()) => {}
-							Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
-							Err(error) => return Err(error),
-						}
-						let deadline = Instant::now() + REAP_TIMEOUT;
-						loop {
-							if let Some(status) = child.try_wait()? {
-								return Ok(status);
-							}
-							if Instant::now() >= deadline {
-								return Err(io::Error::new(
-									io::ErrorKind::TimedOut,
-									"isolated wrapping subprocess was not reaped after termination",
-								));
-							}
-							sleep(Duration::from_millis(5));
-						}
-					}
-				}
-
-				impl Drop for ChildGuard {
-					fn drop(&mut self) {
-						if self.0.is_some() {
-							let _ = self.terminate_and_reap();
-						}
-					}
-				}
-
-				fn drain_pipe(
-					mut pipe: impl Read + Send + 'static,
-				) -> mpsc::Receiver<io::Result<Vec<u8>>> {
-					let (sender, receiver) = mpsc::channel();
-					std::thread::spawn(move || {
-						let mut bytes = Vec::new();
-						let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
-						let _ = sender.send(result);
-					});
-					receiver
-				}
-
-				fn collect_output(
-					status: ExitStatus,
-					stdout: mpsc::Receiver<io::Result<Vec<u8>>>,
-					stderr: mpsc::Receiver<io::Result<Vec<u8>>>,
-				) -> Output {
-					let deadline = Instant::now() + REAP_TIMEOUT;
-					let receive = |receiver: mpsc::Receiver<io::Result<Vec<u8>>>, label| {
-						let remaining = deadline.saturating_duration_since(Instant::now());
-						receiver
-							.recv_timeout(remaining)
-							.unwrap_or_else(|error| {
-								panic!("did not drain isolated {label}: {error}")
-							})
-							.unwrap_or_else(|error| {
-								panic!("could not read isolated {label}: {error}")
-							})
-					};
-					Output {
-						status,
-						stdout: receive(stdout, "stdout"),
-						stderr: receive(stderr, "stderr"),
-					}
-				}
-
-				let mut spawned = std::process::Command::new(std::env::current_exe().unwrap())
+			) -> (std::process::Output, bool) {
+				let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+				command
 					.args(["--exact", test_name, "--nocapture"])
-					.env(environment.0, environment.1)
-					.stdout(Stdio::piped())
-					.stderr(Stdio::piped())
-					.spawn()
-					.expect("start isolated wrapping regression");
-				let stdout = drain_pipe(spawned.stdout.take().expect("capture isolated stdout"));
-				let stderr = drain_pipe(spawned.stderr.take().expect("capture isolated stderr"));
-				let mut child = ChildGuard(Some(spawned));
-				let deadline = Instant::now() + timeout;
-				loop {
-					let status = child
-						.0
-						.as_mut()
-						.expect("the subprocess remains guarded while polling")
-						.try_wait()
-						.expect("poll isolated wrapping regression");
-					if let Some(status) = status {
-						child.0.take();
-						return (collect_output(status, stdout, stderr), false);
-					}
-					if Instant::now() >= deadline {
-						let status = child
-							.terminate_and_reap()
-							.expect("terminate and reap expired wrapping subprocess");
-						child.0.take();
-						return (collect_output(status, stdout, stderr), true);
-					}
-					sleep(Duration::from_millis(5));
-				}
+					.env(environment.0, environment.1);
+				bounded_process::run(command, timeout, None)
+					.expect("run isolated wrapping regression")
 			}
 
 			fn wait_for_exit(mut child: Box<dyn ChildWrapper>) {
