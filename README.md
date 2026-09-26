@@ -349,7 +349,7 @@ The trait provides extension or hook points into the lifecycle of a `Command`:
   only one registered wrapper may expose one.
 
 Pre-spawn, post-spawn, and child-wrapping hooks all run in registration order and stop at the first
-error or panic. The active wrapper remains registered but is temporarily unavailable through
+error or unwinding panic. The active wrapper remains registered but is temporarily unavailable through
 `get_wrap`; peer wrappers remain visible.
 
 ### Spawn providers
@@ -372,8 +372,11 @@ Callbacks run in this order:
 Validation must reject unsupported portable policy before allocating operating-system resources.
 `spawn` returns a child satisfying the frontend's complete `ChildWrapper` contract together with a
 fresh, armed `SpawnTransaction`. The transaction owns cleanup independently of the child chain. A
-later hook, wrapper, or commit error/panic causes best-effort rollback while preserving the original
-failure. Until `spawn` returns the product, cleanup remains the provider's responsibility.
+later hook, wrapper, or commit error or unwinding panic causes best-effort rollback while preserving
+the original failure. Rollback, wrapper restoration, original panic-payload preservation, and
+cleanup-diagnostic panic containment apply only to unwinding panics. With `panic=abort`, the process
+terminates before those guarantees can run. Until `spawn` returns the product, cleanup remains the
+provider's responsibility.
 
 A command may register only one provider; conflicts are rejected before any provider callback or
 operating-system allocation. Both providers and wrapper state are reused across repeated spawns.

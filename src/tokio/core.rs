@@ -150,7 +150,7 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	/// Disarm Windows cleanup state owned by this child layer.
 	///
 	/// Process-wrap invokes this internal hook only after every ordinary spawn finalizer succeeds, so
-	/// cleanup remains armed if any earlier finalizer errors or panics.
+	/// cleanup remains armed if any earlier finalizer errors or hits an unwinding panic.
 	#[doc(hidden)]
 	#[cfg(windows)]
 	fn disarm_spawn_cleanup_layer(&mut self) -> Result<()> {

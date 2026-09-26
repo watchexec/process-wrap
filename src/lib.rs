@@ -246,8 +246,8 @@
 //!   lifecycle, and only one registered wrapper may expose one. By default returns `None`.
 //!
 //! Pre-spawn, post-spawn, and child-wrapping hooks all run in registration order and stop at the first
-//! error or panic. The active wrapper remains registered but is temporarily unavailable through
-//! `get_wrap`; peer wrappers remain visible.
+//! error or unwinding panic. The active wrapper remains registered but is temporarily unavailable
+//! through `get_wrap`; peer wrappers remain visible.
 //!
 //! ## Spawn providers
 //!
@@ -268,8 +268,11 @@
 //! Validation rejects unsupported portable policy before operating-system allocation. `spawn`
 //! returns a child satisfying the frontend's complete `ChildWrapper` contract and a fresh, armed
 //! `SpawnTransaction` which owns cleanup independently of the child chain. A later public hook,
-//! wrapper, or commit error/panic causes best-effort rollback while preserving the original failure.
-//! Cleanup before `spawn` returns that product remains the provider's responsibility.
+//! wrapper, or commit error or unwinding panic causes best-effort rollback while preserving the
+//! original failure. Rollback, wrapper restoration, original panic-payload preservation, and
+//! cleanup-diagnostic panic containment apply only to unwinding panics. With `panic=abort`, the
+//! process terminates before those guarantees can run. Cleanup before `spawn` returns that product
+//! remains the provider's responsibility.
 //!
 //! A command may register only one provider; conflicts are rejected before callbacks or allocation.
 //! Providers and wrapper state are reusable across repeated spawns. `spawn_with` and

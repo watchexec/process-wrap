@@ -362,8 +362,8 @@ impl PendingDiagnostics {
 		}
 	}
 
-	/// Emit one snapshot. Returns true after atomically reserving a later retry for entries that
-	/// panicked or arrived while this emitter was active.
+	/// Emit one snapshot. Returns true after atomically reserving a later retry for entries whose
+	/// diagnostic emission hit an unwinding panic or that arrived while this emitter was active.
 	fn emit(&self) -> bool {
 		#[cfg(feature = "tracing")]
 		{

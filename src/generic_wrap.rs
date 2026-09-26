@@ -104,6 +104,10 @@ macro_rules! Wrap {
 		/// completes the pre-commit child phase while provider rollback remains armed, commits and drops
 		/// the transaction, and finally disarms the sole JobObject cleanup owner. `spawn_with` and
 		/// `spawn_with_child` reject a registered provider instead of bypassing it.
+		///
+		/// Rollback, wrapper restoration, and original panic-payload preservation apply only to
+		/// unwinding panics. With `panic=abort`, the process terminates before lifecycle recovery can
+		/// run.
 		pub trait SpawnProvider: ::std::fmt::Debug + Send + Sync + 'static {
 			/// Check whether this provider is available on the current platform and runtime.
 			///
@@ -139,7 +143,7 @@ macro_rules! Wrap {
 			///
 			/// The provider must honor every portable setting accepted by `validate_attempt`. Until this
 			/// method returns a `ProviderProduct`, it remains responsible for cleaning up resources and any
-			/// child it creates if it returns an error or panics.
+			/// child it creates if it returns an error or an unwinding panic.
 			fn spawn(
 				&self,
 				attempt: &mut SpawnAttempt,
@@ -675,9 +679,9 @@ macro_rules! Wrap {
 
 			/// Called before the command is spawned, to mutate this attempt as needed.
 			///
-			/// Hooks run in registration order and stop at the first error or panic. Mutations to an attempt
-			/// copied from a tracked command apply to that spawn only. A native-only base instead retains
-			/// native mutations when process-wrap restores it after the lifecycle.
+			/// Hooks run in registration order and stop at the first error or unwinding panic. Mutations to
+			/// an attempt copied from a tracked command apply to that spawn only. A native-only base instead
+			/// retains native mutations when process-wrap restores it after the lifecycle.
 			///
 			/// Calling `SpawnAttempt::native_mut`, directly or through `stdin`, `stdout`, or `stderr`, makes a
 			/// tracked attempt opaque. A registered portable provider rejects it after all pre-spawn hooks
@@ -717,12 +721,12 @@ macro_rules! Wrap {
 
 			/// Called after any transport spawns a child, but before the child is wrapped.
 			///
-			/// Hooks run in registration order and stop at the first error or panic. The child is exposed
-			/// through the frontend's object-safe capability trait, so it may be a terminal custom or
+			/// Hooks run in registration order and stop at the first error or unwinding panic. The child is
+			/// exposed through the frontend's object-safe capability trait, so it may be a terminal custom or
 			/// provider child with no native child value. The transport has already created it: changing
 			/// command settings on `attempt` here cannot configure that child.
 			///
-			/// On the provider path, an error or panic triggers best-effort transaction rollback. Native
+			/// On the provider path, an error or unwinding panic triggers best-effort transaction rollback. Native
 			/// transports do not promise equivalent child cleanup on every platform.
 			///
 			/// Default implementation: no-op.
@@ -739,9 +743,9 @@ macro_rules! Wrap {
 			///
 			/// If the wrapper needs to override methods on the child, it should create an instance of its
 			/// own type implementing `ChildWrapper` and return it here. Wrappers run in registration order
-			/// and stop at the first error or panic, so `.wrap(Foo).wrap(Bar)` produces an outer
-			/// `Bar(Foo(child))` layer. On the provider path, an error or panic triggers best-effort
-			/// transaction rollback.
+			/// and stop at the first error or unwinding panic, so `.wrap(Foo).wrap(Bar)` produces an outer
+			/// `Bar(Foo(child))` layer. On the provider path, an error or unwinding panic triggers
+			/// best-effort transaction rollback.
 			///
 			/// Default implementation: no-op (returns the child unchanged).
 			fn wrap_child(

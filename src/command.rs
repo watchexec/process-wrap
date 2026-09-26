@@ -550,8 +550,8 @@ impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
 /// hooks directly. These panic guarantees require unwinding; `panic=abort` terminates the process
 /// before rollback or payload preservation can run.
 ///
-/// Until a provider returns its `ProviderProduct`, cleanup for errors or panics in its own `spawn`
-/// implementation remains the provider's responsibility.
+/// Until a provider returns its `ProviderProduct`, cleanup for errors or unwinding panics in its own
+/// `spawn` implementation remains the provider's responsibility.
 pub trait SpawnTransaction: fmt::Debug + Send + 'static {
 	/// Finalize the successful spawn and disarm rollback resources.
 	fn commit(&mut self) -> std::io::Result<()>;
