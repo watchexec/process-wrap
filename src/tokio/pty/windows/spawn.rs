@@ -128,7 +128,7 @@ impl SpawnCleanup {
 	}
 
 	#[cfg(test)]
-	fn tracked(process: OwnedHandle, released: std::sync::mpsc::Sender<usize>) -> Self {
+	pub(super) fn tracked(process: OwnedHandle, released: std::sync::mpsc::Sender<usize>) -> Self {
 		Self {
 			process: Some(ReapHandle::tracked(process, released)),
 		}

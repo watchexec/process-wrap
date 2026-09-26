@@ -443,6 +443,14 @@ impl ControllerSlot {
 		}
 	}
 
+	#[cfg(all(test, windows))]
+	pub(super) fn empty_for_test() -> Self {
+		Self {
+			controller: Mutex::new(None),
+			committed: AtomicBool::new(false),
+		}
+	}
+
 	pub(super) fn commit(&self) {
 		self.committed.store(true, Ordering::Release);
 	}

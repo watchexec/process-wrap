@@ -271,16 +271,16 @@ fn with_slave_stdio<T>(
 
 #[derive(Debug)]
 struct PtyTransaction {
-	child: Arc<Mutex<tokio::process::Child>>,
-	controller: Arc<ControllerSlot>,
+	child: Option<Arc<Mutex<tokio::process::Child>>>,
+	controller: Option<Arc<ControllerSlot>>,
 	armed: bool,
 }
 
 impl PtyTransaction {
 	fn new(child: Arc<Mutex<tokio::process::Child>>, controller: Arc<ControllerSlot>) -> Self {
 		Self {
-			child,
-			controller,
+			child: Some(child),
+			controller: Some(controller),
 			armed: true,
 		}
 	}
@@ -289,16 +289,25 @@ impl PtyTransaction {
 		if !std::mem::replace(&mut self.armed, false) {
 			return Ok(());
 		}
-		self.controller.rollback();
-		terminate_and_reap(&self.child)
+		if let Some(controller) = self.controller.take() {
+			controller.rollback();
+		}
+		self.child
+			.take()
+			.map_or(Ok(()), |child| terminate_and_reap(&child))
 	}
 }
 
 impl SpawnTransaction for PtyTransaction {
 	fn commit(&mut self) -> io::Result<()> {
 		if self.armed {
-			self.controller.commit();
+			self.controller
+				.as_ref()
+				.expect("an armed PTY transaction owns its controller")
+				.commit();
 			self.armed = false;
+			self.child.take();
+			self.controller.take();
 		}
 		Ok(())
 	}
@@ -674,6 +683,44 @@ mod tests {
 			[stdin_reader, stdout_reader, stderr_reader],
 			raw,
 		)
+	}
+
+	#[tokio::test]
+	async fn committed_transaction_releases_rollback_only_strong_owners() {
+		let mut command = tokio::process::Command::new("sh");
+		command.args(["-c", "exit 0"]);
+		let child = Arc::new(Mutex::new(
+			command.spawn().expect("spawn transaction child"),
+		));
+
+		let (master, slave) = open_pty(PtySize::default()).expect("allocate transaction PTY");
+		drop(slave);
+		let master = Arc::new(AsyncFd::new(master).expect("register transaction PTY master"));
+		let controller = Arc::new(ControllerSlot::new(PtyController::new(
+			Input {
+				master: Some(Arc::clone(&master)),
+			},
+			Output {
+				master: Arc::clone(&master),
+			},
+			Resize {
+				master: Arc::downgrade(&master),
+			},
+		)));
+		drop(master);
+
+		let mut transaction = PtyTransaction::new(Arc::clone(&child), Arc::clone(&controller));
+		assert_eq!(Arc::strong_count(&child), 2);
+		assert_eq!(Arc::strong_count(&controller), 2);
+		transaction.commit().expect("commit PTY transaction");
+		assert_eq!(Arc::strong_count(&child), 1);
+		assert_eq!(Arc::strong_count(&controller), 1);
+
+		let mut child = child.lock().unwrap();
+		if child.try_wait().unwrap().is_none() {
+			child.start_kill().expect("terminate transaction child");
+			child.wait().await.expect("reap transaction child");
+		}
 	}
 
 	#[test]

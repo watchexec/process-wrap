@@ -25,6 +25,17 @@ pub(super) struct Release {
 	state: Arc<State>,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct ReleaseTracker(std::sync::Weak<State>);
+
+#[cfg(test)]
+impl ReleaseTracker {
+	pub(super) fn strong_count(&self) -> usize {
+		self.0.strong_count()
+	}
+}
+
 #[derive(Debug)]
 struct State {
 	handle: HPCON,
@@ -104,6 +115,17 @@ impl PseudoConsole {
 }
 
 impl Release {
+	#[cfg(test)]
+	pub(super) fn tracked(api: &'static ConPtyApi, handle: HPCON) -> (Self, ReleaseTracker) {
+		let state = Arc::new(State {
+			handle,
+			api,
+			lifecycle: Mutex::new(Lifecycle::default()),
+		});
+		let tracker = ReleaseTracker(Arc::downgrade(&state));
+		(Self { state }, tracker)
+	}
+
 	pub(super) fn release(&self) -> io::Result<()> {
 		let mut lifecycle = self
 			.state

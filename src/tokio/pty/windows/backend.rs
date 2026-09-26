@@ -52,29 +52,137 @@ pub(in crate::tokio::pty) fn spawn(
 	Ok(ProviderProduct::new(
 		Box::new(child),
 		Box::new(ConPtyTransaction {
-			cleanup,
-			controller,
-			release,
+			cleanup: Some(cleanup),
+			controller: Some(controller),
+			release: Some(release),
 		}),
 	))
 }
 
 #[derive(Debug)]
 struct ConPtyTransaction {
-	cleanup: SpawnCleanup,
-	controller: Arc<ControllerSlot>,
-	release: Release,
+	cleanup: Option<SpawnCleanup>,
+	controller: Option<Arc<ControllerSlot>>,
+	release: Option<Release>,
 }
 
 impl SpawnTransaction for ConPtyTransaction {
 	fn commit(&mut self) -> io::Result<()> {
-		self.release.release()?;
-		self.cleanup.disarm();
+		self.release
+			.as_ref()
+			.expect("an armed ConPTY transaction owns its release capability")
+			.release()?;
+		self.cleanup
+			.as_mut()
+			.expect("an armed ConPTY transaction owns its cleanup duplicate")
+			.disarm();
+		self.cleanup.take();
+		self.controller.take();
+		self.release.take();
 		Ok(())
 	}
 
 	fn rollback(&mut self) -> io::Result<()> {
-		self.controller.rollback();
-		self.cleanup.rollback()
+		if let Some(controller) = self.controller.take() {
+			controller.rollback();
+		}
+		self.release.take();
+		self.cleanup
+			.take()
+			.map_or(Ok(()), |mut cleanup| cleanup.rollback())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		os::windows::io::{FromRawHandle, OwnedHandle},
+		sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering},
+			mpsc,
+		},
+		time::Duration,
+	};
+
+	use windows::{
+		Win32::{
+			Foundation::HANDLE,
+			System::{
+				Console::{COORD, HPCON},
+				Threading::CreateEventW,
+			},
+		},
+		core::HRESULT,
+	};
+
+	use super::*;
+
+	static RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+	unsafe extern "system" fn create(
+		_size: COORD,
+		_input: HANDLE,
+		_output: HANDLE,
+		_flags: u32,
+		_pseudo_console: *mut HPCON,
+	) -> HRESULT {
+		HRESULT(0)
+	}
+
+	unsafe extern "system" fn resize(_pseudo_console: HPCON, _size: COORD) -> HRESULT {
+		HRESULT(0)
+	}
+
+	unsafe extern "system" fn release(_pseudo_console: HPCON) -> HRESULT {
+		RELEASES.fetch_add(1, Ordering::SeqCst);
+		HRESULT(0)
+	}
+
+	unsafe extern "system" fn close(_pseudo_console: HPCON) {}
+
+	static API: api::ConPtyApi = api::ConPtyApi {
+		create,
+		resize,
+		release,
+		close,
+	};
+
+	#[test]
+	fn committed_transaction_releases_rollback_only_owners() -> io::Result<()> {
+		RELEASES.store(0, Ordering::SeqCst);
+		// SAFETY: default security, manual reset, initially unsignaled, and no name request a new event
+		// handle which is transferred immediately to `OwnedHandle`.
+		let event = unsafe { CreateEventW(None, true, false, None) }?;
+		let expected_handle = event.0 as usize;
+		// SAFETY: the successful CreateEventW result is uniquely owned here.
+		let process = unsafe { OwnedHandle::from_raw_handle(event.0) };
+		let (released, observe_release) = mpsc::channel();
+		let cleanup = SpawnCleanup::tracked(process, released);
+		let controller = Arc::new(ControllerSlot::empty_for_test());
+		let controller_observer = Arc::clone(&controller);
+		let (release, release_observer) = Release::tracked(&API, HPCON(42));
+		let mut transaction = ConPtyTransaction {
+			cleanup: Some(cleanup),
+			controller: Some(controller),
+			release: Some(release),
+		};
+
+		assert_eq!(Arc::strong_count(&controller_observer), 2);
+		assert_eq!(release_observer.strong_count(), 1);
+		transaction.commit()?;
+
+		assert_eq!(RELEASES.load(Ordering::SeqCst), 1);
+		assert_eq!(
+			observe_release
+				.recv_timeout(Duration::from_secs(2))
+				.unwrap(),
+			expected_handle
+		);
+		assert_eq!(Arc::strong_count(&controller_observer), 1);
+		assert_eq!(release_observer.strong_count(), 0);
+		drop(transaction);
+		assert_eq!(RELEASES.load(Ordering::SeqCst), 1);
+		Ok(())
 	}
 }
