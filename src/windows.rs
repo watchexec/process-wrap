@@ -142,6 +142,7 @@ mod job_wait_tests {
 #[cfg(test)]
 pub(crate) mod test_support {
 	use std::{
+		any::Any,
 		cell::RefCell,
 		fs,
 		io::{Error, ErrorKind, Result},
@@ -195,6 +196,40 @@ pub(crate) mod test_support {
 
 	thread_local! {
 		static OWNER_FAILURE: RefCell<Option<OwnerFailure>> = const { RefCell::new(None) };
+		static EXTRA_PREPARED_OWNER: RefCell<ExtraPreparedOwner> = RefCell::new(ExtraPreparedOwner::default());
+	}
+
+	#[derive(Default)]
+	struct ExtraPreparedOwner {
+		inject: bool,
+		owners: Vec<Box<dyn Any>>,
+	}
+
+	pub fn arm_extra_prepared_owner() {
+		EXTRA_PREPARED_OWNER.with(|state| {
+			let mut state = state.borrow_mut();
+			assert!(!state.inject);
+			assert!(state.owners.is_empty());
+			state.inject = true;
+		});
+	}
+
+	pub fn take_extra_prepared_owner_injection() -> bool {
+		EXTRA_PREPARED_OWNER.with(|state| std::mem::take(&mut state.borrow_mut().inject))
+	}
+
+	pub fn retain_extra_prepared_owner(owner: Box<dyn Any>) {
+		EXTRA_PREPARED_OWNER.with(|state| state.borrow_mut().owners.push(owner));
+	}
+
+	pub fn clear_extra_prepared_owners() -> (bool, usize) {
+		EXTRA_PREPARED_OWNER.with(|state| {
+			let mut state = state.borrow_mut();
+			let inject = std::mem::take(&mut state.inject);
+			let owner_count = state.owners.len();
+			state.owners.clear();
+			(inject, owner_count)
+		})
 	}
 
 	pub fn arm_owner_failure(failure: OwnerFailure) {

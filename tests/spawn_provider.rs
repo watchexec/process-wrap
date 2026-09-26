@@ -565,6 +565,34 @@ macro_rules! spawn_provider_tests {
 			}
 
 			#[cfg(windows)]
+			#[derive(Debug)]
+			struct StealInstalledPrepared {
+				steal_once: bool,
+				escaped: Option<PreparedChild>,
+			}
+
+			#[cfg(windows)]
+			impl CommandWrapper for StealInstalledPrepared {
+				fn wrap_prepared_child(
+					&mut self,
+					child: &mut dyn ChildWrapper,
+					prepared: Option<PreparedChildRef<'_>>,
+					_command: &CommandWrap,
+				) -> io::Result<Option<PendingChildWrapper>> {
+					assert!(prepared.is_none());
+					if self.steal_once {
+						self.steal_once = false;
+						let layer = (child as &mut dyn std::any::Any)
+							.downcast_mut::<OptionPreparedLayer>()
+							.expect("the prepared layer is immediately inside this wrapper");
+						self.escaped = layer.prepared.take();
+						assert!(self.escaped.is_some());
+					}
+					Ok(None)
+				}
+			}
+
+			#[cfg(windows)]
 			#[derive(Clone, Copy, Debug)]
 			enum MalformedPreparedCase {
 				CallbackError,
@@ -2225,6 +2253,46 @@ macro_rules! spawn_provider_tests {
 				assert_eq!(drops.load(Ordering::SeqCst), 1);
 				drop(child);
 				assert_eq!(drops.load(Ordering::SeqCst), 2);
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn installed_prepared_owner_must_remain_in_its_declared_layer() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let shared = Arc::new(Shared::default());
+				let drops = Arc::new(AtomicUsize::new(0));
+				let mut command = provider_command(Arc::clone(&shared), "provider");
+				command
+					.wrap(OptionPrepared {
+						drops: Arc::clone(&drops),
+					})
+					.wrap(StealInstalledPrepared {
+						steal_once: true,
+						escaped: None,
+					});
+
+				let error = command
+					.spawn()
+					.expect_err("moving the installed owner out of its layer must fail");
+				assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+				assert_eq!(
+					error.to_string(),
+					"prepared child state has an unexpected custody topology"
+				);
+				assert_eq!(drops.load(Ordering::SeqCst), 1);
+				let events = shared.events();
+				assert!(!events.contains(&Event::Commit));
+				assert_eq!(
+					events.iter().filter(|event| **event == Event::Rollback).count(),
+					1
+				);
+
+				shared.clear_events();
+				let child = command.spawn().expect("the command remains reusable");
+				drop(child);
+				assert_eq!(drops.load(Ordering::SeqCst), 2);
+				assert_eq!(shared.events(), successful_events("provider"));
 			}
 
 			#[cfg(windows)]

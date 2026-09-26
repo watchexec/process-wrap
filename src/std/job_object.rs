@@ -26,7 +26,7 @@ use crate::{
 use super::CreationFlags;
 use super::{
 	ChildWrapper, ChildWrapperLayer, ChildWrapperSlots, CommandWrap, CommandWrapper,
-	PendingChildWrapper, PreparedChild, SpawnAttempt,
+	PendingChildWrapper, PreparedChild, PreparedChildRef, SpawnAttempt,
 };
 
 /// Wrapper which creates a job object context for a `Command`.
@@ -140,15 +140,13 @@ impl CommandWrapper for JobObject {
 	fn wrap_prepared_child(
 		&mut self,
 		_inner: &mut dyn ChildWrapper,
-		prepared: Option<&PreparedChild>,
+		prepared: Option<PreparedChildRef<'_>>,
 		_core: &CommandWrap,
 	) -> Result<Option<PendingChildWrapper>> {
 		let prepared = prepared.expect("JobObject child preparation always produces state");
 		assert!(
-			prepared
-				.with::<PreparedJobObject, _>(|prepared| prepared.job_port.is_some())
-				.expect("JobObject prepared state retains its concrete type"),
-			"JobObject prepared state retains its job handles"
+			prepared.is::<PreparedJobObject>(),
+			"JobObject prepared state retains its concrete type"
 		);
 		Ok(Some(PendingChildWrapper::new(JobObjectChild::detached(
 			false,
@@ -213,7 +211,8 @@ impl JobObjectChild {
 
 impl ChildWrapperLayer for JobObjectChild {
 	fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
-		ChildWrapperSlots::new(&mut self.inner).with_prepared(&mut self.prepared)
+		ChildWrapperSlots::new(&mut self.inner)
+			.with_prepared::<PreparedJobObject>(&mut self.prepared)
 	}
 }
 
@@ -305,13 +304,16 @@ impl ChildWrapper for JobObjectChild {
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wait(&mut self) -> Result<ExitStatus> {
-		let prepared = self.prepared().clone();
 		let Self {
 			inner,
+			prepared,
 			exit_status,
 			job_drained,
 			..
 		} = self;
+		let prepared = prepared
+			.as_ref()
+			.expect("an installed JobObject layer owns its prepared state");
 		let inner = inner
 			.as_deref_mut()
 			.expect("an installed JobObject layer owns its child");
@@ -381,9 +383,9 @@ mod tests {
 	use crate::std::{ProviderProduct, SpawnProvider};
 	use crate::windows::test_support::{
 		LifecycleState, OwnerError, OwnerFailure, OwnerPanic, PanickingCommittedTransaction,
-		TreePaths, arm_extra_prepared_owner, arm_owner_failure, assert_tree_terminated,
-		clear_extra_prepared_owners, clear_owner_failure, observe_descendant,
-		publish_process_guards,
+		ProcessGuard, TreePaths, arm_extra_prepared_owner, arm_owner_failure,
+		assert_tree_terminated, clear_extra_prepared_owners, clear_owner_failure,
+		observe_descendant, publish_process_guards,
 	};
 
 	use super::*;
@@ -443,6 +445,30 @@ mod tests {
 		}
 	}
 
+	#[derive(Debug)]
+	struct ObserveNativeTree(ObserveTree);
+
+	impl CommandWrapper for ObserveNativeTree {
+		fn post_spawn(
+			&mut self,
+			_attempt: &mut SpawnAttempt,
+			child: &mut dyn ChildWrapper,
+			_command: &CommandWrap,
+		) -> Result<()> {
+			let handle = child
+				.try_process_handle()
+				.ok_or_else(|| Error::other("the native child has no process handle"))?;
+			let guard = ProcessGuard::clone_from(handle)?;
+			*self
+				.0
+				.state
+				.direct
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(guard);
+			observe_descendant(&self.0.paths, &self.0.state)
+		}
+	}
+
 	fn primary_owner_failure_preserved(
 		outcome: std::thread::Result<Result<Box<dyn ChildWrapper>>>,
 		identity: &Arc<()>,
@@ -489,15 +515,20 @@ mod tests {
 		} else {
 			CommandWrap::from(paths.direct_command()?)
 		};
-		command.wrap(JobObject).wrap(ObserveTree {
+		command.wrap(JobObject);
+		let observer = ObserveTree {
 			paths: paths.clone(),
 			state: Arc::clone(state),
-		});
+		};
 		if provider {
-			command.wrap(TreeProviderWrapper(TreeProvider {
-				paths: paths.clone(),
-				state: Arc::clone(state),
-			}));
+			command
+				.wrap(observer)
+				.wrap(TreeProviderWrapper(TreeProvider {
+					paths: paths.clone(),
+					state: Arc::clone(state),
+				}));
+		} else {
+			command.wrap(ObserveNativeTree(observer));
 		}
 		Ok(command)
 	}

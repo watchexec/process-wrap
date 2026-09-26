@@ -29,7 +29,7 @@ use super::CreationFlags;
 use super::KillOnDrop;
 use super::{
 	ChildWrapper, ChildWrapperLayer, ChildWrapperSlots, CommandWrap, CommandWrapper,
-	PendingChildWrapper, PreparedChild, SpawnAttempt,
+	PendingChildWrapper, PreparedChild, PreparedChildRef, SpawnAttempt,
 };
 
 /// Wrapper which creates a job object context for a `Command`.
@@ -67,7 +67,6 @@ fn terminate_child(child: &mut dyn ChildWrapper) {
 #[derive(Debug)]
 struct PreparedJobObject {
 	job_port: Option<JobPort>,
-	final_kill_on_drop: bool,
 }
 
 impl JobObject {
@@ -76,16 +75,10 @@ impl JobObject {
 		child: &mut dyn ChildWrapper,
 		core: &CommandWrap,
 	) -> Result<PreparedJobObject> {
-		#[cfg(feature = "kill-on-drop")]
-		let kill_on_drop = core.has_wrap::<KillOnDrop>();
-		#[cfg(not(feature = "kill-on-drop"))]
-		let kill_on_drop = false;
-
 		let policy = job_creation_flags(user_creation_flags(core));
 
 		#[cfg(feature = "tracing")]
 		debug!(
-			?kill_on_drop,
 			resume_after_assignment = policy.resume_after_assignment,
 			"options from other wrappers"
 		);
@@ -124,7 +117,6 @@ impl JobObject {
 
 		Ok(PreparedJobObject {
 			job_port: Some(job_port),
-			final_kill_on_drop: kill_on_drop,
 		})
 	}
 }
@@ -149,19 +141,18 @@ impl CommandWrapper for JobObject {
 	fn wrap_prepared_child(
 		&mut self,
 		_inner: &mut dyn ChildWrapper,
-		prepared: Option<&PreparedChild>,
-		_core: &CommandWrap,
+		prepared: Option<PreparedChildRef<'_>>,
+		core: &CommandWrap,
 	) -> Result<Option<PendingChildWrapper>> {
 		let prepared = prepared.expect("JobObject child preparation always produces state");
-		let final_kill_on_drop = prepared
-			.with::<PreparedJobObject, _>(|prepared| {
-				assert!(
-					prepared.job_port.is_some(),
-					"JobObject prepared state retains its job handles"
-				);
-				prepared.final_kill_on_drop
-			})
-			.expect("JobObject prepared state retains its concrete type");
+		assert!(
+			prepared.is::<PreparedJobObject>(),
+			"JobObject prepared state retains its concrete type"
+		);
+		#[cfg(feature = "kill-on-drop")]
+		let final_kill_on_drop = core.has_wrap::<KillOnDrop>();
+		#[cfg(not(feature = "kill-on-drop"))]
+		let final_kill_on_drop = false;
 		Ok(Some(PendingChildWrapper::new(JobObjectChild::detached(
 			final_kill_on_drop,
 		))))
@@ -256,7 +247,8 @@ impl JobObjectChild {
 
 impl ChildWrapperLayer for JobObjectChild {
 	fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
-		ChildWrapperSlots::new(&mut self.inner).with_prepared(&mut self.prepared)
+		ChildWrapperSlots::new(&mut self.inner)
+			.with_prepared::<PreparedJobObject>(&mut self.prepared)
 	}
 }
 
@@ -397,9 +389,9 @@ mod tests {
 	use crate::tokio::{ProviderProduct, SpawnProvider};
 	use crate::windows::test_support::{
 		LifecycleState, OwnerError, OwnerFailure, OwnerPanic, PanickingCommittedTransaction,
-		TreePaths, arm_extra_prepared_owner, arm_owner_failure, assert_tree_terminated,
-		clear_extra_prepared_owners, clear_owner_failure, observe_descendant,
-		publish_process_guards,
+		ProcessGuard, TreePaths, arm_extra_prepared_owner, arm_owner_failure,
+		assert_tree_terminated, clear_extra_prepared_owners, clear_owner_failure,
+		observe_descendant, publish_process_guards,
 	};
 
 	use super::*;
@@ -465,6 +457,30 @@ mod tests {
 		}
 	}
 
+	#[derive(Debug)]
+	struct ObserveNativeTree(ObserveTree);
+
+	impl CommandWrapper for ObserveNativeTree {
+		fn post_spawn(
+			&mut self,
+			_attempt: &mut SpawnAttempt,
+			child: &mut dyn ChildWrapper,
+			_command: &CommandWrap,
+		) -> Result<()> {
+			let handle = child
+				.try_process_handle()
+				.ok_or_else(|| Error::other("the native child has no process handle"))?;
+			let guard = ProcessGuard::clone_from(handle)?;
+			*self
+				.0
+				.state
+				.direct
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(guard);
+			observe_descendant(&self.0.paths, &self.0.state)
+		}
+	}
+
 	fn primary_owner_failure_preserved(
 		outcome: std::thread::Result<Result<Box<dyn ChildWrapper>>>,
 		identity: &Arc<()>,
@@ -511,15 +527,20 @@ mod tests {
 		} else {
 			CommandWrap::from(tokio::process::Command::from(paths.direct_command()?))
 		};
-		command.wrap(JobObject).wrap(ObserveTree {
+		command.wrap(JobObject);
+		let observer = ObserveTree {
 			paths: paths.clone(),
 			state: Arc::clone(state),
-		});
+		};
 		if provider {
-			command.wrap(TreeProviderWrapper(TreeProvider {
-				paths: paths.clone(),
-				state: Arc::clone(state),
-			}));
+			command
+				.wrap(observer)
+				.wrap(TreeProviderWrapper(TreeProvider {
+					paths: paths.clone(),
+					state: Arc::clone(state),
+				}));
+		} else {
+			command.wrap(ObserveNativeTree(observer));
 		}
 		Ok(command)
 	}

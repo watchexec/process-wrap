@@ -20,14 +20,14 @@ pub use crate::SpawnTransaction;
 #[cfg_attr(docsrs, doc(cfg(windows)))]
 #[doc(inline)]
 pub use crate::WindowsSpawnPolicy;
-#[cfg(windows)]
-#[doc(hidden)]
-pub use core::PreparedChild;
 #[doc(inline)]
 pub use core::{
 	ChildWrapper, ChildWrapperLayer, ChildWrapperSlots, Command, CommandWrap, CommandWrapper,
 	PendingChildWrapper, ProviderProduct, SpawnAttempt, SpawnProvider,
 };
+#[cfg(windows)]
+#[doc(hidden)]
+pub use core::{PreparedChild, PreparedChildRef};
 #[cfg(all(windows, feature = "creation-flags"))]
 #[cfg_attr(docsrs, doc(cfg(all(windows, feature = "creation-flags"))))]
 #[doc(inline)]

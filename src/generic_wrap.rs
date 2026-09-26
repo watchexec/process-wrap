@@ -95,12 +95,122 @@ macro_rules! Wrap {
 		}
 
 		#[cfg(windows)]
+		struct PreparedChildState {
+			value: ::std::sync::Mutex<Option<Box<dyn ::std::any::Any + Send>>>,
+			type_id: ::std::any::TypeId,
+		}
+
+		#[cfg(windows)]
+		struct PreparedLayerOwner {
+			layer_identity: usize,
+			retains: fn(
+				&mut dyn $childer,
+				usize,
+				&::std::sync::Arc<PreparedChildState>,
+			) -> bool,
+		}
+
+		#[cfg(windows)]
+		struct PendingPreparedChild {
+			state: ::std::sync::Arc<PreparedChildState>,
+			layer_owner: Option<PreparedLayerOwner>,
+		}
+
+		#[cfg(windows)]
+		impl PendingPreparedChild {
+			fn new(value: Box<dyn ::std::any::Any + Send>) -> Self {
+				let type_id = value.as_ref().type_id();
+				Self {
+					state: ::std::sync::Arc::new(PreparedChildState {
+						value: ::std::sync::Mutex::new(Some(value)),
+						type_id,
+					}),
+					layer_owner: None,
+				}
+			}
+
+			fn view(&self) -> PreparedChildRef<'_> {
+				PreparedChildRef { state: &self.state }
+			}
+
+			fn layer_owner(&self) -> PreparedChild {
+				PreparedChild {
+					state: ::std::sync::Arc::clone(&self.state),
+				}
+			}
+
+			fn take(&self) -> Option<Box<dyn ::std::any::Any + Send>> {
+				self.state
+					.value
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.take()
+			}
+
+			fn has_exact_layer_owner(&self, child: &mut dyn $childer) -> bool {
+				::std::sync::Arc::strong_count(&self.state) == 2
+					&& self.layer_owner.as_ref().is_some_and(|owner| {
+						(owner.retains)(child, owner.layer_identity, &self.state)
+					})
+			}
+		}
+
+		/// Immutable type metadata for state awaiting child-layer installation.
+		///
+		/// This view cannot clone process-wrap's custody owner or access the prepared value. Use
+		/// [`PreparedChildRef::is`] to select a matching detached layer, declare that layer's empty
+		/// typed slot through [`ChildWrapperSlots::with_prepared`], and inspect the value through the
+		/// installed [`PreparedChild`] only after process-wrap fills the slot.
+		#[cfg(windows)]
 		#[doc(hidden)]
-		#[derive(Clone)]
+		pub struct PreparedChildRef<'a> {
+			state: &'a PreparedChildState,
+		}
+
+		#[cfg(windows)]
+		impl ::std::fmt::Debug for PreparedChildRef<'_> {
+			fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+				formatter.debug_struct("PreparedChildRef").finish_non_exhaustive()
+			}
+		}
+
+		#[cfg(windows)]
+		impl PreparedChildRef<'_> {
+			/// Report whether the pending state has concrete type `T` without exposing its value.
+			pub fn is<T: ::std::any::Any>(&self) -> bool {
+				self.state.type_id == ::std::any::TypeId::of::<T>()
+			}
+		}
+
+		/// Prepared state installed in a matching child layer by process-wrap.
+		///
+		/// This handle is deliberately not `Clone`, and arbitrary mutable access is not public. A
+		/// layer may inspect its installed value immutably with [`PreparedChild::with`]. Resource
+		/// types which themselves expose interior mutation or independently clonable native owners
+		/// remain responsible for those capabilities; this handle never exposes process-wrap's
+		/// pending custody owner.
+		///
+		/// A detached layer cannot manufacture an installed handle:
+		///
+		/// ```compile_fail
+		/// # use process_wrap::std::PreparedChild;
+		/// fn retain_extra_owner(prepared: &PreparedChild) {
+		///     let _escaped: PreparedChild = prepared.clone();
+		/// }
+		/// ```
+		///
+		/// Nor can downstream code move fields out through arbitrary mutable access:
+		///
+		/// ```compile_fail
+		/// # use process_wrap::std::PreparedChild;
+		/// fn take_guard(prepared: &PreparedChild) {
+		///     let _guard = prepared.with_mut::<Option<String>, _>(Option::take);
+		/// }
+		/// ```
+		#[cfg(windows)]
+		#[doc(hidden)]
 		pub struct PreparedChild {
-			value: ::std::sync::Arc<
-				::std::sync::Mutex<Option<Box<dyn ::std::any::Any + Send>>>,
-			>,
+			state: ::std::sync::Arc<PreparedChildState>,
 		}
 
 		#[cfg(windows)]
@@ -112,45 +222,34 @@ macro_rules! Wrap {
 
 		#[cfg(windows)]
 		impl PreparedChild {
-			fn new(value: Box<dyn ::std::any::Any + Send>) -> Self {
-				Self {
-					value: ::std::sync::Arc::new(::std::sync::Mutex::new(Some(value))),
-				}
-			}
-
-			/// Inspect prepared state without taking ownership from process-wrap.
+			/// Inspect installed prepared state immutably.
 			#[doc(hidden)]
 			pub fn with<T: ::std::any::Any, R>(&self, inspect: impl FnOnce(&T) -> R) -> Option<R> {
 				let value = self
+					.state
 					.value
 					.lock()
 					.unwrap_or_else(::std::sync::PoisonError::into_inner);
 				value.as_deref()?.downcast_ref::<T>().map(inspect)
 			}
 
-			/// Mutate prepared state without taking ownership from process-wrap.
-			#[doc(hidden)]
-			pub fn with_mut<T: ::std::any::Any, R>(
+			pub(crate) fn with_mut<T: ::std::any::Any, R>(
 				&self,
 				mutate: impl FnOnce(&mut T) -> R,
 			) -> Option<R> {
 				let mut value = self
+					.state
 					.value
 					.lock()
 					.unwrap_or_else(::std::sync::PoisonError::into_inner);
 				value.as_deref_mut()?.downcast_mut::<T>().map(mutate)
 			}
+		}
 
-			fn take(&self) -> Option<Box<dyn ::std::any::Any + Send>> {
-				self.value
-					.lock()
-					.unwrap_or_else(::std::sync::PoisonError::into_inner)
-					.take()
-			}
-
-			fn has_layer_owner(&self) -> bool {
-				::std::sync::Arc::strong_count(&self.value) > 1
-			}
+		#[cfg(windows)]
+		struct PreparedChildSlot<'a> {
+			value: &'a mut Option<PreparedChild>,
+			expected_type: ::std::any::TypeId,
 		}
 
 		/// Empty ownership slots for a child layer returned by a wrapping hook.
@@ -160,7 +259,7 @@ macro_rules! Wrap {
 		pub struct ChildWrapperSlots<'a> {
 			child: &'a mut Option<Box<dyn $childer>>,
 			#[cfg(windows)]
-			prepared: Option<&'a mut Option<PreparedChild>>,
+			prepared: Option<PreparedChildSlot<'a>>,
 		}
 
 		impl<'a> ChildWrapperSlots<'a> {
@@ -173,11 +272,20 @@ macro_rules! Wrap {
 				}
 			}
 
-			/// Describe the empty prepared-state slot paired with this layer.
+			/// Describe an empty prepared-state slot paired with concrete state type `T`.
+			///
+			/// Process-wrap verifies the pending value's concrete type and installs the only layer
+			/// custody handle after the wrapping callback returns successfully.
 			#[cfg(windows)]
 			#[doc(hidden)]
-			pub fn with_prepared(mut self, prepared: &'a mut Option<PreparedChild>) -> Self {
-				self.prepared = Some(prepared);
+			pub fn with_prepared<T: ::std::any::Any + Send>(
+				mut self,
+				prepared: &'a mut Option<PreparedChild>,
+			) -> Self {
+				self.prepared = Some(PreparedChildSlot {
+					value: prepared,
+					expected_type: ::std::any::TypeId::of::<T>(),
+				});
 				self
 			}
 		}
@@ -187,7 +295,12 @@ macro_rules! Wrap {
 		/// Implement this trait for a layer returned through [`PendingChildWrapper::new`]. The layer's
 		/// child slot must be empty until process-wrap installs the current child.
 		pub trait ChildWrapperLayer: $childer {
-			/// Expose this detached layer's empty ownership slots.
+			/// Expose this layer's stable ownership slots.
+			///
+			/// The slots are empty on the first call, while the layer is detached. Process-wrap may call
+			/// this method again after installation to verify that the exact layer still owns the child
+			/// and prepared-state handles it installed. Every call must return the same logical slots
+			/// without moving their contents or performing unrelated work.
 			fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_>;
 		}
 
@@ -200,7 +313,7 @@ macro_rules! Wrap {
 			install: fn(
 				&mut dyn $childer,
 				&mut Option<Box<dyn $childer>>,
-				#[cfg(windows)] Option<&PreparedChild>,
+				#[cfg(windows)] Option<&mut PendingPreparedChild>,
 			) -> ::std::io::Result<()>,
 		}
 
@@ -225,10 +338,50 @@ macro_rules! Wrap {
 				}
 			}
 
+			#[cfg(windows)]
+			fn layer_retains_prepared<L>(
+				mut child: &mut dyn $childer,
+				layer_identity: usize,
+				state: &::std::sync::Arc<PreparedChildState>,
+			) -> bool
+			where
+				L: ChildWrapperLayer + 'static,
+			{
+				loop {
+					if (&*child as &dyn ::std::any::Any).type_id()
+						== ::std::any::TypeId::of::<L>()
+					{
+						let layer = (child as &mut dyn ::std::any::Any)
+							.downcast_mut::<L>()
+							.expect("a matching child layer retains its concrete type");
+						let identity = ::std::ptr::from_mut(layer).cast::<()>() as usize;
+						if identity == layer_identity {
+							let slots = layer.child_wrapper_slots();
+							return slots.prepared.is_some_and(|slot| {
+								slot.expected_type == state.type_id
+									&& slot.value.as_ref().is_some_and(|prepared| {
+										::std::sync::Arc::ptr_eq(&prepared.state, state)
+									})
+							});
+						}
+					}
+
+					let child_type = (&*child as &dyn ::std::any::Any).type_id();
+					let child_ptr = ::std::ptr::from_mut(child);
+					let next = child.inner_mut();
+					if ::std::ptr::addr_eq(child_ptr, ::std::ptr::from_mut(next))
+						&& child_type == (&*next as &dyn ::std::any::Any).type_id()
+					{
+						return false;
+					}
+					child = next;
+				}
+			}
+
 			fn install_layer<L>(
 				layer: &mut dyn $childer,
 				child: &mut Option<Box<dyn $childer>>,
-				#[cfg(windows)] prepared: Option<&PreparedChild>,
+				#[cfg(windows)] prepared: Option<&mut PendingPreparedChild>,
 			) -> ::std::io::Result<()>
 			where
 				L: ChildWrapperLayer + 'static,
@@ -236,6 +389,8 @@ macro_rules! Wrap {
 				let layer = (layer as &mut dyn ::std::any::Any)
 					.downcast_mut::<L>()
 					.expect("a pending child layer retains its concrete type");
+				#[cfg(windows)]
+				let layer_identity = ::std::ptr::from_mut(&mut *layer).cast::<()>() as usize;
 				let slots = layer.child_wrapper_slots();
 				if slots.child.is_some() {
 					return Err(::std::io::Error::new(
@@ -245,8 +400,25 @@ macro_rules! Wrap {
 				}
 				#[cfg(windows)]
 				match (prepared, slots.prepared) {
-					(Some(prepared), Some(slot)) if slot.is_none() => {
-						*slot = Some(prepared.clone());
+					(Some(prepared), Some(slot)) if slot.value.is_none() => {
+						if prepared.state.type_id != slot.expected_type {
+							return Err(::std::io::Error::new(
+								::std::io::ErrorKind::InvalidInput,
+								"prepared child state does not match the layer slot type",
+							));
+						}
+						debug_assert!(prepared.layer_owner.is_none());
+						prepared.layer_owner = Some(PreparedLayerOwner {
+							layer_identity,
+							retains: Self::layer_retains_prepared::<L>,
+						});
+						*slot.value = Some(prepared.layer_owner());
+						#[cfg(test)]
+						if crate::windows::test_support::take_extra_prepared_owner_injection() {
+							crate::windows::test_support::retain_extra_prepared_owner(Box::new(
+								prepared.layer_owner(),
+							));
+						}
 					}
 					(Some(_), _) => {
 						return Err(::std::io::Error::new(
@@ -254,13 +426,19 @@ macro_rules! Wrap {
 							"prepared child state requires an empty matching layer slot",
 						));
 					}
-					(None, Some(slot)) if slot.is_some() => {
+					(None, Some(slot)) if slot.value.is_some() => {
 						return Err(::std::io::Error::new(
 							::std::io::ErrorKind::InvalidInput,
 							"a pending prepared-state slot must be empty",
 						));
 					}
-					(None, _) => {}
+					(None, Some(_)) => {
+						return Err(::std::io::Error::new(
+							::std::io::ErrorKind::InvalidInput,
+							"a prepared-state slot requires matching prepared child state",
+						));
+					}
+					(None, None) => {}
 				}
 				*slots.child = Some(child.take().expect("the lifecycle retains child custody"));
 				Ok(())
@@ -269,7 +447,7 @@ macro_rules! Wrap {
 			fn install(
 				&mut self,
 				child: &mut Option<Box<dyn $childer>>,
-				#[cfg(windows)] prepared: Option<&PreparedChild>,
+				#[cfg(windows)] prepared: Option<&mut PendingPreparedChild>,
 			) -> ::std::io::Result<()> {
 				(self.install)(
 					self.layer.as_mut(),
@@ -333,7 +511,7 @@ macro_rules! Wrap {
 			fn transfer(
 				&mut self,
 				child: Box<dyn $childer>,
-				#[cfg(windows)] prepared: Vec<Option<PreparedChild>>,
+				#[cfg(windows)] prepared: Vec<Option<PendingPreparedChild>>,
 			) -> Box<dyn $childer> {
 				let Self::Committed(transaction) = ::std::mem::replace(self, Self::Transferred) else {
 					unreachable!("only committed transaction residue can transfer to a child");
@@ -351,7 +529,7 @@ macro_rules! Wrap {
 			child: Box<dyn $childer>,
 			residue: ::std::sync::Arc<::std::sync::Mutex<Box<dyn crate::SpawnTransaction>>>,
 			#[cfg(windows)]
-			prepared: Vec<Option<PreparedChild>>,
+			prepared: Vec<Option<PendingPreparedChild>>,
 		}
 
 		impl ::std::fmt::Debug for CommittedProviderChild {
@@ -390,12 +568,16 @@ macro_rules! Wrap {
 			}
 
 			fn try_clone(&self) -> Option<Box<dyn $childer>> {
+				#[cfg(windows)]
+				if self.prepared.iter().any(Option::is_some) {
+					return None;
+				}
 				self.child.try_clone().map(|child| {
 					Box::new(Self {
 						child,
 						residue: ::std::sync::Arc::clone(&self.residue),
 						#[cfg(windows)]
-						prepared: self.prepared.clone(),
+						prepared: self.prepared.iter().map(|_| None).collect(),
 					}) as Box<dyn $childer>
 				})
 			}
@@ -628,7 +810,7 @@ macro_rules! Wrap {
 				&mut self,
 				attempt: &mut SpawnAttempt,
 				child: &mut dyn $childer,
-				prepared: &mut Vec<Option<PreparedChild>>,
+				prepared: &mut Vec<Option<PendingPreparedChild>>,
 			) -> ::std::result::Result<(), SpawnFailure> {
 				let len = self.wrapper_registry().wrappers.len();
 				for index in 0..len {
@@ -647,7 +829,7 @@ macro_rules! Wrap {
 							wrapper.prepare_child(attempt, child, command)
 						})
 					})?;
-					prepared.push(value.map(PreparedChild::new));
+					prepared.push(value.map(PendingPreparedChild::new));
 				}
 
 				Ok(())
@@ -686,7 +868,7 @@ macro_rules! Wrap {
 				&mut self,
 				child: &mut Option<Box<dyn $childer>>,
 				pending: &mut Option<PendingChildWrapper>,
-				#[cfg(windows)] prepared: &[Option<PreparedChild>],
+				#[cfg(windows)] prepared: &mut [Option<PendingPreparedChild>],
 			) -> ::std::result::Result<(), SpawnFailure> {
 				let len = self.wrapper_registry().wrappers.len();
 				for index in 0..len {
@@ -707,7 +889,11 @@ macro_rules! Wrap {
 								.expect("process-wrap retains child custody between wrapping hooks");
 							#[cfg(windows)]
 							{
-								wrapper.wrap_prepared_child(child, prepared[index].as_ref(), command)
+								wrapper.wrap_prepared_child(
+									child,
+									prepared[index].as_ref().map(PendingPreparedChild::view),
+									command,
+								)
 							}
 							#[cfg(not(windows))]
 							{
@@ -722,7 +908,7 @@ macro_rules! Wrap {
 							layer.install(
 								child,
 								#[cfg(windows)]
-								prepared[index].as_ref(),
+								prepared[index].as_mut(),
 							)
 						})?;
 						let layer = pending
@@ -742,6 +928,37 @@ macro_rules! Wrap {
 				}
 
 				Ok(())
+			}
+
+			#[cfg(windows)]
+			fn validate_prepared_topology(
+				child: &mut dyn $childer,
+				prepared: &[Option<PendingPreparedChild>],
+			) -> ::std::io::Result<()> {
+				for prepared in prepared.iter().flatten() {
+					if !prepared.has_exact_layer_owner(child) {
+						return Err(::std::io::Error::new(
+							::std::io::ErrorKind::InvalidInput,
+							"prepared child state has an unexpected custody topology",
+						));
+					}
+				}
+				Ok(())
+			}
+
+			#[cfg(windows)]
+			fn capture_prepared_topology(
+				child: &mut Option<Box<dyn $childer>>,
+				prepared: &[Option<PendingPreparedChild>],
+			) -> ::std::result::Result<(), SpawnFailure> {
+				Self::capture_io(|| {
+					Self::validate_prepared_topology(
+						child
+							.as_deref_mut()
+							.expect("the lifecycle retains child custody during topology checks"),
+						prepared,
+					)
+				})
 			}
 
 			fn finish_spawn(
@@ -812,8 +1029,10 @@ macro_rules! Wrap {
 						&mut child,
 						&mut pending,
 						#[cfg(windows)]
-						&prepared,
+						&mut prepared,
 					)?;
+					#[cfg(windows)]
+					Self::capture_prepared_topology(&mut child, &prepared)?;
 					#[cfg(windows)]
 					{
 						let final_owner = Self::capture_io(|| {
@@ -828,16 +1047,7 @@ macro_rules! Wrap {
 								.expect("the native lifecycle retains child custody")
 								.finalize_spawn_final_owner(final_owner)
 						})?;
-						if prepared
-							.iter()
-							.flatten()
-							.any(|prepared| !prepared.has_layer_owner())
-						{
-							return Err(SpawnFailure::Error(::std::io::Error::new(
-								::std::io::ErrorKind::InvalidInput,
-								"a prepared child layer released its state before transfer",
-							)));
-						}
+						Self::capture_prepared_topology(&mut child, &prepared)?;
 					}
 					Ok(())
 				})();
@@ -890,7 +1100,7 @@ macro_rules! Wrap {
 			}
 
 			#[cfg(windows)]
-			fn cleanup_prepared(prepared: &mut [Option<PreparedChild>]) {
+			fn cleanup_prepared(prepared: &mut [Option<PendingPreparedChild>]) {
 				for prepared in prepared.iter_mut().filter_map(Option::take) {
 					if let Some(value) = prepared.take() {
 						Self::dispose_value(value);
@@ -951,8 +1161,10 @@ macro_rules! Wrap {
 						&mut child,
 						&mut pending,
 						#[cfg(windows)]
-						&prepared,
+						&mut prepared,
 					)?;
+					#[cfg(windows)]
+					Self::capture_prepared_topology(&mut child, &prepared)?;
 					#[cfg(windows)]
 					let final_owner = Self::capture_io(|| {
 						child
@@ -960,6 +1172,8 @@ macro_rules! Wrap {
 							.expect("the provider lifecycle retains child custody")
 							.finalize_spawn_before_commit()
 					})?;
+					#[cfg(windows)]
+					Self::capture_prepared_topology(&mut child, &prepared)?;
 					Self::capture_io(|| transaction.commit())?;
 					#[cfg(windows)]
 					Self::capture_io(|| {
@@ -968,6 +1182,8 @@ macro_rules! Wrap {
 							.expect("the provider lifecycle retains child custody")
 							.finalize_spawn_final_owner(final_owner)
 					})?;
+					#[cfg(windows)]
+					Self::capture_prepared_topology(&mut child, &prepared)?;
 					Ok(())
 				})();
 
@@ -1202,8 +1418,22 @@ macro_rules! Wrap {
 
 			/// Prepare Windows child state which must exist before public post-spawn hooks run.
 			///
-			/// Process-wrap retains the returned state through post-spawn hooks and supplies it to the
-			/// matching wrapper's `wrap_prepared_child` call.
+			/// Return `Some(Box::new(state))` for a concrete `state: T`. Process-wrap keeps that value in
+			/// private, non-cloneable pending custody through later hooks. The matching
+			/// [`CommandWrapper::wrap_prepared_child`] callback receives only immutable type metadata,
+			/// never the value or a custody handle.
+			///
+			/// The complete safe installation pattern is: return `T` here; have the detached layer store
+			/// an empty `Option<PreparedChild>`; confirm `PreparedChildRef::is::<T>()` while wrapping;
+			/// return that layer through `PendingChildWrapper::new`; and expose its slot with
+			/// `ChildWrapperSlots::with_prepared::<T>`. Process-wrap validates the type and exact owner
+			/// topology before filling the slot. Once installed, the layer may use
+			/// `PreparedChild::with::<T, _>` for immutable access.
+			///
+			/// A prepared type which itself exposes interior ownership transfer or independently clonable
+			/// native resources can deliberately extend their lifetime; that is part of the type's own
+			/// contract. Process-wrap does not expose a cloneable custody token or mutable pre-install
+			/// accessor which creates such an escape.
 			#[doc(hidden)]
 			#[cfg(windows)]
 			fn prepare_child(
@@ -1255,13 +1485,18 @@ macro_rules! Wrap {
 				Ok(None)
 			}
 
-			/// Describe a child layer using state returned by `prepare_child`.
+			/// Describe a child layer for state returned by `prepare_child`.
+			///
+			/// `prepared` is a non-cloneable metadata view. It can establish presence and concrete type but
+			/// cannot expose, mutate, replace, or move the pending value. A matching layer declares an
+			/// empty typed slot; process-wrap alone creates its installed `PreparedChild` handle after this
+			/// callback succeeds.
 			#[doc(hidden)]
 			#[cfg(windows)]
 			fn wrap_prepared_child(
 				&mut self,
 				child: &mut dyn $childer,
-				prepared: Option<&PreparedChild>,
+				prepared: Option<PreparedChildRef<'_>>,
 				command: &Command,
 			) -> ::std::io::Result<Option<PendingChildWrapper>> {
 				debug_assert!(
