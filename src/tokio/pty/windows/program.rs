@@ -8,7 +8,13 @@ use std::{
 	path::{Component, Path, PathBuf},
 };
 
-use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
+use windows::{
+	Win32::{
+		Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES},
+		System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW},
+	},
+	core::PCWSTR,
+};
 
 use super::{
 	command::{WideCString, encode},
@@ -40,7 +46,7 @@ pub(super) fn resolve<'a>(
 			return WideCString::from_os(program, "PTY program");
 		}
 		let with_exe = append_exe(path);
-		if with_exe.exists() {
+		if entry_exists(&with_exe) {
 			return WideCString::from_os(with_exe.as_os_str(), "PTY program");
 		}
 		return WideCString::from_os(program, "PTY program");
@@ -105,7 +111,17 @@ fn candidate(mut directory: PathBuf, program: &OsStr, has_extension: bool) -> Op
 	if !has_extension {
 		directory = append_exe(&directory);
 	}
-	directory.exists().then_some(directory)
+	entry_exists(&directory).then_some(directory)
+}
+
+fn entry_exists(path: &Path) -> bool {
+	let Ok(encoded) = WideCString::from_os(path.as_os_str(), "PTY program candidate") else {
+		return false;
+	};
+	// SAFETY: `WideCString::from_os` rejects interior NULs and appends a trailing
+	// NUL. `encoded.as_ptr()` points to that readable allocation, which remains
+	// live and unmodified while `GetFileAttributesW` reads it during this call.
+	unsafe { GetFileAttributesW(PCWSTR(encoded.as_ptr())) != INVALID_FILE_ATTRIBUTES }
 }
 
 fn append_exe(path: &Path) -> PathBuf {
@@ -166,11 +182,19 @@ fn query_directory(mut query: impl FnMut(Option<&mut [u16]>) -> u32) -> io::Resu
 #[cfg(test)]
 mod tests {
 	use std::{
-		fs::File,
-		os::windows::ffi::{OsStrExt, OsStringExt},
+		fs::{self, File},
+		os::windows::{
+			ffi::{OsStrExt, OsStringExt},
+			fs::symlink_file,
+		},
+		process::{Command, Stdio},
 	};
 
 	use tempfile::tempdir;
+	use windows::{
+		Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES},
+		core::PCWSTR,
+	};
 
 	use super::*;
 
@@ -190,6 +214,47 @@ mod tests {
 
 	fn units(path: &OsStr) -> Vec<u16> {
 		path.encode_wide().chain([0]).collect()
+	}
+
+	fn create_dangling_executable_entry(entry: &Path) {
+		let target = entry.with_file_name("missing-target");
+		File::create(&target).unwrap();
+
+		if let Err(symlink_error) = symlink_file(&target, entry) {
+			fs::remove_file(&target).unwrap();
+			fs::create_dir(&target).unwrap();
+			let junction = Command::new("cmd.exe")
+				.args(["/d", "/c", "mklink", "/J"])
+				.arg(entry)
+				.arg(&target)
+				.output()
+				.unwrap();
+			assert!(
+				junction.status.success(),
+				"file symlink creation failed ({symlink_error}); junction creation failed (status {}; stdout: {}; stderr: {})",
+				junction.status,
+				String::from_utf8_lossy(&junction.stdout),
+				String::from_utf8_lossy(&junction.stderr),
+			);
+			fs::remove_dir(&target).unwrap();
+		} else {
+			fs::remove_file(&target).unwrap();
+		}
+
+		assert!(
+			fs::symlink_metadata(entry).is_ok(),
+			"dangling reparse entry was not created"
+		);
+		assert!(!entry.exists(), "reparse target must be absent");
+
+		let encoded = units(entry.as_os_str());
+		// SAFETY: `encoded` has an explicit trailing NUL; `encoded.as_ptr()` points
+		// to its readable allocation, which stays live and unmodified during the call.
+		let attributes = unsafe { GetFileAttributesW(PCWSTR(encoded.as_ptr())) };
+		assert_ne!(
+			attributes, INVALID_FILE_ATTRIBUTES,
+			"GetFileAttributesW could not query the dangling reparse entry"
+		);
 	}
 
 	#[test]
@@ -248,6 +313,37 @@ mod tests {
 	}
 
 	#[test]
+	fn stops_path_search_at_a_dangling_executable_entry() {
+		let directory = tempdir().unwrap();
+		let first = directory.path().join("first");
+		let second = directory.path().join("second");
+		fs::create_dir(&first).unwrap();
+		fs::create_dir(&second).unwrap();
+
+		let dangling = first.join("tool.exe");
+		create_dangling_executable_entry(&dangling);
+		fs::copy(env::current_exe().unwrap(), second.join("tool.exe")).unwrap();
+
+		let path = env::join_paths([first.as_os_str(), second.as_os_str()]).unwrap();
+		let changes = [(OsString::from("PATH"), Some(path.clone()))];
+		let resolved = resolve_program("tool", &changes).unwrap();
+		assert_eq!(resolved.as_units(), units(dangling.as_os_str()));
+
+		let spawn = Command::new("tool")
+			.arg("--help")
+			.env("PATH", path)
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.spawn();
+		if let Ok(mut child) = spawn {
+			let _ = child.kill();
+			let _ = child.wait();
+			panic!("native Command continued to the second PATH entry");
+		}
+	}
+
+	#[test]
 	fn appends_exe_to_an_existing_direct_path() {
 		let directory = tempdir().unwrap();
 		let requested = directory.path().join("direct");
@@ -256,6 +352,17 @@ mod tests {
 
 		let resolved = resolve_program(requested.as_os_str(), &[]).unwrap();
 		assert_eq!(resolved.as_units(), units(executable.as_os_str()));
+	}
+
+	#[test]
+	fn appends_exe_to_a_dangling_direct_path_entry() {
+		let directory = tempdir().unwrap();
+		let requested = directory.path().join("direct");
+		let dangling = directory.path().join("direct.exe");
+		create_dangling_executable_entry(&dangling);
+
+		let resolved = resolve_program(requested.as_os_str(), &[]).unwrap();
+		assert_eq!(resolved.as_units(), units(dangling.as_os_str()));
 	}
 
 	#[test]
