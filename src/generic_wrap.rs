@@ -137,10 +137,15 @@ macro_rules! Wrap {
 			}
 		}
 
-		#[derive(Debug)]
 		struct CommittedProviderChild {
 			child: Box<dyn $childer>,
 			residue: ::std::sync::Arc<::std::sync::Mutex<Box<dyn crate::SpawnTransaction>>>,
+		}
+
+		impl ::std::fmt::Debug for CommittedProviderChild {
+			fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+				self.child.fmt(formatter)
+			}
 		}
 
 		impl $childer for CommittedProviderChild {
