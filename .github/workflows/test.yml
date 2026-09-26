@@ -200,6 +200,10 @@ jobs:
             cargo clippy --locked --target "${{ matrix.target }}" --no-default-features --features pty --lib
           fi
 
+      - name: Compile unsupported PTY integration test
+        if: matrix.target == 'aarch64-apple-ios'
+        run: cargo check --locked --target aarch64-apple-ios --all-features --test tokio_pty_unsupported
+
   rustdoc:
     name: Rustdoc
     runs-on: ubuntu-latest
