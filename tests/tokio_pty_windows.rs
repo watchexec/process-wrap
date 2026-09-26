@@ -263,11 +263,134 @@ async fn wait_for_process_exit(guard: ProcessExitGuard) -> io::Result<()> {
 	}
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct MarkerSearch {
+	marker_start: Option<usize>,
+	first_candidate: usize,
+	candidates_examined: usize,
+}
+
+fn scan_marker(bytes: &[u8], needle: &[u8], new_bytes_start: usize) -> MarkerSearch {
+	assert!(
+		!needle.is_empty(),
+		"read_through requires a non-empty marker"
+	);
+
+	let first_candidate = new_bytes_start.saturating_sub(needle.len() - 1);
+	let mut candidates_examined = 0;
+	for (offset, window) in bytes[first_candidate..].windows(needle.len()).enumerate() {
+		candidates_examined += 1;
+		if window == needle {
+			return MarkerSearch {
+				marker_start: Some(first_candidate + offset),
+				first_candidate,
+				candidates_examined,
+			};
+		}
+	}
+
+	MarkerSearch {
+		marker_start: None,
+		first_candidate,
+		candidates_examined,
+	}
+}
+
+#[test]
+fn marker_scan_finds_marker_in_first_chunk() {
+	assert_eq!(
+		scan_marker(b"prefix READY suffix", b"READY", 0),
+		MarkerSearch {
+			marker_start: Some(7),
+			first_candidate: 0,
+			candidates_examined: 8,
+		}
+	);
+}
+
+#[test]
+fn marker_scan_detects_marker_across_chunk_boundary() {
+	let mut bytes = b"prefix RE".to_vec();
+	let new_bytes_start = bytes.len();
+	bytes.extend_from_slice(b"ADY suffix");
+
+	assert_eq!(
+		scan_marker(&bytes, b"READY", new_bytes_start),
+		MarkerSearch {
+			marker_start: Some(7),
+			first_candidate: 5,
+			candidates_examined: 3,
+		}
+	);
+}
+
+#[test]
+fn marker_scan_skips_absent_chunks_before_finding_marker() {
+	let chunks: &[&[u8]] = &[b"prefix ", b"without ", b"marker ", b"REA", b"DY tail"];
+	let mut bytes = Vec::new();
+	let scans = chunks
+		.iter()
+		.map(|chunk| {
+			let new_bytes_start = bytes.len();
+			bytes.extend_from_slice(chunk);
+			scan_marker(&bytes, b"READY", new_bytes_start)
+		})
+		.collect::<Vec<_>>();
+
+	assert_eq!(bytes, b"prefix without marker READY tail");
+	assert!(scans[..4].iter().all(|scan| scan.marker_start.is_none()));
+	assert_eq!(
+		scans
+			.iter()
+			.map(|scan| scan.first_candidate)
+			.collect::<Vec<_>>(),
+		[0, 3, 11, 18, 21]
+	);
+	assert_eq!(scans[4].marker_start, Some(22));
+	assert_eq!(scans[4].candidates_examined, 2);
+}
+
+#[test]
+fn marker_scan_does_not_rescan_a_large_examined_prefix() {
+	let needle = b"READY";
+	let mut bytes = vec![b'x'; 1024 * 1024];
+	let first_scan = scan_marker(&bytes, needle, 0);
+	let new_bytes_start = bytes.len();
+	bytes.extend_from_slice(needle);
+	let second_scan = scan_marker(&bytes, needle, new_bytes_start);
+
+	assert_eq!(first_scan.marker_start, None);
+	assert_eq!(first_scan.first_candidate, 0);
+	assert_eq!(
+		first_scan.candidates_examined,
+		new_bytes_start - needle.len() + 1
+	);
+	assert_eq!(second_scan.marker_start, Some(new_bytes_start));
+	assert_eq!(
+		second_scan.first_candidate,
+		new_bytes_start - (needle.len() - 1)
+	);
+	assert_eq!(second_scan.candidates_examined, needle.len());
+	assert_eq!(
+		first_scan.candidates_examined + second_scan.candidates_examined,
+		new_bytes_start + 1
+	);
+}
+
 async fn read_through(output: &mut PtyOutput, needle: &[u8]) -> io::Result<Vec<u8>> {
 	timeout(TIMEOUT, async {
 		let mut bytes = Vec::new();
 		let mut buffer = [0; 1024];
-		while !bytes.windows(needle.len()).any(|window| window == needle) {
+		let mut new_bytes_start = 0;
+		loop {
+			if scan_marker(&bytes, needle, new_bytes_start)
+				.marker_start
+				.is_some()
+			{
+				return Ok(bytes);
+			}
+
+			new_bytes_start = bytes.len();
 			let read = output.read(&mut buffer).await?;
 			if read == 0 {
 				return Err(io::Error::new(
@@ -277,7 +400,6 @@ async fn read_through(output: &mut PtyOutput, needle: &[u8]) -> io::Result<Vec<u
 			}
 			bytes.extend_from_slice(&buffer[..read]);
 		}
-		Ok(bytes)
 	})
 	.await
 	.map_err(io::Error::other)?
