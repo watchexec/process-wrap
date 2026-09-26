@@ -55,14 +55,41 @@ use windows::core::PCWSTR;
 mod windows_thread;
 
 const HELPER_MODE: &str = "PROCESS_WRAP_CONPTY_HELPER";
+const EXPECT_CONPTY: &str = "PROCESS_WRAP_EXPECT_CONPTY";
 const TIMEOUT: Duration = Duration::from_secs(10);
 const DROP_CLEANUP_TIMEOUT_MS: u32 = 1_000;
 
+fn conpty_is_required() -> bool {
+	matches!(env::var(EXPECT_CONPTY), Ok(value) if value == "1")
+}
+
+#[derive(Debug)]
+enum ConPtyDecision {
+	Run,
+	Skip(io::Error),
+}
+
+fn require_conpty_result(capability: io::Result<()>, required: bool) -> io::Result<ConPtyDecision> {
+	match capability {
+		Ok(()) => Ok(ConPtyDecision::Run),
+		Err(error) if error.kind() == io::ErrorKind::Unsupported && required => {
+			Err(io::Error::new(
+				io::ErrorKind::Unsupported,
+				format!(
+					"ConPTY is required because {EXPECT_CONPTY}=1, but it is unavailable: {error}"
+				),
+			))
+		}
+		Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(ConPtyDecision::Skip(error)),
+		Err(error) => Err(error),
+	}
+}
+
 macro_rules! require_conpty {
 	() => {
-		match Pty::check_supported() {
-			Ok(()) => {}
-			Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+		match require_conpty_result(Pty::check_supported(), conpty_is_required()) {
+			Ok(ConPtyDecision::Run) => {}
+			Ok(ConPtyDecision::Skip(error)) => {
 				eprintln!("skipping ConPTY-dependent test: {error}");
 				return Ok(());
 			}
@@ -94,6 +121,26 @@ fn take_controller(child: &mut dyn ChildWrapper) -> PtyController {
 fn capability_queries_agree_with_windows_backend() {
 	let checked = Pty::check_supported().is_ok();
 	assert_eq!(Pty::is_supported(), checked);
+}
+
+#[test]
+fn expected_support_rejects_injected_unsupported_capability() {
+	let unsupported = || {
+		Err(io::Error::new(
+			io::ErrorKind::Unsupported,
+			"injected missing ConPTY capability",
+		))
+	};
+	let error = require_conpty_result(unsupported(), true)
+		.expect_err("expected-support mode must reject an unavailable ConPTY backend");
+	assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+	assert!(error.to_string().contains(EXPECT_CONPTY));
+
+	let decision = require_conpty_result(unsupported(), false).unwrap();
+	let ConPtyDecision::Skip(error) = decision else {
+		panic!("optional ConPTY mode must retain the unavailable-runtime skip");
+	};
+	assert_eq!(error.kind(), io::ErrorKind::Unsupported);
 }
 
 #[test]
@@ -597,6 +644,36 @@ fn print_size(output: HANDLE) -> io::Result<()> {
 	// SAFETY: output is a live console output handle and info is writable output storage.
 	unsafe { GetConsoleScreenBufferInfo(output, &mut info) }.map_err(io::Error::other)?;
 	print!("PW-SIZE:{}x{}", info.dwSize.Y, info.dwSize.X);
+	Ok(())
+}
+
+#[tokio::test]
+async fn expected_supported_conpty_preflight_performs_a_real_spawn() -> io::Result<()> {
+	if !conpty_is_required() {
+		eprintln!("expected-supported ConPTY preflight is disabled");
+		return Ok(());
+	}
+	match require_conpty_result(Pty::check_supported(), true)? {
+		ConPtyDecision::Run => {}
+		ConPtyDecision::Skip(_) => unreachable!("required ConPTY cannot resolve to a skip"),
+	}
+
+	let mut command = helper("terminal")?;
+	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
+	let (input, mut output, _resize) = controller.into_parts();
+	drop(input);
+	let mut bytes = Vec::new();
+	assert!(
+		wait_and_drain(child.as_mut(), &mut output, &mut bytes)
+			.await?
+			.success()
+	);
+	assert!(
+		bytes
+			.windows(b"PW-TERMINALS:111".len())
+			.any(|window| window == b"PW-TERMINALS:111")
+	);
+	eprintln!("expected-supported ConPTY preflight executed a real PTY spawn");
 	Ok(())
 }
 

@@ -29,6 +29,8 @@ jobs:
     name: "Test on ${{ matrix.platform }} with Rust ${{ matrix.toolchain }} (feat: ${{ matrix.features }})"
     runs-on: "${{ matrix.platform }}-latest"
     timeout-minutes: 30
+    env:
+      PROCESS_WRAP_EXPECT_CONPTY: "${{ matrix.platform == 'windows' && '1' || '0' }}"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,6 +43,11 @@ jobs:
           rustup toolchain install --profile minimal --no-self-update ${{ matrix.toolchain }}
           rustup default ${{ matrix.toolchain }}
           rustup component add clippy
+
+      - name: Report expected ConPTY mode
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: Write-Host "PROCESS_WRAP_EXPECT_CONPTY=$env:PROCESS_WRAP_EXPECT_CONPTY"
 
       - run: tests/multiproc_helper.rs 1 1
 
@@ -103,6 +110,8 @@ jobs:
     name: "Test all features on ${{ matrix.platform }}"
     runs-on: "${{ matrix.platform }}-latest"
     timeout-minutes: 30
+    env:
+      PROCESS_WRAP_EXPECT_CONPTY: "${{ matrix.platform == 'windows' && '1' || '0' }}"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -115,6 +124,11 @@ jobs:
           rustup toolchain install --profile minimal --no-self-update stable
           rustup default stable
           rustup component add clippy
+
+      - name: Report expected ConPTY mode
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: Write-Host "PROCESS_WRAP_EXPECT_CONPTY=$env:PROCESS_WRAP_EXPECT_CONPTY"
 
       - run: tests/multiproc_helper.rs 1 1
       - run: cargo test --locked --all-features --all-targets
