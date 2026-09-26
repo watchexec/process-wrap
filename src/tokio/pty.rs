@@ -189,7 +189,7 @@ impl SpawnProvider for Pty {
 	}
 
 	fn validate_command(&self, _command: &Command) -> io::Result<()> {
-		self.size.validate()
+		imp::validate_size(self.size)
 	}
 
 	fn validate_attempt(&self, attempt: &SpawnAttempt, _command: &Command) -> io::Result<()> {
@@ -223,8 +223,10 @@ impl SpawnProvider for Pty {
 
 /// The character and pixel dimensions of a pseudo-terminal.
 ///
-/// Character dimensions must both be nonzero. Pixel dimensions may be zero when they are unknown or
-/// not meaningful to the caller. Sizes are validated before spawning and by [`PtyResize::resize`].
+/// Character dimensions must both be nonzero. The Windows backend additionally requires each
+/// character dimension to fit in a signed 16-bit console coordinate (`1..=32767`). Pixel dimensions
+/// may be zero when they are unknown or not meaningful to the caller. Sizes are validated before
+/// spawning and by [`PtyResize::resize`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PtySize {
 	/// Character rows.

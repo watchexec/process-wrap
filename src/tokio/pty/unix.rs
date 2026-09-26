@@ -162,6 +162,10 @@ pub(super) fn check_available() -> io::Result<()> {
 	Ok(())
 }
 
+pub(super) fn validate_size(size: PtySize) -> io::Result<()> {
+	size.validate()
+}
+
 #[cfg(target_os = "netbsd")]
 fn check_netbsd_version() -> io::Result<()> {
 	let mut name = std::mem::MaybeUninit::<libc::utsname>::uninit();

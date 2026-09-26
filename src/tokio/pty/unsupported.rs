@@ -55,6 +55,10 @@ pub(super) fn check_available() -> io::Result<()> {
 	Err(unsupported())
 }
 
+pub(super) fn validate_size(size: PtySize) -> io::Result<()> {
+	size.validate()
+}
+
 pub(super) fn spawn(_attempt: &mut SpawnAttempt, _size: PtySize) -> io::Result<ProviderProduct> {
 	Err(unsupported())
 }

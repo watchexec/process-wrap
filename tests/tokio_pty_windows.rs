@@ -109,6 +109,68 @@ fn capability_queries_ignore_invalid_configuration_on_windows() {
 	assert_eq!(invalid.check_available().is_ok(), checked);
 }
 
+#[derive(Debug)]
+struct ObservePreSpawn(Arc<AtomicBool>);
+
+impl CommandWrapper for ObservePreSpawn {
+	fn pre_spawn(&mut self, _attempt: &mut SpawnAttempt, _command: &Command) -> io::Result<()> {
+		self.0.store(true, Ordering::SeqCst);
+		Ok(())
+	}
+}
+
+#[test]
+fn oversized_windows_size_is_rejected_before_hooks_without_changing_capability() -> io::Result<()> {
+	let oversized = Pty::new(PtySize {
+		rows: 1,
+		columns: 32_768,
+		pixel_width: 0,
+		pixel_height: 0,
+	});
+	let validation_error = oversized
+		.validate_command(&Command::new("must-not-run"))
+		.expect_err("Windows COORD overflow must be rejected during immutable validation");
+	assert_eq!(validation_error.kind(), io::ErrorKind::InvalidInput);
+	assert_eq!(
+		validation_error.to_string(),
+		"PTY columns must not exceed 32767 on Windows"
+	);
+
+	let supported = Pty::check_supported();
+	let available = oversized.check_available();
+	match (&supported, &available) {
+		(Ok(()), Ok(())) => {}
+		(Err(supported), Err(available)) => {
+			assert_eq!(available.kind(), supported.kind());
+			assert_eq!(available.to_string(), supported.to_string());
+		}
+		_ => panic!("capability queries disagree: {supported:?} != {available:?}"),
+	}
+
+	let called = Arc::new(AtomicBool::new(false));
+	let mut command = Command::new("must-not-run");
+	command
+		.wrap(oversized)
+		.wrap(ObservePreSpawn(Arc::clone(&called)));
+	let spawn_error = match command.spawn() {
+		Ok(_) => panic!("an oversized Windows PTY spawn must fail"),
+		Err(error) => error,
+	};
+	let expected_kind = match supported {
+		Ok(()) => io::ErrorKind::InvalidInput,
+		Err(error) => {
+			assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+			io::ErrorKind::Unsupported
+		}
+	};
+	assert_eq!(spawn_error.kind(), expected_kind);
+	assert!(
+		!called.load(Ordering::SeqCst),
+		"capability and immutable validation must both precede pre_spawn hooks"
+	);
+	Ok(())
+}
+
 fn spawn_with_terminal(
 	command: &mut Command,
 	size: PtySize,

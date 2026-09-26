@@ -22,6 +22,10 @@ pub(in crate::tokio::pty) fn check_available() -> io::Result<()> {
 	api::get().map(|_| ())
 }
 
+pub(in crate::tokio::pty) fn validate_size(size: PtySize) -> io::Result<()> {
+	console::coordinate(size).map(|_| ())
+}
+
 pub(in crate::tokio::pty) fn spawn(
 	attempt: &mut SpawnAttempt,
 	size: PtySize,
