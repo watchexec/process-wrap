@@ -122,8 +122,13 @@
 //! # fn run() -> std::io::Result<()> {
 //! use process_wrap::tokio::{Command, Pty};
 //!
+//! #[cfg(unix)]
 //! let mut command = Command::with_new("sh", |command| {
 //!     command.args(["-c", "printf terminal"]);
+//! });
+//! #[cfg(windows)]
+//! let mut command = Command::with_new("cmd.exe", |command| {
+//!     command.args(["/d", "/s", "/c", "echo terminal"]);
 //! });
 //! command.wrap(Pty::default());
 //! let mut child = command.spawn()?;
@@ -142,6 +147,13 @@
 //! `Pty::check_supported()` for a capability result or `Pty::is_supported()` for a boolean. These
 //! report platform and runtime capability only; they do not suppress later configuration,
 //! compatibility, or spawn errors.
+//!
+//! ## Migrating from the former PTY prototype
+//!
+//! Move command and terminal configuration to the shared Tokio `Command` and `Pty` values. Register
+//! that `Pty` as the spawn provider with `.wrap(Pty::default())` (or `.wrap(configured_pty)`), then
+//! use ordinary `.spawn()` and its ordinary boxed-child result. Call `take_pty_controller()` once on
+//! that returned child to obtain terminal I/O and resize control.
 //!
 //! A terminal has one ordered output stream, so PTY standard output and standard error are merged.
 //! Input and output each strongly own the bidirectional master; resize handles are weak. Dropping one

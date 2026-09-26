@@ -126,8 +126,13 @@ use windows as imp;
 /// # use std::io;
 /// use process_wrap::tokio::{Command, Pty};
 /// # fn run() -> io::Result<()> {
+/// #[cfg(unix)]
 /// let mut command = Command::with_new("sh", |command| {
 ///     command.args(["-c", "printf terminal"]);
+/// });
+/// #[cfg(windows)]
+/// let mut command = Command::with_new("cmd.exe", |command| {
+///     command.args(["/d", "/s", "/c", "echo terminal"]);
 /// });
 /// command.wrap(Pty::default());
 /// let mut child = command.spawn()?;

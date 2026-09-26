@@ -100,11 +100,18 @@ process-wrap = { version = "10.0.0", features = ["pty"] }
 ```
 
 ```rust
-use process_wrap::tokio::*;
+use process_wrap::tokio::{Command, Pty};
 use tokio::io::AsyncReadExt;
 
-let mut command = Command::new("ls");
-command.wrap(ProcessSession).wrap(Pty::default());
+#[cfg(unix)]
+let mut command = Command::with_new("sh", |command| {
+  command.args(["-c", "printf terminal"]);
+});
+#[cfg(windows)]
+let mut command = Command::with_new("cmd.exe", |command| {
+  command.args(["/d", "/s", "/c", "echo terminal"]);
+});
+command.wrap(Pty::default());
 let mut child = command.spawn()?;
 let controller = child
   .take_pty_controller()
@@ -128,6 +135,13 @@ the ownership and lifecycle contract described below on Unix and Windows alike. 
 conditionally, use `Pty::check_supported()` for a capability result or `Pty::is_supported()` for a
 boolean. These report platform and runtime capability only; they do not suppress later
 configuration, compatibility, or spawn errors.
+
+#### Migrating from the former PTY prototype
+
+Move command and terminal configuration to the shared Tokio `Command` and `Pty` values. Register
+that `Pty` as the spawn provider with `.wrap(Pty::default())` (or `.wrap(configured_pty)`), then use
+ordinary `.spawn()` and its ordinary boxed-child result. Call `take_pty_controller()` once on that
+returned child to obtain terminal I/O and resize control.
 
 A PTY has one ordered terminal stream, so standard output and standard error are merged.
 `PtyInput` and `PtyOutput` are strong owners of one bidirectional master descriptor, so dropping
