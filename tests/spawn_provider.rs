@@ -11,6 +11,7 @@ macro_rules! spawn_provider_tests {
 		$child_wrapper_slots:path,
 		$pending_child_wrapper:path,
 		$prepared_child:path,
+		$prepared_child_ref:path,
 		$provider_product:path,
 		$spawn_provider:path,
 		$runtime:expr
@@ -42,6 +43,8 @@ macro_rules! spawn_provider_tests {
 			use $pending_child_wrapper as PendingChildWrapper;
 			#[cfg(windows)]
 			use $prepared_child as PreparedChild;
+			#[cfg(windows)]
+			use $prepared_child_ref as PreparedChildRef;
 			use $provider_product as ProviderProduct;
 			use $spawn_attempt as SpawnAttempt;
 			use $spawn_provider as SpawnProvider;
@@ -401,7 +404,8 @@ macro_rules! spawn_provider_tests {
 			#[cfg(windows)]
 			impl ChildWrapperLayer for PreparedLayer {
 				fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
-					ChildWrapperSlots::new(&mut self.inner).with_prepared(&mut self.prepared)
+					ChildWrapperSlots::new(&mut self.inner)
+						.with_prepared::<PanickingPrepared>(&mut self.prepared)
 				}
 			}
 
@@ -454,7 +458,7 @@ macro_rules! spawn_provider_tests {
 						fn wrap_prepared_child(
 							&mut self,
 							_child: &mut dyn ChildWrapper,
-							prepared: Option<&PreparedChild>,
+							prepared: Option<PreparedChildRef<'_>>,
 							_command: &CommandWrap,
 						) -> io::Result<Option<PendingChildWrapper>> {
 							Ok(prepared.map(|_| PendingChildWrapper::new(PreparedLayer::detached())))
@@ -467,6 +471,216 @@ macro_rules! spawn_provider_tests {
 			prepared_wrapper!(FirstPrepared, "first");
 			#[cfg(windows)]
 			prepared_wrapper!(SecondPrepared, "second");
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct PreparedGuard(Arc<AtomicUsize>);
+
+			#[cfg(windows)]
+			impl Drop for PreparedGuard {
+				fn drop(&mut self) {
+					self.0.fetch_add(1, Ordering::SeqCst);
+				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct OptionPreparedLayer {
+				inner: Option<Box<dyn ChildWrapper>>,
+				prepared: Option<PreparedChild>,
+			}
+
+			#[cfg(windows)]
+			impl OptionPreparedLayer {
+				fn detached() -> Self {
+					Self {
+						inner: None,
+						prepared: None,
+					}
+				}
+			}
+
+			#[cfg(windows)]
+			impl ChildWrapperLayer for OptionPreparedLayer {
+				fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+					ChildWrapperSlots::new(&mut self.inner)
+						.with_prepared::<Option<PreparedGuard>>(&mut self.prepared)
+				}
+			}
+
+			#[cfg(windows)]
+			impl ChildWrapper for OptionPreparedLayer {
+				fn inner(&self) -> &dyn ChildWrapper {
+					self.inner
+						.as_deref()
+						.expect("an installed option-prepared layer owns its child")
+				}
+
+				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+					self.inner
+						.as_deref_mut()
+						.expect("an installed option-prepared layer owns its child")
+				}
+
+				fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+					self.inner
+						.take()
+						.expect("an installed option-prepared layer owns its child")
+				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct OptionPrepared {
+				drops: Arc<AtomicUsize>,
+			}
+
+			#[cfg(windows)]
+			impl CommandWrapper for OptionPrepared {
+				fn prepare_child(
+					&mut self,
+					_attempt: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
+					_command: &CommandWrap,
+				) -> io::Result<Option<Box<dyn std::any::Any + Send>>> {
+					Ok(Some(Box::new(Some(PreparedGuard(Arc::clone(&self.drops))))))
+				}
+
+				fn wrap_prepared_child(
+					&mut self,
+					_child: &mut dyn ChildWrapper,
+					prepared: Option<PreparedChildRef<'_>>,
+					_command: &CommandWrap,
+				) -> io::Result<Option<PendingChildWrapper>> {
+					assert!(
+						prepared
+							.as_ref()
+							.is_some_and(PreparedChildRef::is::<Option<PreparedGuard>>),
+						"the wrapping callback receives only matching type metadata"
+					);
+					Ok(Some(PendingChildWrapper::new(
+						OptionPreparedLayer::detached(),
+					)))
+				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Clone, Copy, Debug)]
+			enum MalformedPreparedCase {
+				CallbackError,
+				CallbackPanic,
+				MissingSlot,
+				ExtraSlot,
+				WrongType,
+				InstallPanic,
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct MalformedPreparedLayer {
+				inner: Option<Box<dyn ChildWrapper>>,
+				prepared: Option<PreparedChild>,
+				case: MalformedPreparedCase,
+			}
+
+			#[cfg(windows)]
+			impl ChildWrapperLayer for MalformedPreparedLayer {
+				fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+					match self.case {
+						MalformedPreparedCase::MissingSlot => ChildWrapperSlots::new(&mut self.inner),
+						MalformedPreparedCase::ExtraSlot => ChildWrapperSlots::new(&mut self.inner)
+							.with_prepared::<PreparedGuard>(&mut self.prepared),
+						MalformedPreparedCase::WrongType => ChildWrapperSlots::new(&mut self.inner)
+							.with_prepared::<u8>(&mut self.prepared),
+						MalformedPreparedCase::InstallPanic => {
+							panic_any("prepared layer installation failed")
+						}
+						MalformedPreparedCase::CallbackError | MalformedPreparedCase::CallbackPanic => {
+							unreachable!("callback failures do not return a layer")
+						}
+					}
+				}
+			}
+
+			#[cfg(windows)]
+			impl ChildWrapper for MalformedPreparedLayer {
+				fn inner(&self) -> &dyn ChildWrapper {
+					self.inner
+						.as_deref()
+						.expect("an installed malformed-test layer owns its child")
+				}
+
+				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+					self.inner
+						.as_deref_mut()
+						.expect("an installed malformed-test layer owns its child")
+				}
+
+				fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+					self.inner
+						.take()
+						.expect("an installed malformed-test layer owns its child")
+				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct MalformedPrepared {
+				next: Option<MalformedPreparedCase>,
+				active: Option<MalformedPreparedCase>,
+				drops: Arc<AtomicUsize>,
+			}
+
+			#[cfg(windows)]
+			impl CommandWrapper for MalformedPrepared {
+				fn prepare_child(
+					&mut self,
+					_attempt: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
+					_command: &CommandWrap,
+				) -> io::Result<Option<Box<dyn std::any::Any + Send>>> {
+					self.active = self.next.take();
+					match self.active {
+						Some(MalformedPreparedCase::ExtraSlot) | None => Ok(None),
+						Some(_) => Ok(Some(Box::new(PreparedGuard(Arc::clone(&self.drops))))),
+					}
+				}
+
+				fn wrap_prepared_child(
+					&mut self,
+					_child: &mut dyn ChildWrapper,
+					prepared: Option<PreparedChildRef<'_>>,
+					_command: &CommandWrap,
+				) -> io::Result<Option<PendingChildWrapper>> {
+					let Some(case) = self.active.take() else {
+						assert!(prepared.is_none());
+						return Ok(None);
+					};
+					if matches!(case, MalformedPreparedCase::ExtraSlot) {
+						assert!(prepared.is_none());
+					} else {
+						assert!(
+							prepared
+								.as_ref()
+								.is_some_and(PreparedChildRef::is::<PreparedGuard>)
+						);
+					}
+					match case {
+						MalformedPreparedCase::CallbackError => Err(io::Error::new(
+							io::ErrorKind::InvalidInput,
+							"prepared wrapping callback failed",
+						)),
+						MalformedPreparedCase::CallbackPanic => {
+							panic_any("prepared wrapping callback failed")
+						}
+						_ => Ok(Some(PendingChildWrapper::new(MalformedPreparedLayer {
+							inner: None,
+							prepared: None,
+							case,
+						}))),
+					}
+				}
+			}
 
 			#[cfg(windows)]
 			#[derive(Debug)]
@@ -1992,6 +2206,112 @@ macro_rules! spawn_provider_tests {
 
 			#[cfg(windows)]
 			#[test]
+			fn option_prepared_state_stays_owned_until_the_returned_child_is_dropped() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let shared = Arc::new(Shared::default());
+				let drops = Arc::new(AtomicUsize::new(0));
+				let mut command = provider_command(Arc::clone(&shared), "provider");
+				command.wrap(OptionPrepared {
+					drops: Arc::clone(&drops),
+				});
+
+				let child = command.spawn().expect("spawn with prepared state");
+				assert_eq!(drops.load(Ordering::SeqCst), 0);
+				drop(child);
+				assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+				let child = command.spawn().expect("reuse command with prepared state");
+				assert_eq!(drops.load(Ordering::SeqCst), 1);
+				drop(child);
+				assert_eq!(drops.load(Ordering::SeqCst), 2);
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn malformed_prepared_layers_fail_atomically_and_allow_reuse() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for (case, expected, was_panic, expected_drops) in [
+					(
+						MalformedPreparedCase::CallbackError,
+						"prepared wrapping callback failed",
+						false,
+						1,
+					),
+					(
+						MalformedPreparedCase::CallbackPanic,
+						"prepared wrapping callback failed",
+						true,
+						1,
+					),
+					(
+						MalformedPreparedCase::MissingSlot,
+						"prepared child state requires an empty matching layer slot",
+						false,
+						1,
+					),
+					(
+						MalformedPreparedCase::ExtraSlot,
+						"a prepared-state slot requires matching prepared child state",
+						false,
+						0,
+					),
+					(
+						MalformedPreparedCase::WrongType,
+						"prepared child state does not match the layer slot type",
+						false,
+						1,
+					),
+					(
+						MalformedPreparedCase::InstallPanic,
+						"prepared layer installation failed",
+						true,
+						1,
+					),
+				] {
+					let shared = Arc::new(Shared::default());
+					let drops = Arc::new(AtomicUsize::new(0));
+					let mut command = provider_command(Arc::clone(&shared), "provider");
+					command.wrap(MalformedPrepared {
+						next: Some(case),
+						active: None,
+						drops: Arc::clone(&drops),
+					});
+
+					let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
+					if was_panic {
+						let payload = outcome.expect_err("prepared installation must panic");
+						assert_eq!(
+							*payload
+								.downcast::<&'static str>()
+								.expect("the exact installation panic is preserved"),
+							expected
+						);
+					} else {
+						let error = outcome
+							.expect("prepared installation must return its error")
+							.expect_err("malformed prepared ownership must fail");
+						assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+						assert_eq!(error.to_string(), expected);
+					}
+					assert_eq!(drops.load(Ordering::SeqCst), expected_drops);
+					let events = shared.events();
+					assert!(!events.contains(&Event::Commit));
+					assert_eq!(
+						events.iter().filter(|event| **event == Event::Rollback).count(),
+						1
+					);
+
+					shared.clear_events();
+					drop(command.spawn().expect("the command remains reusable"));
+					assert_eq!(shared.events(), successful_events("provider"));
+					assert_eq!(drops.load(Ordering::SeqCst), expected_drops);
+				}
+			}
+
+			#[cfg(windows)]
+			#[test]
 			fn prepared_states_are_disposed_independently_after_the_primary_is_owned() {
 				const CHILD_ENV: &str = "PROCESS_WRAP_PROVIDER_PREPARED_PANIC";
 				let module = stringify!($module);
@@ -3373,6 +3693,7 @@ spawn_provider_tests!(
 	process_wrap::std::ChildWrapperSlots,
 	process_wrap::std::PendingChildWrapper,
 	process_wrap::std::PreparedChild,
+	process_wrap::std::PreparedChildRef,
 	process_wrap::std::ProviderProduct,
 	process_wrap::std::SpawnProvider,
 	None
@@ -3389,6 +3710,7 @@ spawn_provider_tests!(
 	process_wrap::tokio::ChildWrapperSlots,
 	process_wrap::tokio::PendingChildWrapper,
 	process_wrap::tokio::PreparedChild,
+	process_wrap::tokio::PreparedChildRef,
 	process_wrap::tokio::ProviderProduct,
 	process_wrap::tokio::SpawnProvider,
 	Some(

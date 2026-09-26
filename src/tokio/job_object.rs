@@ -397,8 +397,9 @@ mod tests {
 	use crate::tokio::{ProviderProduct, SpawnProvider};
 	use crate::windows::test_support::{
 		LifecycleState, OwnerError, OwnerFailure, OwnerPanic, PanickingCommittedTransaction,
-		TreePaths, arm_owner_failure, assert_tree_terminated, clear_owner_failure,
-		observe_descendant, publish_process_guards,
+		TreePaths, arm_extra_prepared_owner, arm_owner_failure, assert_tree_terminated,
+		clear_extra_prepared_owners, clear_owner_failure, observe_descendant,
+		publish_process_guards,
 	};
 
 	use super::*;
@@ -498,6 +499,82 @@ mod tests {
 				.and_then(|error| error.downcast_ref::<OwnerError>())
 				.is_some_and(|error| Arc::ptr_eq(&error.0, identity))
 		}
+	}
+
+	fn topology_command(
+		provider: bool,
+		paths: &TreePaths,
+		state: &Arc<LifecycleState>,
+	) -> Result<CommandWrap> {
+		let mut command = if provider {
+			CommandWrap::new("provider-owned-program")
+		} else {
+			CommandWrap::from(tokio::process::Command::from(paths.direct_command()?))
+		};
+		command.wrap(JobObject).wrap(ObserveTree {
+			paths: paths.clone(),
+			state: Arc::clone(state),
+		});
+		if provider {
+			command.wrap(TreeProviderWrapper(TreeProvider {
+				paths: paths.clone(),
+				state: Arc::clone(state),
+			}));
+		}
+		Ok(command)
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn unexpected_prepared_owner_fails_native_and_provider_spawns_before_success()
+	-> Result<()> {
+		for provider in [false, true] {
+			let directory = tempfile::tempdir()?;
+			let paths = TreePaths::new(directory.path());
+			let state = Arc::new(LifecycleState::default());
+			let mut command = topology_command(provider, &paths, &state)?;
+			arm_extra_prepared_owner();
+
+			let error = command
+				.spawn()
+				.expect_err("an unexpected prepared owner must fail the lifecycle");
+			let (injection_pending, retained_owners) = clear_extra_prepared_owners();
+			assert!(
+				!injection_pending,
+				"the installation must consume the injection"
+			);
+			assert_eq!(retained_owners, 1);
+			assert_eq!(error.kind(), ErrorKind::InvalidInput);
+			assert_eq!(
+				error.to_string(),
+				"prepared child state has an unexpected custody topology"
+			);
+			assert_eq!(state.commits.load(Ordering::SeqCst), 0);
+			assert_eq!(
+				state.rollbacks.load(Ordering::SeqCst),
+				usize::from(provider)
+			);
+			assert_tree_terminated(&paths, &state)?;
+			std::fs::remove_file(&paths.descendant_pid)?;
+
+			let mut child = command.spawn().expect("the command remains reusable");
+			child.start_kill()?;
+			let _ = child.wait().await?;
+			let disposal = catch_unwind(AssertUnwindSafe(|| drop(child)));
+			if provider {
+				let payload =
+					disposal.expect_err("the provider fixture residue panics on disposal");
+				std::mem::forget(payload);
+			} else {
+				disposal.expect("native child disposal does not panic");
+			}
+			assert_tree_terminated(&paths, &state)?;
+			assert_eq!(state.commits.load(Ordering::SeqCst), usize::from(provider));
+			assert_eq!(
+				state.rollbacks.load(Ordering::SeqCst),
+				usize::from(provider)
+			);
+		}
+		Ok(())
 	}
 
 	#[tokio::test(flavor = "current_thread")]
