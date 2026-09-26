@@ -48,6 +48,14 @@ macro_rules! spawn_provider_tests {
 				PeerWrap,
 				Commit,
 				Rollback,
+				#[cfg(windows)]
+				FinalizeSpawn,
+				#[cfg(windows)]
+				DisarmSpawnCleanup,
+				#[cfg(windows)]
+				DisarmNonOwner,
+				#[cfg(windows)]
+				DisarmOwner,
 			}
 
 			#[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +76,23 @@ macro_rules! spawn_provider_tests {
 				Wrap(&'static str),
 				Commit,
 				Rollback,
+				#[cfg(windows)]
+				FinalizeSpawn(&'static str),
+				#[cfg(windows)]
+				DisarmSpawnCleanup(&'static str),
+				#[cfg(windows)]
+				DisarmNonOwner(&'static str),
+				#[cfg(windows)]
+				DisarmOwner(&'static str),
+				#[cfg(windows)]
+				OwnerDropped(&'static str, bool),
+			}
+
+			#[cfg(windows)]
+			#[derive(Clone, Copy, Debug)]
+			struct FinalizationLayerSpec {
+				name: &'static str,
+				owns_job_cleanup: bool,
 			}
 
 			#[derive(Debug, Default)]
@@ -75,6 +100,8 @@ macro_rules! spawn_provider_tests {
 				events: Mutex<Vec<Event>>,
 				failures: Mutex<Vec<(Point, Failure)>>,
 				make_attempt_native_only: AtomicBool,
+				#[cfg(windows)]
+				finalization_layers: Mutex<Vec<FinalizationLayerSpec>>,
 			}
 
 			impl Shared {
@@ -88,6 +115,16 @@ macro_rules! spawn_provider_tests {
 
 				fn clear_events(&self) {
 					self.events.lock().unwrap().clear();
+				}
+
+				#[cfg(windows)]
+				fn set_finalization_layers(&self, layers: Vec<FinalizationLayerSpec>) {
+					*self.finalization_layers.lock().unwrap() = layers;
+				}
+
+				#[cfg(windows)]
+				fn finalization_layers(&self) -> Vec<FinalizationLayerSpec> {
+					self.finalization_layers.lock().unwrap().clone()
 				}
 
 				fn fail_once(&self, point: Point, failure: Failure) {
@@ -126,6 +163,90 @@ macro_rules! spawn_provider_tests {
 				fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
 					self
 				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct FinalizationChild {
+				inner: Option<Box<dyn ChildWrapper>>,
+				shared: Arc<Shared>,
+				name: &'static str,
+				owns_job_cleanup: bool,
+				armed: bool,
+			}
+
+			#[cfg(windows)]
+			impl ChildWrapper for FinalizationChild {
+				fn inner(&self) -> &dyn ChildWrapper {
+					self.inner.as_deref().expect("the child layer still owns its inner child")
+				}
+
+				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+					self.inner
+						.as_deref_mut()
+						.expect("the child layer still owns its inner child")
+				}
+
+				fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+					self.inner
+						.take()
+						.expect("the child layer still owns its inner child")
+				}
+
+				fn finalize_spawn_layer(&mut self) -> io::Result<()> {
+					self.shared.event(Event::FinalizeSpawn(self.name));
+					self.shared.fail(Point::FinalizeSpawn)
+				}
+
+				fn disarm_spawn_cleanup_layer(&mut self) -> io::Result<()> {
+					self.shared.event(Event::DisarmSpawnCleanup(self.name));
+					self.shared.fail(Point::DisarmSpawnCleanup)
+				}
+
+				fn owns_job_object_cleanup_layer(&self) -> bool {
+					self.owns_job_cleanup
+				}
+
+				fn disarm_job_object_layer(&mut self) -> io::Result<()> {
+					if self.owns_job_cleanup {
+						self.shared.event(Event::DisarmOwner(self.name));
+						self.shared.fail(Point::DisarmOwner)?;
+						self.armed = false;
+					} else {
+						self.shared.event(Event::DisarmNonOwner(self.name));
+						self.shared.fail(Point::DisarmNonOwner)?;
+					}
+					Ok(())
+				}
+			}
+
+			#[cfg(windows)]
+			impl Drop for FinalizationChild {
+				fn drop(&mut self) {
+					if self.owns_job_cleanup {
+						self.shared.event(Event::OwnerDropped(self.name, self.armed));
+					}
+				}
+			}
+
+			#[cfg(windows)]
+			fn add_finalization_layers(
+				shared: Arc<Shared>,
+				child: Box<dyn ChildWrapper>,
+			) -> Box<dyn ChildWrapper> {
+				shared
+					.finalization_layers()
+					.into_iter()
+					.rev()
+					.fold(child, |inner, layer| {
+						Box::new(FinalizationChild {
+							inner: Some(inner),
+							shared: Arc::clone(&shared),
+							name: layer.name,
+							owns_job_cleanup: layer.owns_job_cleanup,
+							armed: layer.owns_job_cleanup,
+						})
+					})
 			}
 
 			#[derive(Debug)]
@@ -379,6 +500,8 @@ macro_rules! spawn_provider_tests {
 					}
 					self.shared.event(Event::Wrap("peer"));
 					self.shared.fail(Point::PeerWrap)?;
+					#[cfg(windows)]
+					let child = add_finalization_layers(Arc::clone(&self.shared), child);
 					Ok(child)
 				}
 			}
@@ -446,6 +569,49 @@ macro_rules! spawn_provider_tests {
 					Event::Wrap("peer"),
 					Event::Commit,
 				]
+			}
+
+			#[cfg(windows)]
+			fn finalization_layer(
+				name: &'static str,
+				owns_job_cleanup: bool,
+			) -> FinalizationLayerSpec {
+				FinalizationLayerSpec {
+					name,
+					owns_job_cleanup,
+				}
+			}
+
+			#[cfg(windows)]
+			fn lifecycle_before_commit(name: &'static str) -> Vec<Event> {
+				let mut events = successful_events(name);
+				assert_eq!(events.pop(), Some(Event::Commit));
+				events
+			}
+
+			#[cfg(windows)]
+			fn successful_finalization_events(
+				name: &'static str,
+				layers: &[FinalizationLayerSpec],
+			) -> Vec<Event> {
+				let mut events = lifecycle_before_commit(name);
+				events.extend(layers.iter().map(|layer| Event::FinalizeSpawn(layer.name)));
+				events.extend(
+					layers
+						.iter()
+						.map(|layer| Event::DisarmSpawnCleanup(layer.name)),
+				);
+				events.extend(
+					layers
+						.iter()
+						.filter(|layer| !layer.owns_job_cleanup)
+						.map(|layer| Event::DisarmNonOwner(layer.name)),
+				);
+				events.push(Event::Commit);
+				if let Some(owner) = layers.iter().find(|layer| layer.owns_job_cleanup) {
+					events.push(Event::DisarmOwner(owner.name));
+				}
+				events
 			}
 
 			fn expected_before(point: Point, name: &'static str) -> Vec<Event> {
@@ -839,6 +1005,140 @@ macro_rules! spawn_provider_tests {
 				shared.clear_events();
 				let _child = command.spawn().unwrap();
 				assert_eq!(shared.events(), successful_events("provider"));
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn precommit_child_hook_failures_roll_back_preserve_failure_and_allow_reuse() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for (point, failure_event) in [
+					(Point::FinalizeSpawn, Event::FinalizeSpawn("layer")),
+					(
+						Point::DisarmSpawnCleanup,
+						Event::DisarmSpawnCleanup("layer"),
+					),
+					(Point::DisarmNonOwner, Event::DisarmNonOwner("layer")),
+				] {
+					for failure in [
+						Failure::Error(io::ErrorKind::Other, "finalization failed"),
+						Failure::Panic("finalization failed"),
+					] {
+						let shared = Arc::new(Shared::default());
+						let layers = vec![finalization_layer("layer", false)];
+						shared.set_finalization_layers(layers.clone());
+						shared.fail_once(point, failure);
+						let mut command = provider_command(Arc::clone(&shared), "provider");
+
+						assert_failure(&mut command, failure, "finalization failed");
+						let events = shared.events();
+						assert_eq!(events.last(), Some(&Event::Rollback));
+						assert!(events.contains(&failure_event));
+						assert!(!events.contains(&Event::Commit));
+						assert!(
+							events
+								.windows(2)
+								.any(|events| events == [failure_event, Event::Rollback]),
+							"the failing hook must be followed by provider rollback: {events:?}"
+						);
+
+						shared.clear_events();
+						let child = command.spawn().unwrap();
+						drop(child);
+						assert_eq!(
+							shared.events(),
+							successful_finalization_events("provider", &layers)
+						);
+					}
+				}
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn provider_commit_separates_nonowners_from_the_sole_final_owner() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for layers in [
+					vec![
+						finalization_layer("outer", false),
+						finalization_layer("inner", false),
+					],
+					vec![
+						finalization_layer("outer", false),
+						finalization_layer("owner", true),
+						finalization_layer("inner", false),
+					],
+				] {
+					let shared = Arc::new(Shared::default());
+					shared.set_finalization_layers(layers.clone());
+					let mut command = provider_command(Arc::clone(&shared), "provider");
+
+					let child = command.spawn().unwrap();
+					drop(child);
+					let mut expected = successful_finalization_events("provider", &layers);
+					if let Some(owner) = layers.iter().find(|layer| layer.owns_job_cleanup) {
+						expected.push(Event::OwnerDropped(owner.name, false));
+					}
+					assert_eq!(shared.events(), expected);
+				}
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn multiple_final_owners_fail_and_roll_back_before_commit() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let shared = Arc::new(Shared::default());
+				let layers = vec![
+					finalization_layer("outer-owner", true),
+					finalization_layer("nonowner", false),
+					finalization_layer("inner-owner", true),
+				];
+				shared.set_finalization_layers(layers);
+				let mut command = provider_command(Arc::clone(&shared), "provider");
+
+				let error = command.spawn().expect_err("multiple owners must fail");
+				assert_eq!(
+					error.to_string(),
+					"multiple child layers own JobObject cleanup"
+				);
+				let events = shared.events();
+				assert!(!events.contains(&Event::Commit));
+				assert_eq!(events.last(), Some(&Event::Rollback));
+				assert!(events.contains(&Event::DisarmNonOwner("nonowner")));
+				assert!(events.contains(&Event::OwnerDropped("outer-owner", true)));
+				assert!(events.contains(&Event::OwnerDropped("inner-owner", true)));
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn final_owner_failures_leave_the_owner_armed_and_preserve_the_failure() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for failure in [
+					Failure::Error(io::ErrorKind::Other, "owner disarm failed"),
+					Failure::Panic("owner disarm failed"),
+				] {
+					let shared = Arc::new(Shared::default());
+					let layers = vec![finalization_layer("owner", true)];
+					shared.set_finalization_layers(layers.clone());
+					shared.fail_once(Point::DisarmOwner, failure);
+					let mut command = provider_command(Arc::clone(&shared), "provider");
+
+					assert_failure(&mut command, failure, "owner disarm failed");
+					let events = shared.events();
+					assert!(events.contains(&Event::Commit));
+					assert!(events.contains(&Event::DisarmOwner("owner")));
+					assert_eq!(events.last(), Some(&Event::OwnerDropped("owner", true)));
+					assert!(!events.contains(&Event::Rollback));
+
+					shared.clear_events();
+					let child = command.spawn().unwrap();
+					drop(child);
+					let mut expected = successful_finalization_events("provider", &layers);
+					expected.push(Event::OwnerDropped("owner", false));
+					assert_eq!(shared.events(), expected);
+				}
 			}
 
 			#[test]

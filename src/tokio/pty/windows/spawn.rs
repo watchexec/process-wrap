@@ -102,7 +102,7 @@ pub(super) struct SpawnedChild {
 
 #[derive(Debug)]
 pub(super) struct SpawnCleanup {
-	process: Option<OwnedHandle>,
+	process: Option<ReapHandle>,
 }
 
 impl SpawnCleanup {
@@ -111,7 +111,16 @@ impl SpawnCleanup {
 	}
 
 	pub(super) fn rollback(&mut self) -> io::Result<()> {
-		self.process.take().map_or(Ok(()), terminate_and_reap)
+		self.process.take().map_or(Ok(()), |process| {
+			terminate_and_reap_with(process, WindowsCleanupOperations)
+		})
+	}
+
+	#[cfg(test)]
+	fn tracked(process: OwnedHandle, released: std::sync::mpsc::Sender<usize>) -> Self {
+		Self {
+			process: Some(ReapHandle::tracked(process, released)),
+		}
 	}
 }
 
@@ -153,7 +162,7 @@ impl SpawnedProcess {
 			.as_ref()
 			.expect("a spawned process guard must own its process handle");
 		Ok(SpawnCleanup {
-			process: Some(duplicate(process)?),
+			process: Some(ReapHandle::new(duplicate(process)?)),
 		})
 	}
 
@@ -430,6 +439,15 @@ struct ReapHandle {
 	diagnostics: PendingDiagnostics,
 	#[cfg(test)]
 	released: Option<std::sync::mpsc::Sender<usize>>,
+}
+
+impl std::fmt::Debug for ReapHandle {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("ReapHandle")
+			.field("process", &self.process)
+			.finish_non_exhaustive()
+	}
 }
 
 impl ReapHandle {
@@ -761,7 +779,9 @@ fn win32_io_error(error: windows::core::Error) -> io::Error {
 mod tests {
 	use std::{
 		collections::VecDeque,
-		os::windows::io::FromRawHandle,
+		io,
+		os::windows::io::{AsRawHandle, FromRawHandle},
+		panic::{AssertUnwindSafe, catch_unwind, panic_any},
 		sync::{
 			Arc, Condvar, Mutex,
 			atomic::{AtomicUsize, Ordering},
@@ -779,12 +799,158 @@ mod tests {
 	use windows::{
 		Win32::System::{
 			Console::HPCON,
-			Threading::{CreateEventW, STARTF_USESTDHANDLES},
+			Threading::{CreateEventW, STARTF_USESTDHANDLES, SetEvent},
 		},
 		core::PCWSTR,
 	};
 
+	use crate::{
+		SpawnTransaction,
+		tokio::{
+			ChildWrapper, Command, CommandWrapper, ProviderProduct, SpawnAttempt, SpawnProvider,
+		},
+	};
+
 	use super::*;
+
+	#[derive(Clone, Copy, Debug)]
+	enum LifecycleFailure {
+		Error,
+		Panic,
+	}
+
+	#[derive(Debug)]
+	struct FinalizationFailureChild(LifecycleFailure);
+
+	impl ChildWrapper for FinalizationFailureChild {
+		fn inner(&self) -> &dyn ChildWrapper {
+			self
+		}
+
+		fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+			self
+		}
+
+		fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+			self
+		}
+
+		fn finalize_spawn_layer(&mut self) -> io::Result<()> {
+			match self.0 {
+				LifecycleFailure::Error => Err(io::Error::other("finalization failed")),
+				LifecycleFailure::Panic => panic_any("finalization failed"),
+			}
+		}
+	}
+
+	#[derive(Debug)]
+	struct TrackedCleanupTransaction(SpawnCleanup);
+
+	impl SpawnTransaction for TrackedCleanupTransaction {
+		fn commit(&mut self) -> io::Result<()> {
+			self.0.disarm();
+			Ok(())
+		}
+
+		fn rollback(&mut self) -> io::Result<()> {
+			self.0.rollback()
+		}
+	}
+
+	struct CleanupControl {
+		signal: OwnedHandle,
+		released: mpsc::Receiver<usize>,
+		expected_handle: usize,
+	}
+
+	#[derive(Debug)]
+	struct TrackedCleanupProvider {
+		failure: LifecycleFailure,
+		control: mpsc::Sender<CleanupControl>,
+	}
+
+	impl SpawnProvider for TrackedCleanupProvider {
+		fn spawn(
+			&self,
+			_attempt: &mut SpawnAttempt,
+			_command: &Command,
+		) -> io::Result<ProviderProduct> {
+			// SAFETY: default security, manual reset, initially unsignaled, and no name request an event
+			// handle which is transferred immediately to `OwnedHandle`.
+			let event = unsafe { CreateEventW(None, true, false, None) }?;
+			// SAFETY: the successful CreateEventW result is uniquely owned here.
+			let process = unsafe { OwnedHandle::from_raw_handle(event.0) };
+			let signal = duplicate(&process)?;
+			let expected_handle = process.as_raw_handle() as usize;
+			let (released, released_rx) = mpsc::channel();
+			let cleanup = SpawnCleanup::tracked(process, released);
+			self.control
+				.send(CleanupControl {
+					signal,
+					released: released_rx,
+					expected_handle,
+				})
+				.expect("the lifecycle test still receives cleanup ownership");
+			Ok(ProviderProduct::new(
+				Box::new(FinalizationFailureChild(self.failure)),
+				Box::new(TrackedCleanupTransaction(cleanup)),
+			))
+		}
+	}
+
+	#[derive(Debug)]
+	struct TrackedCleanupWrapper(TrackedCleanupProvider);
+
+	impl CommandWrapper for TrackedCleanupWrapper {
+		fn spawn_provider(&self) -> Option<&dyn SpawnProvider> {
+			Some(&self.0)
+		}
+	}
+
+	#[test]
+	fn finalization_failures_transfer_the_exact_transaction_handle_to_the_reaper() -> io::Result<()>
+	{
+		for failure in [LifecycleFailure::Error, LifecycleFailure::Panic] {
+			let (control, control_rx) = mpsc::channel();
+			let mut command = Command::new("provider-owned-program");
+			command.wrap(TrackedCleanupWrapper(TrackedCleanupProvider {
+				failure,
+				control,
+			}));
+
+			match failure {
+				LifecycleFailure::Error => {
+					let error = command.spawn().expect_err("finalization must fail");
+					assert_eq!(error.to_string(), "finalization failed");
+				}
+				LifecycleFailure::Panic => {
+					let payload = catch_unwind(AssertUnwindSafe(|| command.spawn()))
+						.expect_err("finalization must panic");
+					assert_eq!(
+						*payload
+							.downcast::<&'static str>()
+							.expect("the original panic payload is preserved"),
+						"finalization failed"
+					);
+				}
+			}
+
+			let control = control_rx
+				.recv_timeout(Duration::from_secs(2))
+				.expect("the provider reports its exact cleanup handle");
+			assert_eq!(control.released.try_recv(), Err(mpsc::TryRecvError::Empty));
+			// SAFETY: `signal` owns a live duplicate of the manual-reset event waited on by the reaper.
+			unsafe { SetEvent(HANDLE(control.signal.as_raw_handle())) }?;
+			assert_eq!(
+				control
+					.released
+					.recv_timeout(Duration::from_secs(2))
+					.expect("the reaper releases the exact handle after completion"),
+				control.expected_handle
+			);
+		}
+		Ok(())
+	}
 
 	#[cfg(feature = "tracing")]
 	#[derive(Clone, Copy, Debug)]

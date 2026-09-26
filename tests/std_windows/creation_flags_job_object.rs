@@ -12,6 +12,13 @@ use std::{
 	time::Instant,
 };
 
+#[cfg(feature = "tracing")]
+use tracing::{
+	Event, Metadata, Subscriber,
+	field::{Field, Visit},
+	span::{Attributes, Id, Record},
+};
+
 use windows::Win32::System::Threading::{
 	CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS,
 	PROCESS_CREATION_FLAGS,
@@ -24,6 +31,8 @@ use super::{
 
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const DESCENDANT_PID_FILE: &str = "PROCESS_WRAP_DESCENDANT_PID_FILE";
+#[cfg(feature = "tracing")]
+const FINAL_OWNER_TRACE_HELPER: &str = "PROCESS_WRAP_FINAL_OWNER_TRACE_HELPER";
 static PID_FILE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
@@ -278,6 +287,96 @@ impl CommandWrapper for FailAfterDescendant {
 	}
 }
 
+#[cfg(feature = "tracing")]
+#[derive(Debug)]
+struct ObserveDescendant {
+	pid_file: PathBuf,
+	guard: Arc<Mutex<Option<ProcessGuard>>>,
+}
+
+#[cfg(feature = "tracing")]
+impl CommandWrapper for ObserveDescendant {
+	fn wrap_child(
+		&mut self,
+		child: Box<dyn ChildWrapper>,
+		_core: &CommandWrap,
+	) -> Result<Box<dyn ChildWrapper>> {
+		resume_process_threads(child.id())?;
+		let deadline = Instant::now() + EXIT_TIMEOUT;
+		let pid = loop {
+			if let Ok(pid) = fs::read_to_string(&self.pid_file)
+				.and_then(|pid| pid.trim().parse().map_err(Error::other))
+			{
+				break pid;
+			}
+			if Instant::now() >= deadline {
+				return Err(Error::new(
+					ErrorKind::TimedOut,
+					"descendant helper did not report its process ID",
+				));
+			}
+			std::thread::sleep(Duration::from_millis(10));
+		};
+		*self.guard.lock().unwrap() = Some(ProcessGuard::open(pid)?);
+		Ok(child)
+	}
+}
+
+#[cfg(feature = "tracing")]
+#[derive(Default)]
+struct JobLimitMessageVisitor {
+	matches: bool,
+	kill_on_drop: Option<bool>,
+}
+
+#[cfg(feature = "tracing")]
+impl Visit for JobLimitMessageVisitor {
+	fn record_bool(&mut self, field: &Field, value: bool) {
+		if field.name() == "kill_on_drop" {
+			self.kill_on_drop = Some(value);
+		}
+	}
+
+	fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+		if field.name() == "message"
+			&& format!("{value:?}").contains("setting SetInformationJobObject(limit)")
+		{
+			self.matches = true;
+		}
+	}
+}
+
+#[cfg(feature = "tracing")]
+#[derive(Debug, Default)]
+struct PanicOnJobDisarmEvent;
+
+#[cfg(feature = "tracing")]
+impl Subscriber for PanicOnJobDisarmEvent {
+	fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+		true
+	}
+
+	fn new_span(&self, _span: &Attributes<'_>) -> Id {
+		Id::from_u64(1)
+	}
+
+	fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+	fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+	fn event(&self, event: &Event<'_>) {
+		let mut visitor = JobLimitMessageVisitor::default();
+		event.record(&mut visitor);
+		if visitor.matches && visitor.kill_on_drop == Some(false) {
+			panic!("injected final-owner tracing panic");
+		}
+	}
+
+	fn enter(&self, _span: &Id) {}
+
+	fn exit(&self, _span: &Id) {}
+}
+
 fn descendant_pid_file() -> Result<PathBuf> {
 	let path = std::env::temp_dir().join(format!(
 		"process-wrap-{}-{}.pid",
@@ -489,6 +588,55 @@ fn armed_job_kills_descendants_after_later_failures() -> Result<()> {
 			fs::remove_file(pid_file)?;
 		}
 	}
+	Ok(())
+}
+
+#[cfg(feature = "tracing")]
+#[test]
+fn final_owner_tracing_panic_leaves_job_cleanup_armed() -> Result<()> {
+	if std::env::var_os(FINAL_OWNER_TRACE_HELPER).is_none() {
+		let status = StdCommand::new(std::env::current_exe()?)
+			.args([
+				"std_windows::creation_flags_job_object::final_owner_tracing_panic_leaves_job_cleanup_armed",
+				"--exact",
+				"--nocapture",
+			])
+			.env(FINAL_OWNER_TRACE_HELPER, "1")
+			.status()?;
+		assert!(status.success(), "the isolated tracing regression failed");
+		return Ok(());
+	}
+
+	let pid_file = descendant_pid_file()?;
+	let guard = Arc::new(Mutex::new(None));
+	let mut command = CommandWrap::with_new(std::env::current_exe()?, |command| {
+		command
+			.args(["lifecycle_descendant_parent", "--ignored", "--nocapture"])
+			.env(DESCENDANT_PID_FILE, &pid_file);
+	});
+	command
+		.wrap(ObserveDescendant {
+			pid_file: pid_file.clone(),
+			guard: Arc::clone(&guard),
+		})
+		.wrap(JobObject);
+
+	let panic = tracing::subscriber::with_default(PanicOnJobDisarmEvent, || {
+		catch_unwind(AssertUnwindSafe(|| command.spawn()))
+	})
+	.expect_err("the final-owner tracing callback must panic");
+	assert_eq!(
+		*panic.downcast::<&'static str>().unwrap(),
+		"injected final-owner tracing panic"
+	);
+
+	let process = guard
+		.lock()
+		.unwrap()
+		.take()
+		.expect("the observing hook opened the descendant process");
+	wait_for_process_exit(process)?;
+	fs::remove_file(pid_file)?;
 	Ok(())
 }
 

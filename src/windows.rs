@@ -121,13 +121,20 @@ impl Drop for JobPort {
 }
 
 /// Set whether closing a job's final handle terminates every process in the job.
-#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 pub(crate) fn set_job_kill_on_drop(job: JobHandle, kill_on_drop: bool) -> Result<()> {
 	let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
 	if kill_on_drop {
 		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 	}
 
+	#[cfg(feature = "tracing")]
+	debug!(
+		kill_on_drop,
+		?info,
+		"setting SetInformationJobObject(limit)"
+	);
+	// No tracing or other caller-controlled callback may run after the native transition: the sole
+	// final owner must either remain kill-on-close armed or complete disarming without unwinding.
 	// SAFETY: `job` is live, and initialized `info` has the reported size and outlives the call.
 	unsafe {
 		SetInformationJobObject(
@@ -139,8 +146,6 @@ pub(crate) fn set_job_kill_on_drop(job: JobHandle, kill_on_drop: bool) -> Result
 				.expect("cannot safely cast to DWORD"),
 		)
 	}?;
-	#[cfg(feature = "tracing")]
-	debug!(?info, "done SetInformationJobObject(limit)");
 	Ok(())
 }
 

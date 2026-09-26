@@ -159,7 +159,9 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 
 	/// Report whether this layer owns the JobObject rollback guard.
 	///
-	/// Process-wrap defers the sole owning layer until every other fallible child-layer hook succeeds.
+	/// Process-wrap counts owners and disarms every non-owner before a provider transaction commits.
+	/// More than one owner fails the lifecycle before commit. The sole owner stays armed until commit
+	/// succeeds and is then disarmed as the only post-commit child-layer operation.
 	#[doc(hidden)]
 	#[cfg(windows)]
 	fn owns_job_object_cleanup_layer(&self) -> bool {
@@ -168,8 +170,10 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 
 	/// Disarm JobObject-phase cleanup state owned by this child layer.
 	///
-	/// Non-owning hooks run first. The sole layer identified by
-	/// [`ChildWrapper::owns_job_object_cleanup_layer`] runs last.
+	/// Non-owning hooks run before provider commit. The sole layer identified by
+	/// [`ChildWrapper::owns_job_object_cleanup_layer`] runs after commit and must be failure-atomic:
+	/// returning an error or unwinding must leave kill-on-close protection armed. If disarming uses a
+	/// native state transition, no caller-controlled callback may run after that transition succeeds.
 	#[doc(hidden)]
 	#[cfg(windows)]
 	fn disarm_job_object_layer(&mut self) -> Result<()> {
@@ -363,6 +367,20 @@ fn same_child(left: &dyn ChildWrapper, right: &dyn ChildWrapper) -> bool {
 	std::ptr::addr_eq(left, right) && left.type_id() == right.type_id()
 }
 
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct FinalJobOwner {
+	identity: Option<(std::any::TypeId, *mut ())>,
+}
+
+#[cfg(windows)]
+fn spawn_layer_identity(layer: &mut dyn ChildWrapper) -> (std::any::TypeId, *mut ()) {
+	(
+		(&*layer as &dyn Any).type_id(),
+		std::ptr::from_mut(layer).cast::<()>(),
+	)
+}
+
 impl dyn ChildWrapper + '_ {
 	fn downcast_ref<T: 'static>(&self) -> Option<&T> {
 		(self as &dyn Any).downcast_ref()
@@ -507,14 +525,16 @@ impl dyn ChildWrapper + '_ {
 	}
 
 	#[cfg(windows)]
-	pub(crate) fn finalize_spawn(&mut self) -> Result<()> {
+	pub(crate) fn finalize_spawn_before_commit(&mut self) -> Result<FinalJobOwner> {
 		self.visit_spawn_layers(|inner| inner.finalize_spawn_layer())?;
 		self.visit_spawn_layers(|inner| inner.disarm_spawn_cleanup_layer())?;
 
 		let mut owners = 0;
+		let mut identity = None;
 		self.visit_spawn_layers(|inner| {
 			if inner.owns_job_object_cleanup_layer() {
 				owners += 1;
+				identity.get_or_insert_with(|| spawn_layer_identity(inner));
 				Ok(())
 			} else {
 				inner.disarm_job_object_layer()
@@ -525,18 +545,31 @@ impl dyn ChildWrapper + '_ {
 				"multiple child layers own JobObject cleanup",
 			));
 		}
-		if owners == 0 {
-			return Ok(());
-		}
+		Ok(FinalJobOwner { identity })
+	}
 
+	#[cfg(windows)]
+	pub(crate) fn finalize_spawn_final_owner(&mut self, owner: FinalJobOwner) -> Result<()> {
+		let Some(identity) = owner.identity else {
+			return Ok(());
+		};
+		let mut found = false;
 		self.visit_spawn_layers_until(|inner| {
-			if inner.owns_job_object_cleanup_layer() {
+			if spawn_layer_identity(inner) == identity {
 				inner.disarm_job_object_layer()?;
+				found = true;
 				Ok(true)
 			} else {
 				Ok(false)
 			}
-		})
+		})?;
+		if found {
+			Ok(())
+		} else {
+			Err(std::io::Error::other(
+				"the captured JobObject cleanup owner left the child chain",
+			))
+		}
 	}
 
 	/// Try to obtain a reference to the underlying native [`Child`].
