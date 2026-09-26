@@ -543,8 +543,16 @@ impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
 /// provider rollback resources on success. If pre-commit work or `commit` returns an error or unwinds,
 /// the transaction must remain rollbackable; process-wrap then makes one best-effort
 /// [`rollback`](SpawnTransaction::rollback) call. A rollback error or unwinding panic is suppressed so
-/// the original failure is preserved. After successful commit, process-wrap drops the transaction and
-/// runs only the sole JobObject owner hook, whose contract requires failure-atomic disarming.
+/// the original failure is preserved. Transaction destruction after rollback is contained separately,
+/// and secondary panic payloads are quarantined without being inspected or destroyed.
+///
+/// Successful commit ends failed-spawn rollback. Process-wrap retains the committed transaction
+/// residue until the sole JobObject owner, if any, disarms successfully, then transfers that residue
+/// in a private transparent layer with the returned child. On a successful spawn, arbitrary
+/// transaction destruction therefore occurs only after the child has left the spawn lifecycle. A
+/// committed transaction must retain no armed cleanup or independent process, terminal, controller,
+/// handle, pseudoconsole, or other liveness resource. If the final owner fails after commit, its still-armed cleanup remains
+/// authoritative while process-wrap contains disposal of the committed residue as secondary cleanup.
 ///
 /// On non-Windows targets there is no hidden child-finalization phase, so commit follows the public
 /// hooks directly. These panic guarantees require unwinding; `panic=abort` terminates the process
@@ -554,6 +562,11 @@ impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
 /// `spawn` implementation remains the provider's responsibility.
 pub trait SpawnTransaction: fmt::Debug + Send + 'static {
 	/// Finalize the successful spawn and disarm rollback resources.
+	///
+	/// On success, the transaction must release every rollback-only strong owner and every
+	/// independent process, terminal, controller, handle, pseudoconsole, or other liveness resource.
+	/// Process-wrap may retain and later destroy the committed transaction residue with the returned
+	/// child.
 	fn commit(&mut self) -> std::io::Result<()>;
 
 	/// Undo an uncommitted spawn.

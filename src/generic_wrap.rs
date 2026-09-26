@@ -191,9 +191,9 @@ macro_rules! Wrap {
 		/// completes the pre-commit child phase while provider rollback remains armed, commits the
 		/// transaction, and disarms the sole JobObject cleanup owner. Successful commit ends failed-spawn
 		/// rollback. After the final owner succeeds, process-wrap transfers the committed transaction
-		/// residue in a private transparent layer with the returned child, so arbitrary residue
-		/// destruction occurs outside the spawn lifecycle. `spawn_with` and `spawn_with_child` reject a
-		/// registered provider instead of bypassing it.
+		/// residue in a private transparent layer with the returned child. On the successful path,
+		/// arbitrary residue destruction occurs outside the spawn lifecycle. `spawn_with` and
+		/// `spawn_with_child` reject a registered provider instead of bypassing it.
 		///
 		/// A committed transaction residue must retain no armed cleanup or independent process,
 		/// terminal, controller, handle, pseudoconsole, or other liveness resource.
