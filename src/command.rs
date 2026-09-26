@@ -533,8 +533,13 @@ impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
 /// Cleanup and finalization owned by an alternate spawn provider.
 ///
 /// A provider returns a fresh, armed transaction with every child it successfully creates. The
-/// transaction must own its cleanup resources independently of the child wrapper chain, because a
-/// failing child wrapper may already have consumed or dropped that chain.
+/// transaction must own its cleanup resources independently of the child wrapper chain, so rollback
+/// authority remains available while process-wrap disposes other lifecycle values separately.
+///
+/// After capturing a lifecycle error or unwinding panic, process-wrap first rolls back an armed
+/// transaction or disposes committed residue, then disposes any detached child layer, the child chain,
+/// and each Windows prepared-state value independently. Every secondary cleanup panic is quarantined
+/// without inspecting or destroying its payload before the original failure is returned or resumed.
 ///
 /// On Windows, process-wrap calls [`commit`](SpawnTransaction::commit) only after every public
 /// post-spawn and child-wrapping hook and the complete pre-commit child phase succeed. That phase

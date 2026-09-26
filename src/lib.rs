@@ -248,10 +248,12 @@
 //!   child with no native value. Changing command settings on `attempt` here cannot configure the
 //!   already-created child. By default does nothing.
 //!
-//! - **`fn wrap_child(&mut self, child: Box<dyn ChildWrapper>, command: &Command)`** is called after
-//!   all `post_spawn()` hooks. If your wrapper needs to override child methods, create and return its
-//!   own `ChildWrapper` layer. Child wraps run in registration order, so
-//!   `.wrap(Foo).wrap(Bar)` produces an outer `Bar(Foo(child))`. By default returns the input child.
+//! - **`fn wrap_child(&mut self, child: &mut dyn ChildWrapper, command: &Command) -> io::Result<Option<PendingChildWrapper>>`**
+//!   is called after all `post_spawn()` hooks. The current child remains borrowed from process-wrap.
+//!   To override child methods, return a `PendingChildWrapper` containing a `ChildWrapperLayer` whose
+//!   child slot is empty; process-wrap installs the child after the callback returns successfully.
+//!   Child wraps run in registration order, so `.wrap(Foo).wrap(Bar)` produces an outer
+//!   `Bar(Foo(child))`. By default returns `None` and leaves the child unchanged.
 //!
 //! - **`fn spawn_provider(&self) -> Option<&dyn SpawnProvider>`** exposes an alternate transport owned
 //!   by this wrapper. A provider exposed during selection must remain available throughout the spawn
@@ -283,12 +285,15 @@
 //! returns a child satisfying the frontend's complete `ChildWrapper` contract and a fresh, armed
 //! `SpawnTransaction` which owns cleanup independently of the child chain. A later public hook,
 //! wrapper, pre-commit child step, or commit error or unwinding panic causes best-effort rollback
-//! while preserving the original failure. Successful commit ends failed-spawn rollback. On Windows,
-//! the sole JobObject owner remains authoritative until it disarms after commit. Process-wrap then
-//! transfers the committed transaction residue in a private transparent layer with the returned
-//! child. On a successful spawn, arbitrary residue destruction occurs outside the spawn lifecycle. Committed residue
-//! must retain no armed cleanup or independent process, terminal, controller, handle,
-//! pseudoconsole, or other liveness resource.
+//! while preserving the original failure. After capturing that failure, process-wrap first resolves
+//! transaction cleanup, then disposes any detached child layer, the child chain, and each Windows
+//! prepared value independently. Secondary cleanup panic payloads are quarantined without inspection
+//! or destruction. Successful commit ends failed-spawn rollback. On Windows, the sole JobObject owner
+//! remains authoritative until it disarms after commit. Process-wrap then transfers the committed
+//! transaction residue in a private transparent layer with the returned child. On a successful spawn,
+//! arbitrary residue destruction occurs outside the spawn lifecycle. Committed residue must retain no
+//! armed cleanup or independent process, terminal, controller, handle, pseudoconsole, or other
+//! liveness resource.
 //!
 //! Rollback, wrapper restoration, original panic-payload preservation, and cleanup-diagnostic panic
 //! containment apply only to unwinding panics. With `panic=abort`, the process terminates before
@@ -356,7 +361,8 @@
 //! # #[cfg(feature = "std")]
 //! # mod example {
 //! # use process_wrap::std::{
-//! #     ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper, SpawnAttempt,
+//! #     ChildWrapper, ChildWrapperLayer, ChildWrapperSlots, Command as WrappedCommand,
+//! #     CommandWrap, CommandWrapper, PendingChildWrapper, SpawnAttempt,
 //! # };
 //! # use std::{
 //! #     fs::File,
@@ -397,45 +403,51 @@
 //!
 //!     fn wrap_child(
 //!         &mut self,
-//!         child: Box<dyn ChildWrapper>,
+//!         _child: &mut dyn ChildWrapper,
 //!         _core: &CommandWrap,
-//!     ) -> io::Result<Box<dyn ChildWrapper>> {
+//!     ) -> io::Result<Option<PendingChildWrapper>> {
 //!         let wrapped_child = LogFileChild {
-//!          inner: child,
+//!          inner: None,
 //!          thread: mem::take(&mut self.thread),
 //!         };
-//!         Ok(Box::new(wrapped_child))
+//!         Ok(Some(PendingChildWrapper::new(wrapped_child)))
 //!     }
 //! }
 //!
 //! #[derive(Debug)]
 //! struct LogFileChild {
-//!     inner: Box<dyn ChildWrapper>,
+//!     inner: Option<Box<dyn ChildWrapper>>,
 //!     thread: Option<JoinHandle<()>>,
+//! }
+//!
+//! impl ChildWrapperLayer for LogFileChild {
+//!     fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+//!         ChildWrapperSlots::new(&mut self.inner)
+//!     }
 //! }
 //!
 //! impl ChildWrapper for LogFileChild {
 //!     fn inner(&self) -> &dyn ChildWrapper {
-//!         &*self.inner
+//!         self.inner.as_deref().expect("an installed log layer owns its child")
 //!     }
 //!
 //!     fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-//!         &mut *self.inner
+//!         self.inner.as_deref_mut().expect("an installed log layer owns its child")
 //!     }
 //!
-//!     fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-//!         self.inner
+//!     fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+//!         self.inner.take().expect("an installed log layer owns its child")
 //!     }
 //!
 //!     #[cfg(windows)]
 //!     fn process_handle(
 //!         &self,
 //!     ) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
-//!         self.inner.process_handle()
+//!         self.inner().process_handle()
 //!     }
 //!
 //!     fn wait(&mut self) -> io::Result<ExitStatus> {
-//!         let exit_status = self.inner.wait();
+//!         let exit_status = self.inner_mut().wait();
 //!
 //!         if let Some(thread) = mem::take(&mut self.thread) {
 //!          thread.join().unwrap();
@@ -464,7 +476,8 @@
 //! # #[cfg(feature = "std")]
 //! # mod example {
 //! # use process_wrap::std::{
-//! #     ChildWrapper, Command as WrappedCommand, CommandWrap, CommandWrapper, SpawnAttempt,
+//! #     ChildWrapper, ChildWrapperLayer, ChildWrapperSlots, Command as WrappedCommand,
+//! #     CommandWrap, CommandWrapper, PendingChildWrapper, SpawnAttempt,
 //! # };
 //! # use std::{
 //! #     error::Error,
@@ -507,45 +520,51 @@
 //! #
 //! #     fn wrap_child(
 //! #         &mut self,
-//! #         child: Box<dyn ChildWrapper>,
+//! #         _child: &mut dyn ChildWrapper,
 //! #         _core: &CommandWrap,
-//! #     ) -> io::Result<Box<dyn ChildWrapper>> {
+//! #     ) -> io::Result<Option<PendingChildWrapper>> {
 //! #         let wrapped_child = LogFileChild {
-//! #          inner: child,
+//! #          inner: None,
 //! #          thread: mem::take(&mut self.thread),
 //! #         };
-//! #         Ok(Box::new(wrapped_child))
+//! #         Ok(Some(PendingChildWrapper::new(wrapped_child)))
 //! #     }
 //! # }
 //! #
 //! # #[derive(Debug)]
 //! # struct LogFileChild {
-//! #     inner: Box<dyn ChildWrapper>,
+//! #     inner: Option<Box<dyn ChildWrapper>>,
 //! #     thread: Option<JoinHandle<()>>,
+//! # }
+//! #
+//! # impl ChildWrapperLayer for LogFileChild {
+//! #     fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+//! #         ChildWrapperSlots::new(&mut self.inner)
+//! #     }
 //! # }
 //! #
 //! # impl ChildWrapper for LogFileChild {
 //! #     fn inner(&self) -> &dyn ChildWrapper {
-//! #         &*self.inner
+//! #         self.inner.as_deref().expect("an installed log layer owns its child")
 //! #     }
 //! #
 //! #     fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
-//! #         &mut *self.inner
+//! #         self.inner.as_deref_mut().expect("an installed log layer owns its child")
 //! #     }
 //! #
-//! #     fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-//! #         self.inner
+//! #     fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+//! #         self.inner.take().expect("an installed log layer owns its child")
 //! #     }
 //! #
 //! #     #[cfg(windows)]
 //! #     fn process_handle(
 //! #         &self,
 //! #     ) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
-//! #         self.inner.process_handle()
+//! #         self.inner().process_handle()
 //! #     }
 //! #
 //! #     fn wait(&mut self) -> io::Result<ExitStatus> {
-//! #         let exit_status = self.inner.wait();
+//! #         let exit_status = self.inner_mut().wait();
 //! #
 //! #         if let Some(thread) = mem::take(&mut self.thread) {
 //! #          thread.join().unwrap();

@@ -353,10 +353,11 @@ The trait provides extension or hook points into the lifecycle of a `Command`:
   child with no native child value. Changing command settings on `attempt` at this point cannot
   configure the already-created child.
 
-- **`fn wrap_child(&mut self, child: Box<dyn ChildWrapper>, command: &Command) -> io::Result<Box<dyn ChildWrapper>>`**
-  is called after all `post_spawn()` hooks. If your wrapper needs to override child methods, create
-  your own `ChildWrapper` layer and return it here. Child wraps run in registration order, so
-  `.wrap(Foo).wrap(Bar)` produces an outer `Bar(Foo(child))`.
+- **`fn wrap_child(&mut self, child: &mut dyn ChildWrapper, command: &Command) -> io::Result<Option<PendingChildWrapper>>`**
+  is called after all `post_spawn()` hooks. The current child stays borrowed from process-wrap. To
+  override child methods, return a `PendingChildWrapper` containing a `ChildWrapperLayer` whose child
+  slot is empty; process-wrap installs the child after the callback returns successfully. Child wraps
+  run in registration order, so `.wrap(Foo).wrap(Bar)` produces an outer `Bar(Foo(child))`.
 
 - **`fn spawn_provider(&self) -> Option<&dyn SpawnProvider>`** exposes an alternate transport owned by
   this wrapper. A provider exposed during selection must remain available throughout the lifecycle;
@@ -389,10 +390,13 @@ Validation must reject unsupported portable policy before allocating operating-s
 `spawn` returns a child satisfying the frontend's complete `ChildWrapper` contract together with a
 fresh, armed `SpawnTransaction`. The transaction owns cleanup independently of the child chain. A
 later hook, wrapper, pre-commit child step, or commit error or unwinding panic causes best-effort
-rollback while preserving the original failure. Successful commit ends failed-spawn rollback. On
-Windows, the sole JobObject owner remains authoritative until it disarms after commit. Process-wrap
-then transfers the committed transaction residue in a private transparent layer with the returned
-child. On a successful spawn, arbitrary residue destruction occurs outside the spawn lifecycle. Committed residue must
+rollback while preserving the original failure. After capturing that failure, process-wrap first
+resolves transaction cleanup, then disposes any detached child layer, the child chain, and each
+Windows prepared value independently. Secondary cleanup panic payloads are quarantined without
+inspection or destruction. Successful commit ends failed-spawn rollback. On Windows, the sole
+JobObject owner remains authoritative until it disarms after commit. Process-wrap then transfers the
+committed transaction residue in a private transparent layer with the returned child. On a successful
+spawn, arbitrary residue destruction occurs outside the spawn lifecycle. Committed residue must
 retain no armed cleanup or independent process, terminal, controller, handle, pseudoconsole, or other
 liveness resource.
 
