@@ -3,6 +3,7 @@
 use std::{
 	io::{Error, Result},
 	ops::ControlFlow,
+	os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle as StdOwnedHandle},
 	time::Duration,
 };
 
@@ -94,29 +95,19 @@ unsafe impl Send for JobHandle {}
 // SAFETY: shared access exposes only the handle value, not mutable Rust memory.
 unsafe impl Sync for JobHandle {}
 
-#[derive(Clone, Copy, Debug)]
-pub struct PortHandle(pub HANDLE);
-
-// SAFETY: this non-owning wrapper contains only a process-wide kernel handle value.
-unsafe impl Send for PortHandle {}
-// SAFETY: shared access exposes only the handle value, not mutable Rust memory.
-unsafe impl Sync for PortHandle {}
-
 /// A JobObject and its associated completion port.
 ///
 /// This struct closes the handles when dropped.
 #[derive(Debug)]
 pub(crate) struct JobPort {
 	pub job: JobHandle,
-	pub completion_port: PortHandle,
+	pub completion_port: StdOwnedHandle,
 }
 
 impl Drop for JobPort {
 	fn drop(&mut self) {
 		// SAFETY: `JobPort` solely owns this job handle.
 		unsafe { CloseHandle(self.job.0) }.ok();
-		// SAFETY: `JobPort` solely owns this distinct completion-port handle.
-		unsafe { CloseHandle(self.completion_port.0) }.ok();
 	}
 }
 
@@ -161,14 +152,15 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 	debug!(?job, "done CreateJobObjectW");
 
 	// SAFETY: these arguments create a new port; the successful handle is immediately owned.
-	let completion_port =
-		OwnedHandle(unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) }?);
+	let completion_port = unsafe {
+		StdOwnedHandle::from_raw_handle(CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1)?.0)
+	};
 	#[cfg(feature = "tracing")]
 	debug!(?completion_port, "done CreateIoCompletionPort");
 
 	let associate_completion = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
 		CompletionKey: job.0.0 as _,
-		CompletionPort: completion_port.0,
+		CompletionPort: HANDLE(completion_port.as_raw_handle()),
 	};
 
 	// SAFETY: the handles stay live, and initialized `associate_completion` has the reported size.
@@ -198,7 +190,7 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 
 	Ok(JobPort {
 		job: JobHandle(job.into_raw()),
-		completion_port: PortHandle(completion_port.into_raw()),
+		completion_port,
 	})
 }
 
@@ -275,7 +267,7 @@ pub(crate) fn terminate_job(job: JobHandle, exit_code: u32) -> Result<()> {
 /// Wait for a job to complete.
 #[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 pub(crate) fn wait_on_job(
-	completion_port: PortHandle,
+	completion_port: BorrowedHandle<'_>,
 	timeout: Option<Duration>,
 ) -> Result<ControlFlow<()>> {
 	let mut code: u32 = 0;
@@ -283,12 +275,12 @@ pub(crate) fn wait_on_job(
 	let mut overlapped = OVERLAPPED::default();
 	let mut lp_overlapped = &mut overlapped as *mut OVERLAPPED;
 
-	// SAFETY: `completion_port` is borrowed from a live `JobPort`, and every output pointer refers
-	// to live stack storage. On failure we inspect `code` and `key` only when a packet was dequeued,
-	// as indicated by a non-null `lp_overlapped`.
+	// SAFETY: `completion_port` is lifetime-bound to a live owned handle, and every output pointer
+	// refers to live stack storage. On failure we inspect `code` and `key` only when a packet was
+	// dequeued, as indicated by a non-null `lp_overlapped`.
 	let result = unsafe {
 		GetQueuedCompletionStatus(
-			completion_port.0,
+			HANDLE(completion_port.as_raw_handle()),
 			&mut code,
 			&mut key,
 			&mut lp_overlapped as *mut _,

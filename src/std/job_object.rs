@@ -1,7 +1,7 @@
 use std::{
 	any::Any,
 	io::{Error, ErrorKind, Result},
-	os::windows::io::{AsRawHandle, BorrowedHandle},
+	os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle},
 	process::ExitStatus,
 	time::Duration,
 };
@@ -208,7 +208,7 @@ impl ChildWrapper for JobObjectChild {
 			// manually drop the completion port
 			let its = std::mem::ManuallyDrop::new(job_port);
 			// SAFETY: `its` owns the completion-port handle and suppresses `JobPort::drop`.
-			unsafe { CloseHandle(its.completion_port.0) }.ok();
+			unsafe { CloseHandle(HANDLE(its.completion_port.as_raw_handle())) }.ok();
 			// we leave the job handle unclosed, otherwise the Child is useless
 			// (as closing it may terminate the job)
 		}
@@ -246,16 +246,16 @@ impl ChildWrapper for JobObjectChild {
 		self.exit_status = ChildExitStatus::Exited(status);
 
 		// nevertheless, now wait and make sure we reap all children.
-		let JobPort {
-			completion_port, ..
-		} = self.job_port;
-		let _ = wait_on_job(completion_port, None)?;
+		let _ = wait_on_job(self.job_port.completion_port.as_handle(), None)?;
 		Ok(status)
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		let _ = wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?;
+		let _ = wait_on_job(
+			self.job_port.completion_port.as_handle(),
+			Some(Duration::ZERO),
+		)?;
 		self.inner.try_wait()
 	}
 }

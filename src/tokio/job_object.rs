@@ -2,7 +2,7 @@ use std::{
 	any::Any,
 	future::Future,
 	io::{Error, ErrorKind, Result},
-	os::windows::io::{AsRawHandle, BorrowedHandle},
+	os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle},
 	pin::Pin,
 	process::ExitStatus,
 	time::Duration,
@@ -23,6 +23,47 @@ use crate::{
 		terminate_job, wait_on_job,
 	},
 };
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockingWaitEvent {
+	Begin { handle: usize, owned: bool },
+	End { handle: usize },
+	Dropped { handle: usize },
+}
+
+#[cfg(test)]
+fn blocking_wait_observer()
+-> &'static std::sync::Mutex<Option<std::sync::mpsc::Sender<BlockingWaitEvent>>> {
+	static OBSERVER: std::sync::OnceLock<
+		std::sync::Mutex<Option<std::sync::mpsc::Sender<BlockingWaitEvent>>>,
+	> = std::sync::OnceLock::new();
+	OBSERVER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn observe_blocking_wait(event: BlockingWaitEvent) {
+	if let Some(observer) = blocking_wait_observer().lock().unwrap().as_ref() {
+		let _ = observer.send(event);
+	}
+}
+
+fn blocking_wait_on_job(completion_port: OwnedHandle) -> Result<std::ops::ControlFlow<()>> {
+	#[cfg(test)]
+	let handle = completion_port.as_raw_handle() as usize;
+	#[cfg(test)]
+	observe_blocking_wait(BlockingWaitEvent::Begin {
+		handle,
+		owned: true,
+	});
+	let result = wait_on_job(completion_port.as_handle(), None);
+	#[cfg(test)]
+	observe_blocking_wait(BlockingWaitEvent::End { handle });
+	drop(completion_port);
+	#[cfg(test)]
+	observe_blocking_wait(BlockingWaitEvent::Dropped { handle });
+	result
+}
 
 #[cfg(feature = "creation-flags")]
 use super::CreationFlags;
@@ -221,7 +262,7 @@ impl ChildWrapper for JobObjectChild {
 			// manually drop the completion port
 			let its = std::mem::ManuallyDrop::new(job_port);
 			// SAFETY: `its` owns the completion-port handle and suppresses `JobPort::drop`.
-			unsafe { CloseHandle(its.completion_port.0) }.ok();
+			unsafe { CloseHandle(HANDLE(its.completion_port.as_raw_handle())) }.ok();
 			// we leave the job handle unclosed, otherwise the Child is useless
 			// (as closing it may terminate the job)
 		}
@@ -263,24 +304,265 @@ impl ChildWrapper for JobObjectChild {
 
 			// nevertheless, now try reaping all children a few times...
 			for _ in 1..MAX_RETRY_ATTEMPT {
-				if wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?.is_break() {
+				if wait_on_job(
+					self.job_port.completion_port.as_handle(),
+					Some(Duration::ZERO),
+				)?
+				.is_break()
+				{
 					return Ok(status);
 				}
 			}
 
 			// ...finally, if there are some that are still alive,
-			// block in the background to reap them fully.
-			let JobPort {
-				completion_port, ..
-			} = self.job_port;
-			let _ = spawn_blocking(move || wait_on_job(completion_port, None)).await??;
+			// block in the background to reap them fully. The detached closure owns only a duplicate
+			// completion-port handle so canceling this future cannot make its native wait stale or keep
+			// the JobObject itself alive.
+			let completion_port = self.job_port.completion_port.try_clone()?;
+			let _ = spawn_blocking(move || blocking_wait_on_job(completion_port)).await??;
 			Ok(status)
 		})
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		let _ = wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?;
+		let _ = wait_on_job(
+			self.job_port.completion_port.as_handle(),
+			Some(Duration::ZERO),
+		)?;
 		self.inner.try_wait()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		future::Future,
+		io,
+		os::windows::{
+			io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle},
+			process::ExitStatusExt,
+		},
+		pin::Pin,
+		process::ExitStatus,
+		sync::mpsc,
+		time::Duration,
+	};
+
+	use windows::Win32::{
+		Foundation::{
+			DUPLICATE_SAME_ACCESS, DuplicateHandle, GetHandleInformation, HANDLE,
+			INVALID_HANDLE_VALUE,
+		},
+		System::{
+			IO::{CreateIoCompletionPort, PostQueuedCompletionStatus},
+			JobObjects::CreateJobObjectW,
+			Threading::{CreateEventW, GetCurrentProcess},
+		},
+	};
+
+	use super::*;
+	use crate::windows::{JobHandle, JobPort};
+
+	#[derive(Debug)]
+	struct ImmediateChild;
+
+	impl ChildWrapper for ImmediateChild {
+		fn inner(&self) -> &dyn ChildWrapper {
+			self
+		}
+
+		fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+			self
+		}
+
+		fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+			self
+		}
+
+		fn id(&self) -> Option<u32> {
+			Some(1)
+		}
+
+		fn wait(&mut self) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send + '_>> {
+			Box::pin(async { Ok(ExitStatus::from_raw(0)) })
+		}
+	}
+
+	struct ObserverGuard;
+
+	impl ObserverGuard {
+		fn install() -> (Self, mpsc::Receiver<BlockingWaitEvent>) {
+			let (sender, receiver) = mpsc::channel();
+			let mut observer = blocking_wait_observer().lock().unwrap();
+			assert!(
+				observer.is_none(),
+				"blocking wait observer is already installed"
+			);
+			*observer = Some(sender);
+			(Self, receiver)
+		}
+	}
+
+	impl Drop for ObserverGuard {
+		fn drop(&mut self) {
+			*blocking_wait_observer().lock().unwrap() = None;
+		}
+	}
+
+	fn owned(handle: HANDLE) -> OwnedHandle {
+		// SAFETY: each caller transfers one newly created or duplicated owned handle.
+		unsafe { OwnedHandle::from_raw_handle(handle.0) }
+	}
+
+	fn job_port() -> io::Result<JobPort> {
+		// SAFETY: default attributes and no name create a uniquely owned job handle.
+		let job = owned(unsafe { CreateJobObjectW(None, None) }.map_err(io::Error::other)?);
+		// SAFETY: these arguments create a new completion port which is uniquely owned.
+		let port = owned(unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) }?);
+		Ok(JobPort {
+			job: JobHandle(HANDLE(job.into_raw_handle())),
+			completion_port: port,
+		})
+	}
+
+	fn duplicate(handle: HANDLE) -> io::Result<OwnedHandle> {
+		// SAFETY: this returns the current process pseudo-handle, which stays valid for this process.
+		let current = unsafe { GetCurrentProcess() };
+		let mut duplicate = HANDLE::default();
+		// SAFETY: `handle` is live, `duplicate` is writable, and success transfers a distinct owned
+		// handle in the current process.
+		unsafe {
+			DuplicateHandle(
+				current,
+				handle,
+				current,
+				&mut duplicate,
+				0,
+				false,
+				DUPLICATE_SAME_ACCESS,
+			)
+		}?;
+		Ok(owned(duplicate))
+	}
+
+	fn handle_is_live(raw: usize) -> bool {
+		let mut flags = 0;
+		// SAFETY: the call only queries the scalar handle value and writes `flags` on success.
+		unsafe { GetHandleInformation(HANDLE(raw as *mut _), &mut flags) }.is_ok()
+	}
+
+	fn occupy_reused_handle(raw: usize) -> OwnedHandle {
+		let mut retained = Vec::new();
+		for _ in 0..4096 {
+			// SAFETY: default security, manual reset, initially unsignaled, and no name create one event.
+			let replacement = owned(unsafe { CreateEventW(None, true, false, None) }.unwrap());
+			if replacement.as_raw_handle() as usize == raw {
+				return replacement;
+			}
+			retained.push(replacement);
+		}
+		panic!("Windows did not reuse the closed completion-port slot under stress");
+	}
+
+	const CANCELED_WAIT_HELPER: &str = "PROCESS_WRAP_CANCELED_JOB_WAIT_HELPER";
+
+	#[test]
+	fn canceled_blocking_wait_owns_only_a_duplicate_completion_port() {
+		if std::env::var_os(CANCELED_WAIT_HELPER).is_none() {
+			let status = std::process::Command::new(std::env::current_exe().unwrap())
+				.args([
+					"tokio::job_object::tests::canceled_blocking_wait_owns_only_a_duplicate_completion_port",
+					"--exact",
+					"--nocapture",
+				])
+				.env(CANCELED_WAIT_HELPER, "1")
+				.status()
+				.unwrap();
+			assert!(
+				status.success(),
+				"the isolated handle-reuse regression failed"
+			);
+			return;
+		}
+
+		let runtime = tokio::runtime::Builder::new_multi_thread()
+			.worker_threads(1)
+			.max_blocking_threads(1)
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let (blocker_started, blocker_started_rx) = mpsc::channel();
+			let (release_blocker, release_blocker_rx) = mpsc::channel();
+			let blocker = tokio::task::spawn_blocking(move || {
+				blocker_started.send(()).unwrap();
+				release_blocker_rx.recv().unwrap();
+			});
+			blocker_started_rx
+				.recv_timeout(Duration::from_secs(2))
+				.expect("the sole blocking worker starts");
+
+			let job_port = job_port().unwrap();
+			let original_job = job_port.job.0.0 as usize;
+			let original = job_port.completion_port.as_raw_handle() as usize;
+			let controller = duplicate(HANDLE(job_port.completion_port.as_raw_handle())).unwrap();
+			let mut child = JobObjectChild::new(Box::new(ImmediateChild), job_port, false);
+			let (_observer, observations) = ObserverGuard::install();
+
+			let timed_out = tokio::time::timeout(Duration::from_millis(100), child.wait()).await;
+			assert!(
+				timed_out.is_err(),
+				"the queued blocking wait must not start yet"
+			);
+			drop(child);
+			assert!(
+				!handle_is_live(original_job),
+				"the delayed wait must not retain the JobObject"
+			);
+			assert!(
+				!handle_is_live(original),
+				"dropping the child closes the original port"
+			);
+			let replacement = occupy_reused_handle(original);
+
+			release_blocker.send(()).unwrap();
+			let begin = observations
+				.recv_timeout(Duration::from_secs(2))
+				.expect("the delayed completion-port wait begins");
+			let BlockingWaitEvent::Begin { handle, owned } = begin else {
+				panic!("the first observation must begin the wait: {begin:?}");
+			};
+			assert!(owned, "the delayed wait must retain an owned duplicate");
+			assert_ne!(
+				handle, original,
+				"the delayed wait must not reuse the original slot"
+			);
+			assert!(
+				handle_is_live(handle),
+				"the delayed wait's duplicate is live"
+			);
+			// SAFETY: `controller` owns a live duplicate of the same completion port.
+			unsafe { PostQueuedCompletionStatus(HANDLE(controller.as_raw_handle()), 0, 0, None) }
+				.unwrap();
+			assert_eq!(
+				observations.recv_timeout(Duration::from_secs(2)).unwrap(),
+				BlockingWaitEvent::End { handle }
+			);
+			assert_eq!(
+				observations.recv_timeout(Duration::from_secs(2)).unwrap(),
+				BlockingWaitEvent::Dropped { handle }
+			);
+			assert!(
+				!handle_is_live(handle),
+				"the duplicate closes after the wait returns"
+			);
+			assert!(
+				handle_is_live(original),
+				"the replacement object still owns the reused slot"
+			);
+			drop(replacement);
+			blocker.await.unwrap();
+		});
 	}
 }
