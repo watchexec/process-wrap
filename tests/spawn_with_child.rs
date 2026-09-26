@@ -13,8 +13,12 @@ macro_rules! spawn_with_child_tests {
 			use std::{
 				any::TypeId,
 				io,
-				panic::{AssertUnwindSafe, catch_unwind},
-				sync::{Arc, Mutex},
+				panic::{AssertUnwindSafe, catch_unwind, panic_any},
+				process::{Output, Stdio},
+				sync::{
+					Arc, Mutex,
+					atomic::{AtomicUsize, Ordering},
+				},
 				thread::sleep,
 				time::{Duration, Instant},
 			};
@@ -180,6 +184,107 @@ macro_rules! spawn_with_child_tests {
 				}
 			}
 
+			#[derive(Debug)]
+			struct SecondaryPayload(Arc<AtomicUsize>);
+
+			impl Drop for SecondaryPayload {
+				fn drop(&mut self) {
+					self.0.fetch_add(1, Ordering::SeqCst);
+					panic_any("a secondary wrapper payload was dropped");
+				}
+			}
+
+			#[derive(Debug)]
+			struct PanickingLayer {
+				inner: Box<dyn ChildWrapper>,
+				payload: Option<SecondaryPayload>,
+			}
+
+			impl ChildWrapper for PanickingLayer {
+				fn inner(&self) -> &dyn ChildWrapper {
+					self.inner.as_ref()
+				}
+
+				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+					self.inner.as_mut()
+				}
+
+				fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+					self.payload.take();
+					std::mem::replace(&mut self.inner, Box::new(CustomLeaf))
+				}
+			}
+
+			impl Drop for PanickingLayer {
+				fn drop(&mut self) {
+					if let Some(payload) = self.payload.take() {
+						panic_any(payload);
+					}
+				}
+			}
+
+			#[derive(Debug)]
+			struct AddPanickingLayer(Mutex<Option<SecondaryPayload>>);
+
+			impl CommandWrapper for AddPanickingLayer {
+				fn wrap_child(
+					&mut self,
+					child: Box<dyn ChildWrapper>,
+					_command: &CommandWrap,
+				) -> io::Result<Box<dyn ChildWrapper>> {
+					match self.0.lock().unwrap().take() {
+						Some(payload) => Ok(Box::new(PanickingLayer {
+							inner: child,
+							payload: Some(payload),
+						})),
+						None => Ok(child),
+					}
+				}
+			}
+
+			#[derive(Debug)]
+			struct WrapIdentityError(Arc<()>);
+
+			impl std::fmt::Display for WrapIdentityError {
+				fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+					formatter.write_str("primary wrap error")
+				}
+			}
+
+			impl std::error::Error for WrapIdentityError {}
+
+			#[derive(Debug)]
+			struct WrapIdentityPanic(Arc<()>);
+
+			#[derive(Debug)]
+			enum WrapFailure {
+				Error(Arc<()>),
+				Panic(Arc<()>),
+			}
+
+			#[derive(Debug)]
+			struct FailWrap(Mutex<Option<WrapFailure>>);
+
+			impl CommandWrapper for FailWrap {
+				fn wrap_child(
+					&mut self,
+					child: Box<dyn ChildWrapper>,
+					_command: &CommandWrap,
+				) -> io::Result<Box<dyn ChildWrapper>> {
+					match self.0.lock().unwrap().take() {
+						Some(WrapFailure::Error(identity)) => {
+							let _ = child;
+							Err(io::Error::other(WrapIdentityError(identity)))
+						}
+						Some(WrapFailure::Panic(identity)) => {
+							let _ = child;
+							panic_any(WrapIdentityPanic(identity));
+						}
+						None => Ok(child),
+					}
+				}
+			}
+
 			#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 			enum Phase {
 				Pre,
@@ -256,6 +361,59 @@ macro_rules! spawn_with_child_tests {
 				return CommandWrap::with_new("cmd.exe", |command| {
 					command.args(["/D", "/S", "/C", "exit /b 0"]);
 				});
+			}
+
+			fn bounded_test_process(
+				test_name: &str,
+				environment: (&str, &str),
+				timeout: Duration,
+			) -> (Output, bool) {
+				struct ChildGuard(Option<std::process::Child>);
+
+				impl Drop for ChildGuard {
+					fn drop(&mut self) {
+						if let Some(mut child) = self.0.take() {
+							let _ = child.kill();
+							let _ = child.wait();
+						}
+					}
+				}
+
+				let child = std::process::Command::new(std::env::current_exe().unwrap())
+					.args(["--exact", test_name, "--nocapture"])
+					.env(environment.0, environment.1)
+					.stdout(Stdio::piped())
+					.stderr(Stdio::piped())
+					.spawn()
+					.expect("start isolated wrapping regression");
+				let mut child = ChildGuard(Some(child));
+				let deadline = Instant::now() + timeout;
+				loop {
+					let status = child
+						.0
+						.as_mut()
+						.expect("the subprocess remains guarded while polling")
+						.try_wait()
+						.expect("poll isolated wrapping regression");
+					if status.is_some() {
+						let output = child
+							.0
+							.take()
+							.expect("take completed subprocess")
+							.wait_with_output()
+							.expect("collect isolated wrapping output");
+						return (output, false);
+					}
+					if Instant::now() >= deadline {
+						let mut expired = child.0.take().expect("take expired subprocess");
+						let _ = expired.kill();
+						let output = expired
+							.wait_with_output()
+							.expect("reap expired wrapping subprocess");
+						return (output, true);
+					}
+					sleep(Duration::from_millis(5));
+				}
 			}
 
 			fn wait_for_exit(mut child: Box<dyn ChildWrapper>) {
@@ -336,6 +494,158 @@ macro_rules! spawn_with_child_tests {
 					})
 					.expect("the restored command must be reusable");
 				wait_for_exit(child);
+			}
+
+			#[derive(Clone, Copy, Debug)]
+			enum Transport {
+				Native,
+				ExplicitNative,
+				Boxed,
+			}
+
+			fn spawn_transport(
+				command: &mut CommandWrap,
+				transport: Transport,
+			) -> io::Result<Box<dyn ChildWrapper>> {
+				match transport {
+					Transport::Native => command.spawn(),
+					Transport::ExplicitNative => command.spawn_with(|command| command.spawn()),
+					Transport::Boxed => command
+						.spawn_with_child(|_| Ok(Box::new(CustomLeaf) as Box<dyn ChildWrapper>)),
+				}
+			}
+
+			fn assert_wrap_error(
+				outcome: std::thread::Result<io::Result<Box<dyn ChildWrapper>>>,
+				identity: &Arc<()>,
+			) {
+				let result = match outcome {
+					Ok(result) => result,
+					Err(secondary) => {
+						std::mem::forget(secondary);
+						panic!("child cleanup replaced the primary wrapping error");
+					}
+				};
+				let error = result.expect_err("the wrapping hook must fail");
+				let identity_error = error
+					.get_ref()
+					.and_then(|error| error.downcast_ref::<WrapIdentityError>())
+					.expect("the exact wrapping error must survive cleanup");
+				assert!(Arc::ptr_eq(&identity_error.0, identity));
+			}
+
+			fn assert_wrap_panic(
+				outcome: std::thread::Result<io::Result<Box<dyn ChildWrapper>>>,
+				identity: &Arc<()>,
+			) {
+				let payload = match outcome {
+					Err(payload) => payload,
+					Ok(_) => panic!("the wrapping hook must panic"),
+				};
+				let payload = match payload.downcast::<WrapIdentityPanic>() {
+					Ok(payload) => payload,
+					Err(secondary) => {
+						std::mem::forget(secondary);
+						panic!("child cleanup replaced the primary wrapping panic");
+					}
+				};
+				assert!(Arc::ptr_eq(&payload.0, identity));
+			}
+
+			#[test]
+			fn consuming_wrap_errors_preserve_identity_and_cleanup_for_every_transport() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for transport in [
+					Transport::Native,
+					Transport::ExplicitNative,
+					Transport::Boxed,
+				] {
+					let secondary_drops = Arc::new(AtomicUsize::new(0));
+					let identity = Arc::new(());
+					let mut command = command();
+					let payload = SecondaryPayload(Arc::clone(&secondary_drops));
+					let failure = WrapFailure::Error(Arc::clone(&identity));
+					command
+						.wrap(AddPanickingLayer(Mutex::new(Some(payload))))
+						.wrap(FailWrap(Mutex::new(Some(failure))));
+
+					let outcome = catch_unwind(AssertUnwindSafe(|| {
+						spawn_transport(&mut command, transport)
+					}));
+					assert_wrap_error(outcome, &identity);
+					assert_eq!(secondary_drops.load(Ordering::SeqCst), 0);
+
+					let child = spawn_transport(&mut command, transport)
+						.expect("the command and wrapping hooks remain reusable");
+					if !matches!(transport, Transport::Boxed) {
+						wait_for_exit(child);
+					}
+				}
+			}
+
+			#[test]
+			fn consuming_wrap_panics_preserve_identity_and_cleanup_for_every_transport() {
+				const CHILD_ENV: &str = "PROCESS_WRAP_CONSUMING_WRAP_PANIC";
+				let module = stringify!($module);
+				let selected = std::env::var(CHILD_ENV).ok();
+				if selected
+					.as_deref()
+					.is_none_or(|value| !value.starts_with(module))
+				{
+					for transport in ["native", "explicit-native", "boxed"] {
+						let child_value = format!("{module}:{transport}");
+						let (output, timed_out) = bounded_test_process(
+							concat!(
+								stringify!($module),
+								"::consuming_wrap_panics_preserve_identity_and_cleanup_for_every_transport"
+							),
+							(CHILD_ENV, &child_value),
+							EXIT_TIMEOUT,
+						);
+						assert!(
+							!timed_out,
+							"isolated wrapping cleanup exceeded its deadline"
+						);
+						assert!(
+							output.status.success(),
+							"{transport} wrapping panic was not preserved:\nstdout:\n{}\nstderr:\n{}",
+							String::from_utf8_lossy(&output.stdout),
+							String::from_utf8_lossy(&output.stderr),
+						);
+					}
+					return;
+				}
+
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let selected = selected.expect("the subprocess selected a transport");
+				let transport = if selected.ends_with(":native") {
+					Transport::Native
+				} else if selected.ends_with(":explicit-native") {
+					Transport::ExplicitNative
+				} else {
+					Transport::Boxed
+				};
+				let secondary_drops = Arc::new(AtomicUsize::new(0));
+				let identity = Arc::new(());
+				let mut command = command();
+				let payload = SecondaryPayload(Arc::clone(&secondary_drops));
+				let failure = WrapFailure::Panic(Arc::clone(&identity));
+				command
+					.wrap(AddPanickingLayer(Mutex::new(Some(payload))))
+					.wrap(FailWrap(Mutex::new(Some(failure))));
+
+				let outcome = catch_unwind(AssertUnwindSafe(|| {
+					spawn_transport(&mut command, transport)
+				}));
+				assert_wrap_panic(outcome, &identity);
+				assert_eq!(secondary_drops.load(Ordering::SeqCst), 0);
+				let child = spawn_transport(&mut command, transport)
+					.expect("the command and wrapping hooks remain reusable");
+				if !matches!(transport, Transport::Boxed) {
+					wait_for_exit(child);
+				}
 			}
 
 			#[test]

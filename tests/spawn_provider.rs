@@ -17,6 +17,7 @@ macro_rules! spawn_provider_tests {
 				ffi::OsStr,
 				io,
 				panic::{AssertUnwindSafe, catch_unwind, panic_any},
+				process::{Output, Stdio},
 				sync::{
 					Arc, Mutex,
 					atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -104,6 +105,9 @@ macro_rules! spawn_provider_tests {
 				Wrap(&'static str),
 				Commit,
 				Rollback,
+				ChildDrop,
+				#[cfg(windows)]
+				PreparedDrop(&'static str),
 				TransactionDrop,
 				#[cfg(windows)]
 				FinalizeSpawn(&'static str),
@@ -130,7 +134,15 @@ macro_rules! spawn_provider_tests {
 				failures: Mutex<Vec<(Point, Failure)>>,
 				rollback_behavior: Mutex<Option<RollbackBehavior>>,
 				transaction_drop_behavior: Mutex<Option<TransactionDropBehavior>>,
+				child_drop_payload: Mutex<Option<PanickingDropPayload>>,
+				commit_primary_failure: Mutex<Option<PrimaryFailure>>,
+				transaction_debug_calls: AtomicUsize,
+				panic_in_transaction_debug: AtomicBool,
 				make_attempt_native_only: AtomicBool,
+				#[cfg(windows)]
+				use_resume_child: AtomicBool,
+				#[cfg(windows)]
+				resume_calls: AtomicUsize,
 				#[cfg(windows)]
 				finalization_layers: Mutex<Vec<FinalizationLayerSpec>>,
 			}
@@ -162,6 +174,22 @@ macro_rules! spawn_provider_tests {
 
 				fn take_transaction_drop_behavior(&self) -> Option<TransactionDropBehavior> {
 					self.transaction_drop_behavior.lock().unwrap().take()
+				}
+
+				fn set_child_drop_payload(&self, payload: PanickingDropPayload) {
+					*self.child_drop_payload.lock().unwrap() = Some(payload);
+				}
+
+				fn take_child_drop_payload(&self) -> Option<PanickingDropPayload> {
+					self.child_drop_payload.lock().unwrap().take()
+				}
+
+				fn set_commit_primary_failure(&self, failure: PrimaryFailure) {
+					*self.commit_primary_failure.lock().unwrap() = Some(failure);
+				}
+
+				fn take_commit_primary_failure(&self) -> Option<PrimaryFailure> {
+					self.commit_primary_failure.lock().unwrap().take()
 				}
 
 				#[cfg(windows)]
@@ -235,6 +263,162 @@ macro_rules! spawn_provider_tests {
 
 				fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
 					Ok(Some(successful_exit_status()))
+				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct ResumeChild(Arc<Shared>);
+
+			#[cfg(windows)]
+			impl ChildWrapper for ResumeChild {
+				fn inner(&self) -> &dyn ChildWrapper {
+					self
+				}
+
+				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+					self
+				}
+
+				fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+					self
+				}
+
+				fn resume_after_job_assignment(&mut self) -> Option<io::Result<()>> {
+					self.0.resume_calls.fetch_add(1, Ordering::SeqCst);
+					Some(Ok(()))
+				}
+
+				fn start_kill(&mut self) -> io::Result<()> {
+					Ok(())
+				}
+
+				fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+					Ok(Some(successful_exit_status()))
+				}
+			}
+
+			#[derive(Debug)]
+			struct PanickingChild {
+				shared: Arc<Shared>,
+				payload: Option<PanickingDropPayload>,
+			}
+
+			impl ChildWrapper for PanickingChild {
+				fn inner(&self) -> &dyn ChildWrapper {
+					self
+				}
+
+				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+					self
+				}
+
+				fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+					self
+				}
+			}
+
+			impl Drop for PanickingChild {
+				fn drop(&mut self) {
+					self.shared.event(Event::ChildDrop);
+					panic_any(
+						self.payload
+							.take()
+							.expect("the child destructor panics only once"),
+					);
+				}
+			}
+
+			fn assert_provider_child(child: &dyn ChildWrapper) {
+				let id = child.type_id();
+				let expected = id == TypeId::of::<CustomChild>() || id == TypeId::of::<PanickingChild>();
+				#[cfg(windows)]
+				let expected = expected || id == TypeId::of::<ResumeChild>();
+				assert!(expected);
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct PanickingPrepared {
+				shared: Arc<Shared>,
+				name: &'static str,
+				payload: Option<PanickingDropPayload>,
+			}
+
+			#[cfg(windows)]
+			impl Drop for PanickingPrepared {
+				fn drop(&mut self) {
+					self.shared.event(Event::PreparedDrop(self.name));
+					panic_any(
+						self.payload
+							.take()
+							.expect("the prepared-state destructor panics only once"),
+					);
+				}
+			}
+
+			#[cfg(windows)]
+			macro_rules! prepared_wrapper {
+				($name:ident, $label:literal) => {
+					#[derive(Debug)]
+					struct $name {
+						shared: Arc<Shared>,
+						payload: Mutex<Option<PanickingDropPayload>>,
+					}
+
+					impl CommandWrapper for $name {
+						fn prepare_child(
+							&mut self,
+							_attempt: &mut SpawnAttempt,
+							_child: &mut dyn ChildWrapper,
+							_command: &CommandWrap,
+						) -> io::Result<Option<Box<dyn std::any::Any + Send>>> {
+							Ok(self.payload.lock().unwrap().take().map(|payload| {
+								Box::new(PanickingPrepared {
+									shared: Arc::clone(&self.shared),
+									name: $label,
+									payload: Some(payload),
+								}) as Box<dyn std::any::Any + Send>
+							}))
+						}
+
+						fn wrap_prepared_child(
+							&mut self,
+							child: Box<dyn ChildWrapper>,
+							prepared: Option<Box<dyn std::any::Any + Send>>,
+							_command: &CommandWrap,
+						) -> io::Result<Box<dyn ChildWrapper>> {
+							debug_assert!(prepared.is_none());
+							Ok(child)
+						}
+					}
+				};
+			}
+
+			#[cfg(windows)]
+			prepared_wrapper!(FirstPrepared, "first");
+			#[cfg(windows)]
+			prepared_wrapper!(SecondPrepared, "second");
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct FailPrepare(Mutex<Option<PrimaryFailure>>);
+
+			#[cfg(windows)]
+			impl CommandWrapper for FailPrepare {
+				fn prepare_child(
+					&mut self,
+					_attempt: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
+					_command: &CommandWrap,
+				) -> io::Result<Option<Box<dyn std::any::Any + Send>>> {
+					match self.0.lock().unwrap().take() {
+						Some(PrimaryFailure::Error(identity)) => {
+							Err(io::Error::other(IdentityError(identity)))
+						}
+						Some(PrimaryFailure::Panic(identity)) => panic_any(PrimaryPanic(identity)),
+						None => Ok(None),
+					}
 				}
 			}
 
@@ -322,10 +506,23 @@ macro_rules! spawn_provider_tests {
 					})
 			}
 
-			#[derive(Debug)]
 			struct Transaction {
 				shared: Arc<Shared>,
 				committed: bool,
+			}
+
+			impl std::fmt::Debug for Transaction {
+				fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+					self.shared.transaction_debug_calls.fetch_add(1, Ordering::SeqCst);
+					if self
+						.shared
+						.panic_in_transaction_debug
+						.load(Ordering::SeqCst)
+					{
+						panic_any("transaction Debug must remain private");
+					}
+					formatter.debug_struct("Transaction").finish_non_exhaustive()
+				}
 			}
 
 			impl Transaction {
@@ -340,6 +537,14 @@ macro_rules! spawn_provider_tests {
 			impl SpawnTransaction for Transaction {
 				fn commit(&mut self) -> io::Result<()> {
 					self.shared.event(Event::Commit);
+					if let Some(failure) = self.shared.take_commit_primary_failure() {
+						match failure {
+							PrimaryFailure::Error(identity) => {
+								return Err(io::Error::other(IdentityError(identity)));
+							}
+							PrimaryFailure::Panic(identity) => panic_any(PrimaryPanic(identity)),
+						}
+					}
 					self.shared.fail(Point::Commit)?;
 					self.committed = true;
 					Ok(())
@@ -467,8 +672,24 @@ macro_rules! spawn_provider_tests {
 					assert!(!attempt.is_native_only());
 					self.shared.event(Event::Spawn(self.name));
 					self.shared.fail(Point::Spawn)?;
+					let child: Box<dyn ChildWrapper> =
+						if let Some(payload) = self.shared.take_child_drop_payload() {
+							Box::new(PanickingChild {
+								shared: Arc::clone(&self.shared),
+								payload: Some(payload),
+							})
+						} else {
+							#[cfg(windows)]
+							if self.shared.use_resume_child.swap(false, Ordering::SeqCst) {
+								Box::new(ResumeChild(Arc::clone(&self.shared)))
+							} else {
+								Box::new(CustomChild)
+							}
+							#[cfg(not(windows))]
+							Box::new(CustomChild)
+						};
 					Ok(ProviderProduct::new(
-						Box::new(CustomChild),
+						child,
 						Box::new(Transaction::new(Arc::clone(&self.shared))),
 					))
 				}
@@ -532,7 +753,7 @@ macro_rules! spawn_provider_tests {
 					command: &CommandWrap,
 				) -> io::Result<()> {
 					self.assert_hook_visibility(command);
-					assert_eq!(child.type_id(), TypeId::of::<CustomChild>());
+					assert_provider_child(child);
 					self.shared().event(Event::Post(self.name));
 					self.shared().fail(Point::Post)
 				}
@@ -543,7 +764,7 @@ macro_rules! spawn_provider_tests {
 					command: &CommandWrap,
 				) -> io::Result<Box<dyn ChildWrapper>> {
 					self.assert_hook_visibility(command);
-					assert_eq!(child.as_ref().type_id(), TypeId::of::<CustomChild>());
+					assert_provider_child(child.as_ref());
 					self.shared().event(Event::Wrap(self.name));
 					self.shared().fail(Point::Wrap)?;
 					Ok(child)
@@ -592,7 +813,7 @@ macro_rules! spawn_provider_tests {
 				) -> io::Result<()> {
 					self.assert_hook_visibility(command);
 					if self.expect_custom_child {
-						assert_eq!(child.type_id(), TypeId::of::<CustomChild>());
+						assert_provider_child(child);
 					}
 					self.shared.event(Event::Post("peer"));
 					self.shared.fail(Point::PeerPost)
@@ -605,7 +826,7 @@ macro_rules! spawn_provider_tests {
 				) -> io::Result<Box<dyn ChildWrapper>> {
 					self.assert_hook_visibility(command);
 					if self.expect_custom_child {
-						assert_eq!(child.as_ref().type_id(), TypeId::of::<CustomChild>());
+						assert_provider_child(child.as_ref());
 					}
 					self.shared.event(Event::Wrap("peer"));
 					self.shared.fail(Point::PeerWrap)?;
@@ -726,15 +947,27 @@ macro_rules! spawn_provider_tests {
 				was_panic: bool,
 			) {
 				if was_panic {
-					let payload = outcome.expect_err("the primary panic must be resumed");
-					let payload = payload
-						.downcast::<PrimaryPanic>()
-						.expect("cleanup must not replace the primary panic payload");
+					let payload = match outcome {
+						Err(payload) => payload,
+						Ok(_) => panic!("the primary panic must be resumed"),
+					};
+					let payload = match payload.downcast::<PrimaryPanic>() {
+						Ok(payload) => payload,
+						Err(secondary) => {
+							std::mem::forget(secondary);
+							panic!("cleanup replaced the primary panic payload");
+						}
+					};
 					assert!(Arc::ptr_eq(&payload.0, identity));
 				} else {
-					let error = outcome
-						.expect("cleanup must not replace the primary error with a panic")
-						.expect_err("the primary error must be returned");
+					let result = match outcome {
+						Ok(result) => result,
+						Err(secondary) => {
+							std::mem::forget(secondary);
+							panic!("cleanup replaced the primary error with a panic");
+						}
+					};
+					let error = result.expect_err("the primary error must be returned");
 					let payload = error
 						.get_ref()
 						.and_then(|error| error.downcast_ref::<IdentityError>())
@@ -849,6 +1082,59 @@ macro_rules! spawn_provider_tests {
 				}
 			}
 
+			fn bounded_test_process(
+				test_name: &str,
+				environment: (&str, &str),
+				timeout: Duration,
+			) -> (Output, bool) {
+				struct ChildGuard(Option<std::process::Child>);
+
+				impl Drop for ChildGuard {
+					fn drop(&mut self) {
+						if let Some(mut child) = self.0.take() {
+							let _ = child.kill();
+							let _ = child.wait();
+						}
+					}
+				}
+
+				let child = std::process::Command::new(std::env::current_exe().unwrap())
+					.args(["--exact", test_name, "--nocapture"])
+					.env(environment.0, environment.1)
+					.stdout(Stdio::piped())
+					.stderr(Stdio::piped())
+					.spawn()
+					.expect("start isolated lifecycle regression");
+				let mut child = ChildGuard(Some(child));
+				let deadline = Instant::now() + timeout;
+				loop {
+					let status = child
+						.0
+						.as_mut()
+						.expect("the subprocess remains guarded while polling")
+						.try_wait()
+						.expect("poll isolated lifecycle regression");
+					if status.is_some() {
+						let output = child
+							.0
+							.take()
+							.expect("take completed subprocess")
+							.wait_with_output()
+							.expect("collect isolated lifecycle output");
+						return (output, false);
+					}
+					if Instant::now() >= deadline {
+						let mut expired = child.0.take().expect("take expired subprocess");
+						let _ = expired.kill();
+						let output = expired
+							.wait_with_output()
+							.expect("reap expired lifecycle subprocess");
+						return (output, true);
+					}
+					sleep(Duration::from_millis(5));
+				}
+			}
+
 			fn wait_for_exit(mut child: Box<dyn ChildWrapper>) {
 				let deadline = Instant::now() + EXIT_TIMEOUT;
 				loop {
@@ -893,6 +1179,24 @@ macro_rules! spawn_provider_tests {
 				let child = command.spawn().unwrap();
 				assert_eq!(child.inner().type_id(), TypeId::of::<CustomChild>());
 				assert_eq!(shared.events(), successful_events("provider"));
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn committed_sidecar_delegates_post_transfer_exact_resume() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let shared = Arc::new(Shared::default());
+				shared.use_resume_child.store(true, Ordering::SeqCst);
+				let mut command = provider_command(Arc::clone(&shared), "provider");
+
+				let mut child = command.spawn().expect("spawn provider child");
+				assert_eq!(shared.resume_calls.load(Ordering::SeqCst), 0);
+				child
+					.resume_after_job_assignment()
+					.expect("the sidecar delegates an exact resume capability")
+					.expect("the delegated exact resume succeeds");
+				assert_eq!(shared.resume_calls.load(Ordering::SeqCst), 1);
 			}
 
 			#[test]
@@ -949,6 +1253,23 @@ macro_rules! spawn_provider_tests {
 				assert!(child.try_wait().expect("reap reused child").is_some());
 				drop(child);
 				assert_eq!(shared.events(), successful_events("provider"));
+			}
+
+			#[test]
+			fn committed_sidecar_debug_never_formats_transaction_residue() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let shared = Arc::new(Shared::default());
+				shared
+					.panic_in_transaction_debug
+					.store(true, Ordering::SeqCst);
+				let mut command = provider_command(Arc::clone(&shared), "provider");
+				let child = command.spawn().expect("spawn provider child");
+
+				let formatted = catch_unwind(AssertUnwindSafe(|| format!("{child:?}")))
+					.expect("formatting a provider child must not inspect its transaction residue");
+				assert!(formatted.contains("CustomChild"));
+				assert_eq!(shared.transaction_debug_calls.load(Ordering::SeqCst), 0);
 			}
 
 			#[test]
@@ -1333,19 +1654,34 @@ macro_rules! spawn_provider_tests {
 			}
 
 			#[test]
+			fn bounded_subprocess_reaps_the_timeout_path() {
+				const CHILD_ENV: &str = "PROCESS_WRAP_PROVIDER_TIMEOUT_HELPER";
+				let child_value = stringify!($module);
+				if std::env::var_os(CHILD_ENV).as_deref() == Some(OsStr::new(child_value)) {
+					sleep(Duration::from_secs(30));
+					return;
+				}
+
+				let (output, timed_out) = bounded_test_process(
+					concat!(stringify!($module), "::bounded_subprocess_reaps_the_timeout_path"),
+					(CHILD_ENV, child_value),
+					Duration::ZERO,
+				);
+				assert!(timed_out, "the zero-deadline seam must take the timeout branch");
+				assert!(!output.status.success(), "the timed-out helper must be terminated");
+			}
+
+			#[test]
 			fn rollback_and_transaction_unwinds_are_separated() {
 				const CHILD_ENV: &str = "PROCESS_WRAP_SEPARATE_PROVIDER_UNWINDS";
 				let child_value = stringify!($module);
 				if std::env::var_os(CHILD_ENV).as_deref() != Some(OsStr::new(child_value)) {
-					let output = std::process::Command::new(std::env::current_exe().unwrap())
-						.args([
-							"--exact",
-							concat!(stringify!($module), "::rollback_and_transaction_unwinds_are_separated"),
-							"--nocapture",
-						])
-						.env(CHILD_ENV, child_value)
-						.output()
-						.expect("start isolated lifecycle regression");
+					let (output, timed_out) = bounded_test_process(
+						concat!(stringify!($module), "::rollback_and_transaction_unwinds_are_separated"),
+						(CHILD_ENV, child_value),
+						EXIT_TIMEOUT,
+					);
+					assert!(!timed_out, "isolated lifecycle regression exceeded its deadline");
 					assert!(
 						output.status.success(),
 						"rollback and transaction disposal overlapped:\nstdout:\n{}\nstderr:\n{}",
@@ -1382,6 +1718,96 @@ macro_rules! spawn_provider_tests {
 			}
 
 			#[test]
+			fn child_destructor_panics_do_not_replace_post_spawn_or_commit_errors() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for fail_commit in [false, true] {
+					let shared = Arc::new(Shared::default());
+					let secondary_drops = Arc::new(AtomicUsize::new(0));
+					shared.set_child_drop_payload(PanickingDropPayload {
+						drops: Arc::clone(&secondary_drops),
+					});
+					let identity = Arc::new(());
+					let mut command = if fail_commit {
+						shared.set_commit_primary_failure(PrimaryFailure::Error(Arc::clone(&identity)));
+						provider_command(Arc::clone(&shared), "provider")
+					} else {
+						provider_command_with_primary_failure(
+							Arc::clone(&shared),
+							PrimaryFailure::Error(Arc::clone(&identity)),
+						)
+					};
+
+					let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
+					assert_primary_failure_preserved(outcome, &identity, false);
+					assert_eq!(secondary_drops.load(Ordering::SeqCst), 0);
+					assert!(shared.events().ends_with(&[Event::Rollback, Event::ChildDrop]));
+
+					shared.clear_events();
+					drop(command.spawn().expect("the command remains reusable"));
+					assert_eq!(shared.events(), successful_events("provider"));
+				}
+			}
+
+			#[test]
+			fn child_destructor_panics_do_not_replace_post_spawn_or_commit_panics() {
+				const CHILD_ENV: &str = "PROCESS_WRAP_PROVIDER_CHILD_PANIC";
+				let module = stringify!($module);
+				let selected = std::env::var(CHILD_ENV).ok();
+				if selected.as_deref().is_none_or(|value| !value.starts_with(module)) {
+					for phase in ["post", "commit"] {
+						let child_value = format!("{module}:{phase}");
+						let (output, timed_out) = bounded_test_process(
+							concat!(
+								stringify!($module),
+								"::child_destructor_panics_do_not_replace_post_spawn_or_commit_panics"
+							),
+							(CHILD_ENV, &child_value),
+							EXIT_TIMEOUT,
+						);
+						assert!(!timed_out, "isolated child cleanup exceeded its deadline");
+						assert!(
+							output.status.success(),
+							"{phase} panic was not preserved across child cleanup:\nstdout:\n{}\nstderr:\n{}",
+							String::from_utf8_lossy(&output.stdout),
+							String::from_utf8_lossy(&output.stderr),
+						);
+					}
+					return;
+				}
+
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let fail_commit = selected
+					.as_deref()
+					.expect("the subprocess selected a phase")
+					.ends_with(":commit");
+				let shared = Arc::new(Shared::default());
+				let secondary_drops = Arc::new(AtomicUsize::new(0));
+				shared.set_child_drop_payload(PanickingDropPayload {
+					drops: Arc::clone(&secondary_drops),
+				});
+				let identity = Arc::new(());
+				let mut command = if fail_commit {
+					shared.set_commit_primary_failure(PrimaryFailure::Panic(Arc::clone(&identity)));
+					provider_command(Arc::clone(&shared), "provider")
+				} else {
+					provider_command_with_primary_failure(
+						Arc::clone(&shared),
+						PrimaryFailure::Panic(Arc::clone(&identity)),
+					)
+				};
+
+				let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
+				assert_primary_failure_preserved(outcome, &identity, true);
+				assert_eq!(secondary_drops.load(Ordering::SeqCst), 0);
+				assert!(shared.events().ends_with(&[Event::Rollback, Event::ChildDrop]));
+				shared.clear_events();
+				drop(command.spawn().expect("the command remains reusable"));
+				assert_eq!(shared.events(), successful_events("provider"));
+			}
+
+			#[test]
 			fn commit_failure_rolls_back_and_preserves_its_error() {
 				let runtime = runtime();
 				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
@@ -1400,6 +1826,81 @@ macro_rules! spawn_provider_tests {
 
 				shared.clear_events();
 				let _child = command.spawn().unwrap();
+				assert_eq!(shared.events(), successful_events("provider"));
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn prepared_states_are_disposed_independently_after_the_primary_is_owned() {
+				const CHILD_ENV: &str = "PROCESS_WRAP_PROVIDER_PREPARED_PANIC";
+				let module = stringify!($module);
+				let selected = std::env::var(CHILD_ENV).ok();
+				if selected.as_deref().is_none_or(|value| !value.starts_with(module)) {
+					for failure in ["error", "panic"] {
+						let child_value = format!("{module}:{failure}");
+						let (output, timed_out) = bounded_test_process(
+							concat!(
+								stringify!($module),
+								"::prepared_states_are_disposed_independently_after_the_primary_is_owned"
+							),
+							(CHILD_ENV, &child_value),
+							EXIT_TIMEOUT,
+						);
+						assert!(!timed_out, "prepared-state cleanup exceeded its deadline");
+						assert!(
+							output.status.success(),
+							"prepared-state cleanup did not preserve the {failure}:\nstdout:\n{}\nstderr:\n{}",
+							String::from_utf8_lossy(&output.stdout),
+							String::from_utf8_lossy(&output.stderr),
+						);
+					}
+					return;
+				}
+
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let shared = Arc::new(Shared::default());
+				let first_drops = Arc::new(AtomicUsize::new(0));
+				let second_drops = Arc::new(AtomicUsize::new(0));
+				let identity = Arc::new(());
+				let failure = if selected
+					.as_deref()
+					.expect("the subprocess selected a failure")
+					.ends_with(":panic")
+				{
+					PrimaryFailure::Panic(Arc::clone(&identity))
+				} else {
+					PrimaryFailure::Error(Arc::clone(&identity))
+				};
+				let was_panic = matches!(&failure, PrimaryFailure::Panic(_));
+				let mut command = provider_command(Arc::clone(&shared), "provider");
+				command
+					.wrap(FirstPrepared {
+						shared: Arc::clone(&shared),
+						payload: Mutex::new(Some(PanickingDropPayload {
+							drops: Arc::clone(&first_drops),
+						})),
+					})
+					.wrap(SecondPrepared {
+						shared: Arc::clone(&shared),
+						payload: Mutex::new(Some(PanickingDropPayload {
+							drops: Arc::clone(&second_drops),
+						})),
+					})
+					.wrap(FailPrepare(Mutex::new(Some(failure))));
+
+				let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
+				assert_primary_failure_preserved(outcome, &identity, was_panic);
+				assert_eq!(first_drops.load(Ordering::SeqCst), 0);
+				assert_eq!(second_drops.load(Ordering::SeqCst), 0);
+				assert!(shared.events().ends_with(&[
+					Event::Rollback,
+					Event::PreparedDrop("first"),
+					Event::PreparedDrop("second"),
+				]));
+
+				shared.clear_events();
+				drop(command.spawn().expect("the command remains reusable"));
 				assert_eq!(shared.events(), successful_events("provider"));
 			}
 
@@ -1723,6 +2224,24 @@ macro_rules! tokio_wait_for_child {
 	};
 }
 
+#[cfg(feature = "std")]
+macro_rules! std_kill_child {
+	($runtime:expr, $child:expr) => {{
+		let _ = &$runtime;
+		$child.kill()
+	}};
+}
+
+#[cfg(feature = "tokio1")]
+macro_rules! tokio_kill_child {
+	($runtime:expr, $child:expr) => {
+		$runtime
+			.as_ref()
+			.expect("the Tokio frontend has a runtime")
+			.block_on(async { Box::into_pin($child.kill()).await })
+	};
+}
+
 macro_rules! provider_capability_tests {
 	(
 		$module:ident,
@@ -1735,6 +2254,7 @@ macro_rules! provider_capability_tests {
 		$native_command:path,
 		$native_child:path,
 		$wait_for_child:ident,
+		$kill_child:ident,
 		$runtime:expr
 	) => {
 		mod $module {
@@ -1952,6 +2472,27 @@ macro_rules! provider_capability_tests {
 				let first = $wait_for_child!(runtime, child).expect("wait extracted native child");
 				let second = $wait_for_child!(runtime, child).expect("repeat extracted child wait");
 				assert_eq!(first, second);
+			}
+
+			#[test]
+			#[cfg_attr(miri, ignore = "requires native child processes")]
+			fn committed_sidecar_delegates_direct_kill_and_repeated_waits() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let drops = Arc::new(AtomicUsize::new(0));
+				let mut command = command_with_completion(Arc::clone(&drops), false);
+
+				let mut child = command.spawn().expect("spawn live provider child");
+				$kill_child!(runtime, child).expect("kill and reap live provider child");
+				let first = $wait_for_child!(runtime, child).expect("repeat killed child wait");
+				let second = $wait_for_child!(runtime, child).expect("second killed child wait");
+				assert_eq!(first, second);
+				assert_eq!(
+					child.try_wait().expect("repeat killed child try_wait"),
+					Some(first)
+				);
+				drop(child);
+				assert_eq!(drops.load(Ordering::SeqCst), 1);
 			}
 
 			#[cfg(windows)]
@@ -2591,6 +3132,7 @@ provider_capability_tests!(
 	std::process::Command,
 	std::process::Child,
 	std_wait_for_child,
+	std_kill_child,
 	None
 );
 
@@ -2606,6 +3148,7 @@ provider_capability_tests!(
 	tokio::process::Command,
 	tokio::process::Child,
 	tokio_wait_for_child,
+	tokio_kill_child,
 	Some(
 		tokio::runtime::Builder::new_current_thread()
 			.enable_all()
