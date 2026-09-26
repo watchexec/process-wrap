@@ -1,9 +1,10 @@
 use std::{
 	any::Any,
 	io::{Error, ErrorKind, Result},
+	ops::ControlFlow,
 	os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle},
 	process::ExitStatus,
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 #[cfg(feature = "tracing")]
@@ -191,6 +192,40 @@ impl JobObjectChild {
 	}
 }
 
+fn wait_for_exit_and_job_drain_with(
+	exit_status: &mut ChildExitStatus,
+	job_drained: &mut bool,
+	mut wait_direct: impl FnMut() -> Result<ExitStatus>,
+	mut poll_drain: impl FnMut(Duration) -> Result<ControlFlow<()>>,
+	mut now: impl FnMut() -> Instant,
+	mut sleep: impl FnMut(Duration),
+	mut on_pending: impl FnMut(ChildExitStatus),
+) -> Result<ExitStatus> {
+	let status = match *exit_status {
+		ChildExitStatus::Running => {
+			let status = wait_direct()?;
+			*exit_status = ChildExitStatus::Exited(status);
+			status
+		}
+		ChildExitStatus::Exited(status) => status,
+	};
+
+	while !*job_drained {
+		let poll_started = now();
+		if poll_drain(JOB_POLL_INTERVAL)?.is_break() {
+			*job_drained = true;
+		} else {
+			let elapsed = now().saturating_duration_since(poll_started);
+			let remaining = JOB_POLL_INTERVAL.saturating_sub(elapsed);
+			on_pending(*exit_status);
+			if !remaining.is_zero() {
+				sleep(remaining);
+			}
+		}
+	}
+	Ok(status)
+}
+
 impl ChildWrapper for JobObjectChild {
 	fn inner(&self) -> &dyn ChildWrapper {
 		self.inner.as_ref()
@@ -238,29 +273,22 @@ impl ChildWrapper for JobObjectChild {
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wait(&mut self) -> Result<ExitStatus> {
-		let status = match self.exit_status {
-			ChildExitStatus::Running => {
-				// Direct-child exit and whole-job drain are separate states. Cache the direct status so
-				// repeated calls do not lose it while the job still contains descendants.
-				let status = self.inner.wait()?;
-				self.exit_status = ChildExitStatus::Exited(status);
-				status
-			}
-			ChildExitStatus::Exited(status) => status,
-		};
-
-		while !self.job_drained {
-			if poll_job_drain(
-				self.job_port.job,
-				self.job_port.completion_port.as_handle(),
-				JOB_POLL_INTERVAL,
-			)?
-			.is_break()
-			{
-				self.job_drained = true;
-			}
-		}
-		Ok(status)
+		let Self {
+			inner,
+			exit_status,
+			job_drained,
+			job_port,
+			..
+		} = self;
+		wait_for_exit_and_job_drain_with(
+			exit_status,
+			job_drained,
+			|| inner.wait(),
+			|timeout| poll_job_drain(job_port.job, job_port.completion_port.as_handle(), timeout),
+			Instant::now,
+			std::thread::sleep,
+			|_| {},
+		)
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
@@ -287,5 +315,148 @@ impl ChildWrapper for JobObjectChild {
 			(ChildExitStatus::Exited(status), true) => Ok(Some(status)),
 			_ => Ok(None),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		cell::{Cell, RefCell},
+		os::windows::process::ExitStatusExt,
+		sync::mpsc,
+		thread,
+	};
+
+	use super::*;
+
+	#[test]
+	fn sustained_nonterminal_wakes_preserve_poll_cadence() -> Result<()> {
+		let status = ExitStatus::from_raw(0);
+		let mut exit_status = ChildExitStatus::Exited(status);
+		let mut job_drained = false;
+		let base = Instant::now();
+		let elapsed = Cell::new(Duration::ZERO);
+		let poll_costs = [
+			Duration::from_millis(2),
+			Duration::from_millis(7),
+			JOB_POLL_INTERVAL,
+			Duration::ZERO,
+		];
+		let mut poll_costs = poll_costs.into_iter();
+		let mut outcomes = [
+			ControlFlow::Continue(()),
+			ControlFlow::Continue(()),
+			ControlFlow::Continue(()),
+			ControlFlow::Break(()),
+		]
+		.into_iter();
+		let poll_starts = RefCell::new(Vec::new());
+		let sleeps = RefCell::new(Vec::new());
+
+		let result = wait_for_exit_and_job_drain_with(
+			&mut exit_status,
+			&mut job_drained,
+			|| unreachable!("the direct status was already cached"),
+			|timeout| {
+				assert_eq!(timeout, JOB_POLL_INTERVAL);
+				poll_starts.borrow_mut().push(elapsed.get());
+				elapsed.set(elapsed.get() + poll_costs.next().expect("one cost per injected poll"));
+				Ok(outcomes.next().expect("one outcome per injected poll"))
+			},
+			|| base + elapsed.get(),
+			|duration| {
+				sleeps.borrow_mut().push(duration);
+				elapsed.set(elapsed.get() + duration);
+			},
+			|_| {},
+		)?;
+
+		assert_eq!(result, status);
+		assert!(job_drained);
+		assert_eq!(
+			poll_starts.into_inner(),
+			[
+				Duration::ZERO,
+				JOB_POLL_INTERVAL,
+				JOB_POLL_INTERVAL * 2,
+				JOB_POLL_INTERVAL * 3,
+			]
+		);
+		assert_eq!(
+			sleeps.into_inner(),
+			[Duration::from_millis(8), Duration::from_millis(3)]
+		);
+		Ok(())
+	}
+
+	#[test]
+	fn blocking_wait_rendezvous_follows_cached_exit_and_false_drain_poll() -> Result<()> {
+		let (pending_tx, pending_rx) = mpsc::sync_channel(0);
+		let (release_tx, release_rx) = mpsc::channel();
+		let (completed_tx, completed_rx) = mpsc::channel();
+		let waiter = thread::spawn(move || {
+			let status = ExitStatus::from_raw(0);
+			let mut exit_status = ChildExitStatus::Running;
+			let mut job_drained = false;
+			let mut polls = [ControlFlow::Continue(()), ControlFlow::Break(())].into_iter();
+			let result = wait_for_exit_and_job_drain_with(
+				&mut exit_status,
+				&mut job_drained,
+				|| Ok(status),
+				|_| {
+					Ok(polls
+						.next()
+						.expect("the fake job drains on its second poll"))
+				},
+				Instant::now,
+				|_| {},
+				|cached_exit| {
+					assert!(matches!(
+						cached_exit,
+						ChildExitStatus::Exited(cached) if cached == status
+					));
+					pending_tx
+						.send(())
+						.expect("the test receives the pending rendezvous");
+					release_rx
+						.recv()
+						.expect("the test releases the pending drain");
+				},
+			);
+			let _ = completed_tx.send((result, exit_status, job_drained));
+		});
+
+		if let Err(error) = pending_rx.recv_timeout(Duration::from_secs(5)) {
+			let _ = release_tx.send(());
+			let _ = waiter.join();
+			return Err(Error::new(
+				ErrorKind::TimedOut,
+				format!("wait did not enter the pending drain state: {error}"),
+			));
+		}
+		let was_pending = matches!(completed_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+		let _ = release_tx.send(());
+		let completed = completed_rx.recv_timeout(Duration::from_secs(5));
+		let joined = waiter.join();
+
+		assert!(
+			was_pending,
+			"wait returned before the injected drain release"
+		);
+		joined.map_err(|_| Error::other("blocking wait seam thread panicked"))?;
+		let (result, exit_status, job_drained) = completed.map_err(|error| {
+			Error::new(
+				ErrorKind::TimedOut,
+				format!("wait did not finish after the injected release: {error}"),
+			)
+		})?;
+		let status = result?;
+		assert!(status.success());
+		assert!(matches!(
+			exit_status,
+			ChildExitStatus::Exited(cached) if cached == status
+		));
+		assert!(job_drained);
+		Ok(())
 	}
 }

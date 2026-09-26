@@ -76,6 +76,24 @@ jobs:
 
       - run: cargo check --locked --no-default-features --lib
 
+  windows-production-features:
+    name: Check Windows production feature closure
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+          rustup target add x86_64-pc-windows-gnu
+
+      - name: Check Tokio JobObject production library
+        run: cargo check --locked --target x86_64-pc-windows-gnu --no-default-features --features tokio1,job-object --lib
+
   # Miri deliberately excludes native process creation and FFI.
   miri-process-free:
     name: Miri (process-free state and ownership)
