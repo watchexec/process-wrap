@@ -24,6 +24,7 @@ mod try_wait_after_die;
 mod wait_after_die;
 mod wait_twice;
 mod wait_with_output;
-#[cfg(all(feature = "creation-flags", feature = "job-object"))]
+#[cfg(feature = "job-object")]
+#[cfg_attr(not(feature = "creation-flags"), allow(dead_code))]
 #[path = "../support/windows_thread.rs"]
 mod windows_thread;

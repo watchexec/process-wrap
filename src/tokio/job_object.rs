@@ -2,13 +2,12 @@ use std::{
 	any::Any,
 	future::Future,
 	io::{Error, ErrorKind, Result},
-	os::windows::io::{AsRawHandle, BorrowedHandle},
+	os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle},
 	pin::Pin,
 	process::ExitStatus,
-	time::Duration,
+	time::{Duration, Instant},
 };
 
-use tokio::task::spawn_blocking;
 #[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
 use windows::Win32::{
@@ -19,8 +18,8 @@ use windows::Win32::{
 use crate::{
 	ChildExitStatus,
 	windows::{
-		JobPort, job_creation_flags, make_job_object, resume_threads, set_job_kill_on_drop,
-		terminate_job, wait_on_job,
+		JOB_POLL_INTERVAL, JobPort, job_creation_flags, make_job_object, poll_job_drain,
+		resume_threads, set_job_kill_on_drop, terminate_job,
 	},
 };
 
@@ -180,6 +179,8 @@ impl CommandWrapper for JobObject {
 pub struct JobObjectChild {
 	inner: Box<dyn ChildWrapper>,
 	exit_status: ChildExitStatus,
+	job_drained: bool,
+	poll_cadence: Option<tokio::task::JoinHandle<()>>,
 	job_port: JobPort,
 	final_kill_on_drop: bool,
 	spawn_finalized: bool,
@@ -195,9 +196,40 @@ impl JobObjectChild {
 		Self {
 			inner,
 			exit_status: ChildExitStatus::Running,
+			job_drained: false,
+			poll_cadence: None,
 			job_port,
 			final_kill_on_drop,
 			spawn_finalized: false,
+		}
+	}
+
+	fn arm_poll_cadence(&mut self, elapsed: Duration) {
+		debug_assert!(self.poll_cadence.is_none());
+		let remaining = JOB_POLL_INTERVAL.saturating_sub(elapsed);
+		if !remaining.is_zero() {
+			// The blocking task owns only inert timing data. In particular, it cannot prolong or
+			// outlive any borrow of the JobObject or completion-port handles.
+			self.poll_cadence = Some(tokio::task::spawn_blocking(move || {
+				std::thread::sleep(remaining);
+			}));
+		}
+	}
+
+	async fn wait_for_poll_cadence(&mut self) -> Result<()> {
+		let Some(cadence) = self.poll_cadence.as_mut() else {
+			return Ok(());
+		};
+		let result = cadence.await;
+		self.poll_cadence = None;
+		result.map_err(Error::other)
+	}
+
+	fn clear_poll_cadence(&mut self) {
+		if let Some(cadence) = self.poll_cadence.take() {
+			// `abort` can prevent a queued blocking task from starting. If it has started, Tokio
+			// lets the short sleep finish detached; its closure owns no native resource.
+			cadence.abort();
 		}
 	}
 }
@@ -221,7 +253,7 @@ impl ChildWrapper for JobObjectChild {
 			// manually drop the completion port
 			let its = std::mem::ManuallyDrop::new(job_port);
 			// SAFETY: `its` owns the completion-port handle and suppresses `JobPort::drop`.
-			unsafe { CloseHandle(its.completion_port.0) }.ok();
+			unsafe { CloseHandle(HANDLE(its.completion_port.as_raw_handle())) }.ok();
 			// we leave the job handle unclosed, otherwise the Child is useless
 			// (as closing it may terminate the job)
 		}
@@ -232,6 +264,9 @@ impl ChildWrapper for JobObjectChild {
 	}
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
 		self.inner.try_process_handle()
+	}
+	fn owns_job_object_cleanup_layer(&self) -> bool {
+		true
 	}
 	fn disarm_job_object_layer(&mut self) -> Result<()> {
 		set_job_kill_on_drop(self.job_port.job, self.final_kill_on_drop)?;
@@ -247,37 +282,65 @@ impl ChildWrapper for JobObjectChild {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn wait(&mut self) -> Pin<Box<dyn Future<Output = Result<ExitStatus>> + Send + '_>> {
 		Box::pin(async {
-			if let ChildExitStatus::Exited(status) = &self.exit_status {
-				return Ok(*status);
-			}
-
-			const MAX_RETRY_ATTEMPT: usize = 10;
-
-			// always wait for parent to exit first, as by the time it does,
-			// it's likely that all its children have already exited.
-			let status = self.inner.wait().await?;
-			self.exit_status = ChildExitStatus::Exited(status);
-
-			// nevertheless, now try reaping all children a few times...
-			for _ in 1..MAX_RETRY_ATTEMPT {
-				if wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?.is_break() {
-					return Ok(status);
+			let status = match self.exit_status {
+				ChildExitStatus::Running => {
+					// Cache direct-child exit independently from whole-job drain. There is no await
+					// between observing the status and retaining it, so cancellation cannot lose it.
+					let status = self.inner.wait().await?;
+					self.exit_status = ChildExitStatus::Exited(status);
+					status
 				}
-			}
+				ChildExitStatus::Exited(status) => status,
+			};
 
-			// ...finally, if there are some that are still alive,
-			// block in the background to reap them fully.
-			let JobPort {
-				completion_port, ..
-			} = self.job_port;
-			let _ = spawn_blocking(move || wait_on_job(completion_port, None)).await??;
+			while !self.job_drained {
+				// A canceled wait leaves this handle in `self`, so its successor cannot poll again
+				// until the already-armed cadence completes.
+				self.wait_for_poll_cadence().await?;
+				let poll_started = Instant::now();
+				if poll_job_drain(
+					self.job_port.job,
+					self.job_port.completion_port.as_handle(),
+					Duration::ZERO,
+				)?
+				.is_break()
+				{
+					// No await occurs between the authoritative accounting result and this durable
+					// transition, so a canceled future cannot consume the drain state.
+					self.job_drained = true;
+					self.clear_poll_cadence();
+					break;
+				}
+				self.arm_poll_cadence(poll_started.elapsed());
+			}
 			Ok(status)
 		})
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		let _ = wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?;
-		self.inner.try_wait()
+		if matches!(self.exit_status, ChildExitStatus::Running) {
+			let Some(status) = self.inner.try_wait()? else {
+				return Ok(None);
+			};
+			self.exit_status = ChildExitStatus::Exited(status);
+		}
+
+		if !self.job_drained
+			&& poll_job_drain(
+				self.job_port.job,
+				self.job_port.completion_port.as_handle(),
+				Duration::ZERO,
+			)?
+			.is_break()
+		{
+			self.job_drained = true;
+			self.clear_poll_cadence();
+		}
+
+		match (self.exit_status, self.job_drained) {
+			(ChildExitStatus::Exited(status), true) => Ok(Some(status)),
+			_ => Ok(None),
+		}
 	}
 }

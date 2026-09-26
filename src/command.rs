@@ -536,15 +536,22 @@ impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
 /// transaction must own its cleanup resources independently of the child wrapper chain, because a
 /// failing child wrapper may already have consumed or dropped that chain.
 ///
-/// Process-wrap calls [`commit`](SpawnTransaction::commit) only after every public post-spawn and
-/// child-wrapping hook succeeds. `commit` must disarm rollback resources on success. If it returns an
-/// error or panics, the transaction must remain rollbackable; process-wrap then makes one best-effort
-/// [`rollback`](SpawnTransaction::rollback) call. A rollback error or panic is suppressed so the
-/// original error or panic is preserved. After a successful commit, process-wrap drops the transaction
-/// and does not roll it back if a later internal child-finalization phase fails.
+/// On Windows, process-wrap calls [`commit`](SpawnTransaction::commit) only after every public
+/// post-spawn and child-wrapping hook and the complete pre-commit child phase succeed. That phase
+/// runs ordinary child finalizers, disarms ordinary child cleanup, rejects multiple JobObject cleanup
+/// owners, and disarms every non-owner while leaving the sole owner armed. `commit` must disarm
+/// provider rollback resources on success. If pre-commit work or `commit` returns an error or unwinds,
+/// the transaction must remain rollbackable; process-wrap then makes one best-effort
+/// [`rollback`](SpawnTransaction::rollback) call. A rollback error or unwinding panic is suppressed so
+/// the original failure is preserved. After successful commit, process-wrap drops the transaction and
+/// runs only the sole JobObject owner hook, whose contract requires failure-atomic disarming.
 ///
-/// Until a provider returns its `ProviderProduct`, cleanup for errors or panics in its own `spawn`
-/// implementation remains the provider's responsibility.
+/// On non-Windows targets there is no hidden child-finalization phase, so commit follows the public
+/// hooks directly. These panic guarantees require unwinding; `panic=abort` terminates the process
+/// before rollback or payload preservation can run.
+///
+/// Until a provider returns its `ProviderProduct`, cleanup for errors or unwinding panics in its own
+/// `spawn` implementation remains the provider's responsibility.
 pub trait SpawnTransaction: fmt::Debug + Send + 'static {
 	/// Finalize the successful spawn and disarm rollback resources.
 	fn commit(&mut self) -> std::io::Result<()>;

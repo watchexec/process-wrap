@@ -1,16 +1,23 @@
 use std::{
 	any::TypeId,
+	fs,
 	future::Future,
 	os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle},
+	path::{Path, PathBuf},
 	pin::Pin,
-	process::ExitStatus,
+	process::{Command as StdCommand, ExitStatus},
 	sync::{
 		Arc,
 		atomic::{AtomicBool, AtomicUsize, Ordering},
 	},
+	time::Instant,
 };
 
-use super::prelude::*;
+use super::{prelude::*, windows_thread::ProcessGuard};
+
+const JOB_WAIT_DESCENDANT_PID: &str = "PROCESS_WRAP_JOB_WAIT_DESCENDANT_PID";
+const JOB_WAIT_DESCENDANT_RELEASE: &str = "PROCESS_WRAP_JOB_WAIT_DESCENDANT_RELEASE";
+const JOB_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -427,5 +434,331 @@ async fn job_object_uses_delegated_handle_and_preserves_the_direct_child() -> Re
 	assert_eq!(direct_mut_type, TypeId::of::<TransparentChild>());
 	assert_eq!(consumed_type, TypeId::of::<TransparentChild>());
 	assert!(consumed_has_handle);
+	Ok(())
+}
+
+#[derive(Debug)]
+struct ReleaseOnDrop(PathBuf);
+
+impl Drop for ReleaseOnDrop {
+	fn drop(&mut self) {
+		let _ = fs::File::create(&self.0);
+	}
+}
+
+fn wait_for_pid_blocking(path: &Path) -> Result<u32> {
+	let deadline = Instant::now() + JOB_WAIT_TIMEOUT;
+	loop {
+		if let Ok(pid) = fs::read_to_string(path)
+			.and_then(|pid| pid.trim().parse().map_err(std::io::Error::other))
+		{
+			return Ok(pid);
+		}
+		if Instant::now() >= deadline {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::TimedOut,
+				"descendant helper did not report its process ID",
+			));
+		}
+		std::thread::sleep(Duration::from_millis(10));
+	}
+}
+
+fn wait_for_process_exit_blocking(guard: ProcessGuard) -> Result<()> {
+	let deadline = Instant::now() + JOB_WAIT_TIMEOUT;
+	loop {
+		if guard.has_exited()? {
+			return guard.disarm();
+		}
+		if Instant::now() >= deadline {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::TimedOut,
+				"process did not exit before the test deadline",
+			));
+		}
+		std::thread::sleep(Duration::from_millis(10));
+	}
+}
+
+async fn wait_for_pid(path: &Path) -> Result<u32> {
+	let deadline = Instant::now() + JOB_WAIT_TIMEOUT;
+	loop {
+		if let Ok(pid) = fs::read_to_string(path)
+			.and_then(|pid| pid.trim().parse().map_err(std::io::Error::other))
+		{
+			return Ok(pid);
+		}
+		if Instant::now() >= deadline {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::TimedOut,
+				"descendant helper did not report its process ID",
+			));
+		}
+		sleep(Duration::from_millis(10)).await;
+	}
+}
+
+async fn wait_for_process_exit(guard: ProcessGuard) -> Result<()> {
+	let deadline = Instant::now() + JOB_WAIT_TIMEOUT;
+	loop {
+		if guard.has_exited()? {
+			return guard.disarm();
+		}
+		if Instant::now() >= deadline {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::TimedOut,
+				"process did not exit before the test deadline",
+			));
+		}
+		sleep(Duration::from_millis(10)).await;
+	}
+}
+
+fn descendant_job_command(pid_file: &Path, release_file: &Path) -> Result<CommandWrap> {
+	Ok(CommandWrap::with_new(std::env::current_exe()?, |command| {
+		command
+			.args([
+				"--exact",
+				"tokio_windows::process_handle::job_wait_direct_child_helper",
+				"--ignored",
+				"--nocapture",
+			])
+			.env(JOB_WAIT_DESCENDANT_PID, pid_file)
+			.env(JOB_WAIT_DESCENDANT_RELEASE, release_file)
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null());
+	}))
+}
+
+#[test]
+#[ignore = "subprocess helper"]
+fn job_wait_descendant_helper() -> Result<()> {
+	let release = PathBuf::from(
+		std::env::var_os(JOB_WAIT_DESCENDANT_RELEASE)
+			.ok_or_else(|| std::io::Error::other("descendant release path is missing"))?,
+	);
+	let deadline = Instant::now() + JOB_WAIT_TIMEOUT;
+	while !release.exists() {
+		if Instant::now() >= deadline {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::TimedOut,
+				"descendant release was not signaled",
+			));
+		}
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	Ok(())
+}
+
+#[test]
+#[ignore = "subprocess helper"]
+fn job_wait_direct_child_helper() -> Result<()> {
+	let pid_file = PathBuf::from(
+		std::env::var_os(JOB_WAIT_DESCENDANT_PID)
+			.ok_or_else(|| std::io::Error::other("descendant PID path is missing"))?,
+	);
+	let descendant = StdCommand::new(std::env::current_exe()?)
+		.args([
+			"--exact",
+			"tokio_windows::process_handle::job_wait_descendant_helper",
+			"--ignored",
+			"--nocapture",
+		])
+		.env(
+			JOB_WAIT_DESCENDANT_RELEASE,
+			std::env::var_os(JOB_WAIT_DESCENDANT_RELEASE)
+				.ok_or_else(|| std::io::Error::other("descendant release path is missing"))?,
+		)
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.spawn()?;
+	fs::write(pid_file, descendant.id().to_string())?;
+	drop(descendant);
+	Ok(())
+}
+
+struct DescendantJob {
+	child: Box<dyn ChildWrapper>,
+	release_file: PathBuf,
+	release_on_drop: ReleaseOnDrop,
+	descendant_process: ProcessGuard,
+	directory: tempfile::TempDir,
+}
+
+async fn spawn_descendant_job() -> Result<DescendantJob> {
+	let directory = tempfile::tempdir()?;
+	let pid_file = directory.path().join("descendant.pid");
+	let release_file = directory.path().join("release");
+	let release_on_drop = ReleaseOnDrop(release_file.clone());
+	let mut command = descendant_job_command(&pid_file, &release_file)?;
+	command.wrap(JobObject);
+	let child = command.spawn()?;
+	let direct_process = ProcessGuard::open(
+		child
+			.id()
+			.expect("a newly spawned child exposes its process ID"),
+	)?;
+	let descendant_process = ProcessGuard::open(wait_for_pid(&pid_file).await?)?;
+	wait_for_process_exit(direct_process).await?;
+	Ok(DescendantJob {
+		child,
+		release_file,
+		release_on_drop,
+		descendant_process,
+		directory,
+	})
+}
+
+fn spawn_descendant_job_without_timer() -> Result<DescendantJob> {
+	let directory = tempfile::tempdir()?;
+	let pid_file = directory.path().join("descendant.pid");
+	let release_file = directory.path().join("release");
+	let release_on_drop = ReleaseOnDrop(release_file.clone());
+	let mut command = descendant_job_command(&pid_file, &release_file)?;
+	command.wrap(JobObject);
+	let child = command.spawn()?;
+	let direct_process = ProcessGuard::open(
+		child
+			.id()
+			.expect("a newly spawned child exposes its process ID"),
+	)?;
+	let descendant_process = ProcessGuard::open(wait_for_pid_blocking(&pid_file)?)?;
+	wait_for_process_exit_blocking(direct_process)?;
+	Ok(DescendantJob {
+		child,
+		release_file,
+		release_on_drop,
+		descendant_process,
+		directory,
+	})
+}
+
+#[test]
+fn descendant_aware_wait_works_without_a_timer_driver() -> Result<()> {
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.max_blocking_threads(1)
+		.build()?;
+	runtime.block_on(async {
+		let DescendantJob {
+			mut child,
+			release_file,
+			release_on_drop: _release_on_drop,
+			descendant_process,
+			directory: _directory,
+		} = spawn_descendant_job_without_timer()?;
+		assert_eq!(
+			child.try_wait()?,
+			None,
+			"the direct status is cached while the descendant keeps the job active"
+		);
+
+		let (blocker_started_tx, blocker_started_rx) = std::sync::mpsc::channel();
+		let (blocker_release_tx, blocker_release_rx) = std::sync::mpsc::channel();
+		let blocker = tokio::task::spawn_blocking(move || {
+			let _ = blocker_started_tx.send(());
+			let _ = blocker_release_rx.recv();
+		});
+		blocker_started_rx
+			.recv_timeout(JOB_WAIT_TIMEOUT)
+			.map_err(|error| {
+				std::io::Error::new(
+					std::io::ErrorKind::TimedOut,
+					format!("blocking-pool guard did not start: {error}"),
+				)
+			})?;
+
+		let mut wait = child.wait();
+		let first_poll =
+			std::future::poll_fn(|context| std::task::Poll::Ready(wait.as_mut().poll(context)))
+				.await;
+		assert!(
+			first_poll.is_pending(),
+			"the live descendant must leave the timer-disabled wait pending"
+		);
+		drop(wait);
+
+		let mut resumed_wait = child.wait();
+		let resumed_poll = std::future::poll_fn(|context| {
+			std::task::Poll::Ready(resumed_wait.as_mut().poll(context))
+		})
+		.await;
+		assert!(
+			resumed_poll.is_pending(),
+			"a canceled wait must resume its queued cadence without a timer driver"
+		);
+
+		fs::File::create(&release_file)?;
+		let _ = blocker_release_tx.send(());
+		let status = resumed_wait.await?;
+		blocker.await.map_err(std::io::Error::other)?;
+		assert!(status.success());
+		assert_eq!(child.try_wait()?, Some(status));
+		wait_for_process_exit_blocking(descendant_process)?;
+		Ok(())
+	})
+}
+
+#[tokio::test]
+async fn job_waits_for_descendant_after_direct_child_exits() -> Result<()> {
+	let DescendantJob {
+		mut child,
+		release_file,
+		release_on_drop: _release_on_drop,
+		descendant_process,
+		directory: _directory,
+	} = spawn_descendant_job().await?;
+	assert_eq!(
+		child.try_wait()?,
+		None,
+		"direct-child exit must remain pending while the job has a live descendant"
+	);
+	assert!(
+		tokio::time::timeout(Duration::from_millis(100), child.wait())
+			.await
+			.is_err(),
+		"JobObject wait returned while the descendant remained alive"
+	);
+	fs::File::create(&release_file)?;
+	let status = tokio::time::timeout(JOB_WAIT_TIMEOUT, child.wait())
+		.await
+		.map_err(std::io::Error::other)??;
+	assert!(status.success());
+	assert_eq!(child.try_wait()?, Some(status));
+	assert_eq!(child.wait().await?, status);
+	wait_for_process_exit(descendant_process).await?;
+	Ok(())
+}
+
+#[tokio::test]
+async fn canceled_job_wait_preserves_pending_drain_state() -> Result<()> {
+	let DescendantJob {
+		mut child,
+		release_file,
+		release_on_drop: _release_on_drop,
+		descendant_process,
+		directory: _directory,
+	} = spawn_descendant_job().await?;
+	assert!(
+		tokio::time::timeout(Duration::from_millis(100), child.wait())
+			.await
+			.is_err(),
+		"the first wait must remain pending before cancellation"
+	);
+	assert_eq!(child.try_wait()?, None);
+	assert!(
+		tokio::time::timeout(Duration::from_millis(100), child.wait())
+			.await
+			.is_err(),
+		"a repeated wait after cancellation must resume the pending job drain"
+	);
+	fs::File::create(&release_file)?;
+	let status = tokio::time::timeout(JOB_WAIT_TIMEOUT, child.wait())
+		.await
+		.map_err(std::io::Error::other)??;
+	assert!(status.success());
+	assert_eq!(child.try_wait()?, Some(status));
+	wait_for_process_exit(descendant_process).await?;
 	Ok(())
 }

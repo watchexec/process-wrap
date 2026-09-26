@@ -60,7 +60,9 @@ macro_rules! Wrap {
 		/// The child must implement the complete contract for this frontend's `ChildWrapper`, including
 		/// any platform capabilities required by registered wrappers. The transaction must be fresh,
 		/// armed, independently owned from the child chain, and able to undo this specific spawn until
-		/// process-wrap commits it.
+		/// process-wrap commits it. On Windows, that includes every ordinary child-finalization and
+		/// cleanup-disarm hook plus JobObject owner validation and non-owner disarming. Only the sole
+		/// JobObject owner hook, if present, runs after commit.
 		#[derive(Debug)]
 		pub struct ProviderProduct {
 			child: Box<dyn $childer>,
@@ -72,7 +74,8 @@ macro_rules! Wrap {
 			///
 			/// Construct this only after the child has been created successfully. The transaction must own
 			/// everything needed to terminate and reap that child and release provider resources if a later
-			/// hook, child wrapper, or transaction commit fails or panics.
+			/// hook, pre-commit child-finalization step, or transaction commit fails or unwinds. These panic
+			/// guarantees do not apply to `panic=abort`.
 			pub fn new(
 				child: Box<dyn $childer>,
 				transaction: Box<dyn crate::SpawnTransaction>,
@@ -97,9 +100,14 @@ macro_rules! Wrap {
 		/// Process-wrap invokes provider callbacks in this order: `check_available`, native-only base
 		/// rejection, `validate_command`, every `pre_spawn` hook in registration order, native-only
 		/// attempt rejection, `validate_attempt`, and `spawn`. After `spawn` returns a product, every
-		/// `post_spawn` and child-wrapping hook runs in registration order before process-wrap commits the
-		/// product's transaction. `spawn_with` and `spawn_with_child` reject a registered provider instead
-		/// of bypassing it.
+		/// `post_spawn` and child-wrapping hook runs in registration order. On Windows, process-wrap then
+		/// completes the pre-commit child phase while provider rollback remains armed, commits and drops
+		/// the transaction, and finally disarms the sole JobObject cleanup owner. `spawn_with` and
+		/// `spawn_with_child` reject a registered provider instead of bypassing it.
+		///
+		/// Rollback, wrapper restoration, and original panic-payload preservation apply only to
+		/// unwinding panics. With `panic=abort`, the process terminates before lifecycle recovery can
+		/// run.
 		pub trait SpawnProvider: ::std::fmt::Debug + Send + Sync + 'static {
 			/// Check whether this provider is available on the current platform and runtime.
 			///
@@ -135,7 +143,7 @@ macro_rules! Wrap {
 			///
 			/// The provider must honor every portable setting accepted by `validate_attempt`. Until this
 			/// method returns a `ProviderProduct`, it remains responsible for cleaning up resources and any
-			/// child it creates if it returns an error or panics.
+			/// child it creates if it returns an error or an unwinding panic.
 			fn spawn(
 				&self,
 				attempt: &mut SpawnAttempt,
@@ -425,7 +433,8 @@ macro_rules! Wrap {
 				})();
 				#[cfg(windows)]
 				let result = result.and_then(|mut child| {
-					child.finalize_spawn()?;
+					let final_owner = child.finalize_spawn_before_commit()?;
+					child.finalize_spawn_final_owner(final_owner)?;
 					if let Some(cleanup) = cleanup.as_mut() {
 						cleanup.disarm();
 					}
@@ -453,9 +462,11 @@ macro_rules! Wrap {
 					let prepared = self.run_prepare_child(attempt, child.as_mut())?;
 					self.run_post_spawn(attempt, child.as_mut())?;
 					#[cfg(windows)]
-					let child = self.run_wrap_child(child, prepared)?;
+					let mut child = self.run_wrap_child(child, prepared)?;
 					#[cfg(not(windows))]
 					let child = self.run_wrap_child(child)?;
+					#[cfg(windows)]
+					let final_owner = child.finalize_spawn_before_commit()?;
 					transaction
 						.as_mut()
 						.expect("the provider transaction remains armed until commit")
@@ -466,11 +477,7 @@ macro_rules! Wrap {
 							.expect("a committed provider transaction is still present"),
 					);
 					#[cfg(windows)]
-					let child = {
-						let mut child = child;
-						child.finalize_spawn()?;
-						child
-					};
+					child.finalize_spawn_final_owner(final_owner)?;
 					Ok(child)
 				}));
 
@@ -672,9 +679,9 @@ macro_rules! Wrap {
 
 			/// Called before the command is spawned, to mutate this attempt as needed.
 			///
-			/// Hooks run in registration order and stop at the first error or panic. Mutations to an attempt
-			/// copied from a tracked command apply to that spawn only. A native-only base instead retains
-			/// native mutations when process-wrap restores it after the lifecycle.
+			/// Hooks run in registration order and stop at the first error or unwinding panic. Mutations to
+			/// an attempt copied from a tracked command apply to that spawn only. A native-only base instead
+			/// retains native mutations when process-wrap restores it after the lifecycle.
 			///
 			/// Calling `SpawnAttempt::native_mut`, directly or through `stdin`, `stdout`, or `stderr`, makes a
 			/// tracked attempt opaque. A registered portable provider rejects it after all pre-spawn hooks
@@ -714,12 +721,12 @@ macro_rules! Wrap {
 
 			/// Called after any transport spawns a child, but before the child is wrapped.
 			///
-			/// Hooks run in registration order and stop at the first error or panic. The child is exposed
-			/// through the frontend's object-safe capability trait, so it may be a terminal custom or
+			/// Hooks run in registration order and stop at the first error or unwinding panic. The child is
+			/// exposed through the frontend's object-safe capability trait, so it may be a terminal custom or
 			/// provider child with no native child value. The transport has already created it: changing
 			/// command settings on `attempt` here cannot configure that child.
 			///
-			/// On the provider path, an error or panic triggers best-effort transaction rollback. Native
+			/// On the provider path, an error or unwinding panic triggers best-effort transaction rollback. Native
 			/// transports do not promise equivalent child cleanup on every platform.
 			///
 			/// Default implementation: no-op.
@@ -736,9 +743,9 @@ macro_rules! Wrap {
 			///
 			/// If the wrapper needs to override methods on the child, it should create an instance of its
 			/// own type implementing `ChildWrapper` and return it here. Wrappers run in registration order
-			/// and stop at the first error or panic, so `.wrap(Foo).wrap(Bar)` produces an outer
-			/// `Bar(Foo(child))` layer. On the provider path, an error or panic triggers best-effort
-			/// transaction rollback.
+			/// and stop at the first error or unwinding panic, so `.wrap(Foo).wrap(Bar)` produces an outer
+			/// `Bar(Foo(child))` layer. On the provider path, an error or unwinding panic triggers
+			/// best-effort transaction rollback.
 			///
 			/// Default implementation: no-op (returns the child unchanged).
 			fn wrap_child(

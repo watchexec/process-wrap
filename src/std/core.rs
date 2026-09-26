@@ -127,16 +127,30 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	/// Disarm Windows cleanup state owned by this child layer.
 	///
 	/// Process-wrap invokes this internal hook only after every ordinary spawn finalizer succeeds, so
-	/// cleanup remains armed if any earlier finalizer errors or panics.
+	/// cleanup remains armed if any earlier finalizer errors or hits an unwinding panic.
 	#[doc(hidden)]
 	#[cfg(windows)]
 	fn disarm_spawn_cleanup_layer(&mut self) -> Result<()> {
 		Ok(())
 	}
 
-	/// Disarm the JobObject cleanup state owned by this child layer.
+	/// Report whether this layer owns the JobObject rollback guard.
 	///
-	/// This process-wrap-internal phase runs after every other fallible finalizer and cleanup disarm.
+	/// Process-wrap counts owners and disarms every non-owner before a provider transaction commits.
+	/// More than one owner fails the lifecycle before commit. The sole owner stays armed until commit
+	/// succeeds and is then disarmed as the only post-commit child-layer operation.
+	#[doc(hidden)]
+	#[cfg(windows)]
+	fn owns_job_object_cleanup_layer(&self) -> bool {
+		false
+	}
+
+	/// Disarm JobObject-phase cleanup state owned by this child layer.
+	///
+	/// Non-owning hooks run before provider commit. The sole layer identified by
+	/// [`ChildWrapper::owns_job_object_cleanup_layer`] runs after commit and must be failure-atomic:
+	/// returning an error or unwinding must leave kill-on-close protection armed. If disarming uses a
+	/// native state transition, no caller-controlled callback may run after that transition succeeds.
 	#[doc(hidden)]
 	#[cfg(windows)]
 	fn disarm_job_object_layer(&mut self) -> Result<()> {
@@ -332,6 +346,20 @@ fn same_child(left: &dyn ChildWrapper, right: &dyn ChildWrapper) -> bool {
 	std::ptr::addr_eq(left, right) && left.type_id() == right.type_id()
 }
 
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct FinalJobOwner {
+	identity: Option<(std::any::TypeId, *mut ())>,
+}
+
+#[cfg(windows)]
+fn spawn_layer_identity(layer: &mut dyn ChildWrapper) -> (std::any::TypeId, *mut ()) {
+	(
+		(&*layer as &dyn Any).type_id(),
+		std::ptr::from_mut(layer).cast::<()>(),
+	)
+}
+
 impl dyn ChildWrapper + '_ {
 	fn downcast_ref<T: 'static>(&self) -> Option<&T> {
 		(self as &dyn Any).downcast_ref()
@@ -408,10 +436,74 @@ impl dyn ChildWrapper + '_ {
 	}
 
 	#[cfg(windows)]
-	pub(crate) fn finalize_spawn(&mut self) -> Result<()> {
+	fn visit_spawn_layers_until(
+		&mut self,
+		mut visit: impl FnMut(&mut dyn ChildWrapper) -> Result<bool>,
+	) -> Result<()> {
+		let mut inner = self;
+		loop {
+			if visit(inner)? {
+				return Ok(());
+			}
+
+			let inner_type = (&*inner as &dyn Any).type_id();
+			let inner_ptr = std::ptr::from_mut(inner);
+			let next = inner.inner_mut();
+			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
+				&& inner_type == (&*next as &dyn Any).type_id()
+			{
+				return Ok(());
+			}
+			inner = next;
+		}
+	}
+
+	#[cfg(windows)]
+	pub(crate) fn finalize_spawn_before_commit(&mut self) -> Result<FinalJobOwner> {
 		self.visit_spawn_layers(|inner| inner.finalize_spawn_layer())?;
 		self.visit_spawn_layers(|inner| inner.disarm_spawn_cleanup_layer())?;
-		self.visit_spawn_layers(|inner| inner.disarm_job_object_layer())
+
+		let mut owners = 0;
+		let mut identity = None;
+		self.visit_spawn_layers(|inner| {
+			if inner.owns_job_object_cleanup_layer() {
+				owners += 1;
+				identity.get_or_insert_with(|| spawn_layer_identity(inner));
+				Ok(())
+			} else {
+				inner.disarm_job_object_layer()
+			}
+		})?;
+		if owners > 1 {
+			return Err(std::io::Error::other(
+				"multiple child layers own JobObject cleanup",
+			));
+		}
+		Ok(FinalJobOwner { identity })
+	}
+
+	#[cfg(windows)]
+	pub(crate) fn finalize_spawn_final_owner(&mut self, owner: FinalJobOwner) -> Result<()> {
+		let Some(identity) = owner.identity else {
+			return Ok(());
+		};
+		let mut found = false;
+		self.visit_spawn_layers_until(|inner| {
+			if spawn_layer_identity(inner) == identity {
+				inner.disarm_job_object_layer()?;
+				found = true;
+				Ok(true)
+			} else {
+				Ok(false)
+			}
+		})?;
+		if found {
+			Ok(())
+		} else {
+			Err(std::io::Error::other(
+				"the captured JobObject cleanup owner left the child chain",
+			))
+		}
 	}
 
 	/// Try to obtain a reference to the underlying native [`Child`].

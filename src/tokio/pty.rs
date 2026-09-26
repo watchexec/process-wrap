@@ -5,6 +5,7 @@ use std::{
 };
 
 #[cfg(any(
+	windows,
 	target_os = "android",
 	target_os = "dragonfly",
 	target_os = "freebsd",
@@ -15,14 +16,22 @@ use std::{
 	target_os = "openbsd",
 	target_os = "solaris"
 ))]
-use std::{
-	future::Future,
-	process::ExitStatus,
-	sync::{
-		Arc, Mutex,
-		atomic::{AtomicBool, Ordering},
-	},
+use std::sync::{
+	Mutex,
+	atomic::{AtomicBool, Ordering},
 };
+#[cfg(any(
+	target_os = "android",
+	target_os = "dragonfly",
+	target_os = "freebsd",
+	target_os = "illumos",
+	target_os = "linux",
+	target_os = "macos",
+	target_os = "netbsd",
+	target_os = "openbsd",
+	target_os = "solaris"
+))]
+use std::{future::Future, process::ExitStatus, sync::Arc};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(any(
@@ -65,6 +74,7 @@ use super::{Command, CommandWrapper, ProviderProduct, SpawnAttempt, SpawnProvide
 ))]
 mod unix;
 #[cfg(not(any(
+	windows,
 	target_os = "android",
 	target_os = "dragonfly",
 	target_os = "freebsd",
@@ -77,7 +87,6 @@ mod unix;
 )))]
 mod unsupported;
 #[cfg(windows)]
-#[allow(dead_code)]
 mod windows;
 #[cfg(any(
 	target_os = "android",
@@ -92,6 +101,7 @@ mod windows;
 ))]
 use unix as imp;
 #[cfg(not(any(
+	windows,
 	target_os = "android",
 	target_os = "dragonfly",
 	target_os = "freebsd",
@@ -103,6 +113,8 @@ use unix as imp;
 	target_os = "solaris"
 )))]
 use unsupported as imp;
+#[cfg(windows)]
+use windows as imp;
 
 /// A pseudo-terminal spawn provider for Tokio commands.
 ///
@@ -114,8 +126,13 @@ use unsupported as imp;
 /// # use std::io;
 /// use process_wrap::tokio::{Command, Pty};
 /// # fn run() -> io::Result<()> {
+/// #[cfg(unix)]
 /// let mut command = Command::with_new("sh", |command| {
 ///     command.args(["-c", "printf terminal"]);
+/// });
+/// #[cfg(windows)]
+/// let mut command = Command::with_new("cmd.exe", |command| {
+///     command.args(["/d", "/s", "/c", "echo terminal"]);
 /// });
 /// command.wrap(Pty::default());
 /// let mut child = command.spawn()?;
@@ -133,6 +150,23 @@ pub struct Pty {
 }
 
 impl Pty {
+	/// Check whether the selected PTY backend is available on this platform and runtime.
+	///
+	/// This does not validate a [`Pty`] configuration or attempt a spawn. A successful result only
+	/// reports backend capability; a particular spawn can still fail for its command, configuration,
+	/// or environment.
+	pub fn check_supported() -> io::Result<()> {
+		imp::check_available()
+	}
+
+	/// Return whether the selected PTY backend is available on this platform and runtime.
+	///
+	/// This is equivalent to [`Pty::check_supported`].is_ok(). A `true` result does not guarantee a
+	/// particular spawn will succeed.
+	pub fn is_supported() -> bool {
+		Self::check_supported().is_ok()
+	}
+
 	/// Construct a PTY provider with the requested initial terminal size.
 	pub fn new(size: PtySize) -> Self {
 		Self { size }
@@ -156,11 +190,11 @@ impl CommandWrapper for Pty {
 
 impl SpawnProvider for Pty {
 	fn check_available(&self) -> io::Result<()> {
-		imp::check_available()
+		Self::check_supported()
 	}
 
 	fn validate_command(&self, _command: &Command) -> io::Result<()> {
-		self.size.validate()
+		imp::validate_size(self.size)
 	}
 
 	fn validate_attempt(&self, attempt: &SpawnAttempt, _command: &Command) -> io::Result<()> {
@@ -194,8 +228,10 @@ impl SpawnProvider for Pty {
 
 /// The character and pixel dimensions of a pseudo-terminal.
 ///
-/// Character dimensions must both be nonzero. Pixel dimensions may be zero when they are unknown or
-/// not meaningful to the caller. Sizes are validated before spawning and by [`PtyResize::resize`].
+/// Character dimensions must both be nonzero. The Windows backend additionally requires each
+/// character dimension to fit in a signed 16-bit console coordinate (`1..=32767`). Pixel dimensions
+/// may be zero when they are unknown or not meaningful to the caller. Sizes are validated before
+/// spawning and by [`PtyResize::resize`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PtySize {
 	/// Character rows.
@@ -370,6 +406,7 @@ impl PtyController {
 }
 
 #[cfg(any(
+	windows,
 	target_os = "android",
 	target_os = "dragonfly",
 	target_os = "freebsd",
@@ -387,6 +424,7 @@ pub(super) struct ControllerSlot {
 }
 
 #[cfg(any(
+	windows,
 	target_os = "android",
 	target_os = "dragonfly",
 	target_os = "freebsd",

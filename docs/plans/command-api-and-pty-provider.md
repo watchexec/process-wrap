@@ -67,6 +67,8 @@ Keep ordinary `spawn` returning the boxed Tokio child contract.
 Install a private child layer which owns the PTY controller beneath arbitrary outer wrappers.
 Add one-shot controller extraction by traversing the child chain without unwrapping it.
 Keep PTY input and output on the controller and keep native Tokio pipe accessors absent.
+Expose side-effect-free `Pty::check_supported` and `Pty::is_supported` associated functions for platform and runtime capability detection.
+Keep command configuration, wrapper compatibility, and spawn failures outside that capability result so callers do not mistake availability for a spawn guarantee.
 
 ## Unix PTY transport
 
@@ -92,8 +94,11 @@ Carry creation flags, explicit versus temporary suspension, JobObject, and KillO
 ## ConPTY transport
 
 Reuse the existing dynamic ConPTY API resolution, startup attributes, named pipes, manual `CreateProcessW`, custom child, controller, and cleanup modules.
-Integrate them as the Tokio `Pty` provider rather than a separate spawn method.
-Preserve unsupported-runtime precedence and exact command line, environment, cwd, flag, and handle-inheritance semantics.
+Call the native ConPTY API through the `windows` crate rather than introducing another PTY or process abstraction.
+Integrate the transport as the Tokio `Pty` provider rather than a separate spawn method.
+Resolve `CreatePseudoConsole`, `ResizePseudoConsole`, `ReleasePseudoConsole`, and `ClosePseudoConsole` dynamically and preserve unsupported-runtime precedence.
+Require Windows 11 24H2 build 26100 or Windows Server 2025 because descendant-aware output EOF depends on `ReleasePseudoConsole`.
+Preserve exact command line, environment, cwd, flag, and handle-inheritance semantics.
 Retain process and primary-thread handles through JobObject assignment and provider-owned suspension finalization.
 Keep the cleanup guard armed through all wrapper hooks and disarm it only when the provider transaction commits.
 Preserve cancellation-safe repeated waits, post-exit kill behavior, resize, merged I/O, direct-child and job-object kill-on-drop behavior, and off-reactor pseudoconsole closure.
@@ -109,3 +114,44 @@ Preserve the terminal stream, ownership, VEOF, draining, macOS lifecycle, and pr
 Explain that `pty` remains non-default because it selects Tokio and PTY dependencies.
 Remove the rejected public PTY builder, tuple spawn, marker names, fallback-to-pipes wording, and CI-runner prose.
 Document native-only escape behavior and the migration from the former PTY prototype.
+Document ConPTY support, its Windows build floor, and the descendant-aware EOF semantics which require that floor.
+
+## Recovery and completion sequence
+
+### Task 1: Recover the historical ConPTY stack
+
+Treat the shared command family, exact state, attempt lifecycle, spawn providers, Tokio PTY wrapper, Unix transport, and exact Windows command model as the merged foundation on `main`.
+Recover the unpublished ConPTY work by rebasing its logical commits onto that foundation rather than merging the obsolete branch or reconstructing one squashed change.
+Preserve the feature sequence for executable resolution, dynamic API resolution, named pipes, startup ownership, child ownership, controller ownership, exact process creation, and provider integration.
+Preserve the subsequent test and lifecycle-fix commits while omitting the historical correction merge whose other parent is already an ancestor of `main`.
+
+Keep the recovered Windows transport split by responsibility:
+
+- `src/tokio/pty/windows/api.rs` resolves and calls the required ConPTY entry points.
+- `src/tokio/pty/windows/attributes.rs` owns the process-thread startup attribute list.
+- `src/tokio/pty/windows/backend.rs` validates, allocates, and returns the provider product and transaction.
+- `src/tokio/pty/windows/child.rs` owns process handles and cancellation-safe wait state.
+- `src/tokio/pty/windows/console.rs` owns startup release, resize, and off-reactor pseudoconsole closure.
+- `src/tokio/pty/windows/controller.rs` exposes PTY input, output, and resize ownership.
+- `src/tokio/pty/windows/pipe.rs` pairs ConPTY-compatible synchronous endpoints with Tokio-compatible named-pipe endpoints.
+- `src/tokio/pty/windows/program.rs` resolves executables deterministically and rejects direct batch execution.
+- `src/tokio/pty/windows/spawn.rs` performs exact `CreateProcessW` startup and arms process cleanup.
+- `src/tokio/pty/windows/mod.rs` composes those modules with the existing command and environment preparation.
+- `src/tokio/pty.rs` selects the Windows backend.
+- `Cargo.toml` enables only the additional Win32 API features required by the transport.
+
+### Task 2: Add PTY capability queries
+
+Add `Pty::check_supported() -> io::Result<()>` and `Pty::is_supported() -> bool` in `src/tokio/pty.rs` as side-effect-free associated functions.
+Delegate the provider availability callback to the same check so the public query and spawn path cannot drift.
+Keep size validation, command compatibility, wrapper compatibility, and spawn outcomes outside the capability result.
+
+### Task 3: Complete the Windows support documentation
+
+Update `README.md` and crate-level documentation to describe Windows ConPTY support, its Windows 11 24H2 build 26100 or Windows Server 2025 floor, and the same ownership and lifecycle contract as the Unix backend.
+Document capability queries as the supported way to select PTY conditionally without weakening later validation and spawn errors.
+
+### Task 4: Close the implementation plan
+
+Resolve any current-`main` integration gaps in new focused commits rather than folding fixes into the recovered commits.
+When every implementation promise in this plan is present, remove this plan in a standalone `unplan:` commit.

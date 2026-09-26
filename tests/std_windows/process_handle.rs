@@ -1,17 +1,25 @@
 use std::{
 	any::TypeId,
+	fs,
 	os::windows::{
 		io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle},
 		process::ExitStatusExt,
 	},
-	process::{Command, ExitStatus},
+	path::{Path, PathBuf},
+	process::{Command, Command as StdCommand, ExitStatus},
 	sync::{
 		Arc,
 		atomic::{AtomicBool, AtomicUsize, Ordering},
+		mpsc,
 	},
+	time::Instant,
 };
 
-use super::prelude::*;
+use super::{prelude::*, windows_thread::ProcessGuard};
+
+const JOB_WAIT_DESCENDANT_PID: &str = "PROCESS_WRAP_JOB_WAIT_DESCENDANT_PID";
+const JOB_WAIT_DESCENDANT_RELEASE: &str = "PROCESS_WRAP_JOB_WAIT_DESCENDANT_RELEASE";
+const JOB_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -437,5 +445,206 @@ fn job_object_uses_delegated_handle_and_preserves_the_direct_child() -> Result<(
 	assert_eq!(direct_mut_type, TypeId::of::<TransparentChild>());
 	assert_eq!(consumed_type, TypeId::of::<TransparentChild>());
 	assert!(consumed_has_handle);
+	Ok(())
+}
+
+#[derive(Debug)]
+struct ReleaseOnDrop(PathBuf);
+
+impl Drop for ReleaseOnDrop {
+	fn drop(&mut self) {
+		let _ = fs::File::create(&self.0);
+	}
+}
+
+#[derive(Debug)]
+struct WaiterGuard {
+	release_file: PathBuf,
+	thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WaiterGuard {
+	fn join(&mut self) -> Result<()> {
+		if let Some(thread) = self.thread.take() {
+			thread
+				.join()
+				.map_err(|_| std::io::Error::other("JobObject wait thread panicked"))?;
+		}
+		Ok(())
+	}
+}
+
+impl Drop for WaiterGuard {
+	fn drop(&mut self) {
+		let _ = fs::File::create(&self.release_file);
+		if let Some(thread) = self.thread.take() {
+			let _ = thread.join();
+		}
+	}
+}
+
+fn wait_for_pid(path: &Path) -> Result<u32> {
+	let deadline = Instant::now() + JOB_WAIT_TIMEOUT;
+	loop {
+		if let Ok(pid) = fs::read_to_string(path)
+			.and_then(|pid| pid.trim().parse().map_err(std::io::Error::other))
+		{
+			return Ok(pid);
+		}
+		if Instant::now() >= deadline {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::TimedOut,
+				"descendant helper did not report its process ID",
+			));
+		}
+		sleep(Duration::from_millis(10));
+	}
+}
+
+fn wait_for_process_exit(guard: ProcessGuard) -> Result<()> {
+	let deadline = Instant::now() + JOB_WAIT_TIMEOUT;
+	loop {
+		if guard.has_exited()? {
+			return guard.disarm();
+		}
+		if Instant::now() >= deadline {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::TimedOut,
+				"process did not exit before the test deadline",
+			));
+		}
+		sleep(Duration::from_millis(10));
+	}
+}
+
+fn descendant_job_command(pid_file: &Path, release_file: &Path) -> Result<CommandWrap> {
+	Ok(CommandWrap::with_new(std::env::current_exe()?, |command| {
+		command
+			.args([
+				"--exact",
+				"std_windows::process_handle::job_wait_direct_child_helper",
+				"--ignored",
+				"--nocapture",
+			])
+			.env(JOB_WAIT_DESCENDANT_PID, pid_file)
+			.env(JOB_WAIT_DESCENDANT_RELEASE, release_file)
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null());
+	}))
+}
+
+#[test]
+#[ignore = "subprocess helper"]
+fn job_wait_descendant_helper() -> Result<()> {
+	let release = PathBuf::from(
+		std::env::var_os(JOB_WAIT_DESCENDANT_RELEASE)
+			.ok_or_else(|| std::io::Error::other("descendant release path is missing"))?,
+	);
+	let deadline = Instant::now() + JOB_WAIT_TIMEOUT;
+	while !release.exists() {
+		if Instant::now() >= deadline {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::TimedOut,
+				"descendant release was not signaled",
+			));
+		}
+		sleep(Duration::from_millis(10));
+	}
+	Ok(())
+}
+
+#[test]
+#[ignore = "subprocess helper"]
+fn job_wait_direct_child_helper() -> Result<()> {
+	let pid_file = PathBuf::from(
+		std::env::var_os(JOB_WAIT_DESCENDANT_PID)
+			.ok_or_else(|| std::io::Error::other("descendant PID path is missing"))?,
+	);
+	let descendant = StdCommand::new(std::env::current_exe()?)
+		.args([
+			"--exact",
+			"std_windows::process_handle::job_wait_descendant_helper",
+			"--ignored",
+			"--nocapture",
+		])
+		.env(
+			JOB_WAIT_DESCENDANT_RELEASE,
+			std::env::var_os(JOB_WAIT_DESCENDANT_RELEASE)
+				.ok_or_else(|| std::io::Error::other("descendant release path is missing"))?,
+		)
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.spawn()?;
+	fs::write(pid_file, descendant.id().to_string())?;
+	drop(descendant);
+	Ok(())
+}
+
+#[test]
+fn job_waits_for_descendant_after_direct_child_exits() -> Result<()> {
+	let directory = tempfile::tempdir()?;
+	let pid_file = directory.path().join("descendant.pid");
+	let release_file = directory.path().join("release");
+	let _release_on_drop = ReleaseOnDrop(release_file.clone());
+	let mut command = descendant_job_command(&pid_file, &release_file)?;
+	command.wrap(JobObject);
+	let mut child = command.spawn()?;
+	let direct_process = ProcessGuard::open(child.id())?;
+	let descendant_process = ProcessGuard::open(wait_for_pid(&pid_file)?)?;
+	wait_for_process_exit(direct_process)?;
+
+	assert_eq!(
+		child.try_wait()?,
+		None,
+		"direct-child exit must remain pending while the job has a live descendant"
+	);
+
+	let (drain_entered, drain_entry) = mpsc::channel();
+	let (completed, completion) = mpsc::channel();
+	let waiter_release = release_file.clone();
+	let thread = std::thread::spawn(move || {
+		let pending = child.try_wait();
+		let entered = match &pending {
+			Ok(None) => Ok(()),
+			Ok(Some(_)) => Err(std::io::Error::other(
+				"blocking wait setup observed a drained job before release",
+			)),
+			Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+		};
+		let _ = drain_entered.send(entered);
+		let result = match pending {
+			Ok(None) => child.wait(),
+			Ok(Some(status)) => Ok(status),
+			Err(error) => Err(error),
+		};
+		let _ = completed.send((result, child));
+	});
+	let mut waiter = WaiterGuard {
+		release_file: waiter_release,
+		thread: Some(thread),
+	};
+	drain_entry
+		.recv_timeout(JOB_WAIT_TIMEOUT)
+		.map_err(|error| {
+			std::io::Error::new(
+				std::io::ErrorKind::TimedOut,
+				format!("waiter did not enter job drain after a false query: {error}"),
+			)
+		})??;
+	fs::File::create(&release_file)?;
+	let (status, mut child) = completion.recv_timeout(JOB_WAIT_TIMEOUT).map_err(|error| {
+		std::io::Error::new(
+			std::io::ErrorKind::TimedOut,
+			format!("JobObject wait did not finish after descendant release: {error}"),
+		)
+	})?;
+	waiter.join()?;
+	let status = status?;
+	assert!(status.success());
+	assert_eq!(child.try_wait()?, Some(status));
+	assert_eq!(child.wait()?, status);
+	wait_for_process_exit(descendant_process)?;
 	Ok(())
 }

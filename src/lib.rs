@@ -112,7 +112,9 @@
 //!
 //! The non-default `pty` feature selects the Tokio frontend and terminal dependencies. It provides
 //! native transport on Linux, Android, macOS, FreeBSD, NetBSD 10 and newer, OpenBSD, DragonFly BSD,
-//! illumos, and Solaris; unavailable platforms report `std::io::ErrorKind::Unsupported`.
+//! illumos, Solaris, and Windows 11 24H2 (build 26100) or Windows Server 2025. The Windows backend
+//! uses native ConPTY. That Windows floor is required because descendant-aware output EOF requires
+//! `ReleasePseudoConsole`. Unavailable platforms report `std::io::ErrorKind::Unsupported`.
 //!
 //! ```rust,no_run
 //! # #[cfg(feature = "pty")]
@@ -120,8 +122,13 @@
 //! # fn run() -> std::io::Result<()> {
 //! use process_wrap::tokio::{Command, Pty};
 //!
+//! #[cfg(unix)]
 //! let mut command = Command::with_new("sh", |command| {
 //!     command.args(["-c", "printf terminal"]);
+//! });
+//! #[cfg(windows)]
+//! let mut command = Command::with_new("cmd.exe", |command| {
+//!     command.args(["/d", "/s", "/c", "echo terminal"]);
 //! });
 //! command.wrap(Pty::default());
 //! let mut child = command.spawn()?;
@@ -133,6 +140,20 @@
 //! # }
 //! # fn main() {}
 //! ```
+//!
+//! On every supported platform, including Windows, register `Pty` with the same
+//! `Command::wrap(Pty::default()).spawn()` API and take the same `PtyController`. Its ownership and
+//! lifecycle contract below applies on Unix and Windows alike. To select a PTY conditionally, use
+//! `Pty::check_supported()` for a capability result or `Pty::is_supported()` for a boolean. These
+//! report platform and runtime capability only; they do not suppress later configuration,
+//! compatibility, or spawn errors.
+//!
+//! ## Migrating from the former PTY prototype
+//!
+//! Move command and terminal configuration to the shared Tokio `Command` and `Pty` values. Register
+//! that `Pty` as the spawn provider with `.wrap(Pty::default())` (or `.wrap(configured_pty)`), then
+//! use ordinary `.spawn()` and its ordinary boxed-child result. Call `take_pty_controller()` once on
+//! that returned child to obtain terminal I/O and resize control.
 //!
 //! A terminal has one ordered output stream, so PTY standard output and standard error are merged.
 //! Input and output each strongly own the bidirectional master; resize handles are weak. Dropping one
@@ -237,8 +258,8 @@
 //!   lifecycle, and only one registered wrapper may expose one. By default returns `None`.
 //!
 //! Pre-spawn, post-spawn, and child-wrapping hooks all run in registration order and stop at the first
-//! error or panic. The active wrapper remains registered but is temporarily unavailable through
-//! `get_wrap`; peer wrappers remain visible.
+//! error or unwinding panic. The active wrapper remains registered but is temporarily unavailable
+//! through `get_wrap`; peer wrappers remain visible.
 //!
 //! ## Spawn providers
 //!
@@ -259,8 +280,11 @@
 //! Validation rejects unsupported portable policy before operating-system allocation. `spawn`
 //! returns a child satisfying the frontend's complete `ChildWrapper` contract and a fresh, armed
 //! `SpawnTransaction` which owns cleanup independently of the child chain. A later public hook,
-//! wrapper, or commit error/panic causes best-effort rollback while preserving the original failure.
-//! Cleanup before `spawn` returns that product remains the provider's responsibility.
+//! wrapper, or commit error or unwinding panic causes best-effort rollback while preserving the
+//! original failure. Rollback, wrapper restoration, original panic-payload preservation, and
+//! cleanup-diagnostic panic containment apply only to unwinding panics. With `panic=abort`, the
+//! process terminates before those guarantees can run. Cleanup before `spawn` returns that product
+//! remains the provider's responsibility.
 //!
 //! A command may register only one provider; conflicts are rejected before callbacks or allocation.
 //! Providers and wrapper state are reusable across repeated spawns. `spawn_with` and

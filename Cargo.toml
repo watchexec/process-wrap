@@ -44,9 +44,11 @@ windows = { version = "0.62.2", optional = true }
 # as process-wrap is carefully designed to never expose windows's types
 
 [dev-dependencies]
-remoteprocess = "0.5.0"
 tempfile = { version = "3.20.0", default-features = false }
 tokio = { version = "1.38.2", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
+
+[target.'cfg(any(target_os = "freebsd", target_os = "linux", target_os = "macos"))'.dev-dependencies]
+remoteprocess = "0.5.0"
 
 [features]
 default = ["creation-flags", "job-object", "kill-on-drop", "process-group", "process-session", "tracing"]
@@ -67,7 +69,13 @@ pty = [
     "tokio/net",
     "dep:windows",
     "windows/Win32_Globalization",
+    "windows/Win32_Security",
+    "windows/Win32_Storage_FileSystem",
+    "windows/Win32_System_Console",
     "windows/Win32_System_Environment",
+    "windows/Win32_System_LibraryLoader",
+    "windows/Win32_System_Pipes",
+    "windows/Win32_System_SystemInformation",
     "windows/Win32_System_Threading",
 ]
 

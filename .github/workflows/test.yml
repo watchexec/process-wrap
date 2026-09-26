@@ -28,6 +28,9 @@ jobs:
 
     name: "Test on ${{ matrix.platform }} with Rust ${{ matrix.toolchain }} (feat: ${{ matrix.features }})"
     runs-on: "${{ matrix.platform }}-latest"
+    timeout-minutes: 30
+    env:
+      PROCESS_WRAP_EXPECT_CONPTY: "${{ matrix.platform == 'windows' && '1' || '0' }}"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -40,6 +43,11 @@ jobs:
           rustup toolchain install --profile minimal --no-self-update ${{ matrix.toolchain }}
           rustup default ${{ matrix.toolchain }}
           rustup component add clippy
+
+      - name: Report expected ConPTY mode
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: Write-Host "PROCESS_WRAP_EXPECT_CONPTY=$env:PROCESS_WRAP_EXPECT_CONPTY"
 
       - run: tests/multiproc_helper.rs 1 1
 
@@ -67,6 +75,24 @@ jobs:
           rustup default stable
 
       - run: cargo check --locked --no-default-features --lib
+
+  windows-production-features:
+    name: Check Windows production feature closure
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+          rustup target add x86_64-pc-windows-gnu
+
+      - name: Check Tokio JobObject production library
+        run: cargo check --locked --target x86_64-pc-windows-gnu --no-default-features --features tokio1,job-object --lib
 
   # Miri deliberately excludes native process creation and FFI.
   miri-process-free:
@@ -101,6 +127,9 @@ jobs:
 
     name: "Test all features on ${{ matrix.platform }}"
     runs-on: "${{ matrix.platform }}-latest"
+    timeout-minutes: 30
+    env:
+      PROCESS_WRAP_EXPECT_CONPTY: "${{ matrix.platform == 'windows' && '1' || '0' }}"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -113,6 +142,11 @@ jobs:
           rustup toolchain install --profile minimal --no-self-update stable
           rustup default stable
           rustup component add clippy
+
+      - name: Report expected ConPTY mode
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: Write-Host "PROCESS_WRAP_EXPECT_CONPTY=$env:PROCESS_WRAP_EXPECT_CONPTY"
 
       - run: tests/multiproc_helper.rs 1 1
       - run: cargo test --locked --all-features --all-targets
@@ -183,6 +217,10 @@ jobs:
           else
             cargo clippy --locked --target "${{ matrix.target }}" --no-default-features --features pty --lib
           fi
+
+      - name: Compile unsupported PTY integration test
+        if: matrix.target == 'aarch64-apple-ios'
+        run: cargo check --locked --target aarch64-apple-ios --all-features --test tokio_pty_unsupported
 
   rustdoc:
     name: Rustdoc

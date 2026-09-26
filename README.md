@@ -89,8 +89,10 @@ dbg!(status);
 ### or in a pseudo-terminal
 
 The non-default `pty` feature enables Tokio PTY transport on Linux, Android, macOS, FreeBSD,
-NetBSD 10 and newer, OpenBSD, DragonFly BSD, illumos, and Solaris. It implies `tokio1`, selecting
-the Tokio frontend and its terminal dependencies explicitly.
+NetBSD 10 and newer, OpenBSD, DragonFly BSD, illumos, Solaris, and Windows 11 24H2 (build 26100)
+or Windows Server 2025. The Windows backend uses native ConPTY. That Windows floor is required
+because descendant-aware output EOF requires `ReleasePseudoConsole`. The feature implies `tokio1`,
+selecting the Tokio frontend and its terminal dependencies explicitly.
 
 ```toml
 [dependencies]
@@ -98,11 +100,18 @@ process-wrap = { version = "10.0.0", features = ["pty"] }
 ```
 
 ```rust
-use process_wrap::tokio::*;
+use process_wrap::tokio::{Command, Pty};
 use tokio::io::AsyncReadExt;
 
-let mut command = Command::new("ls");
-command.wrap(ProcessSession).wrap(Pty::default());
+#[cfg(unix)]
+let mut command = Command::with_new("sh", |command| {
+  command.args(["-c", "printf terminal"]);
+});
+#[cfg(windows)]
+let mut command = Command::with_new("cmd.exe", |command| {
+  command.args(["/d", "/s", "/c", "echo terminal"]);
+});
+command.wrap(Pty::default());
 let mut child = command.spawn()?;
 let controller = child
   .take_pty_controller()
@@ -119,6 +128,20 @@ let status = child.wait().await?;
 let terminal_bytes = drain.await??;
 dbg!(status, terminal_bytes);
 ```
+
+On every supported platform, including Windows, register `Pty` with the same
+`Command::wrap(Pty::default()).spawn()` API and take the same `PtyController`. The controller has
+the ownership and lifecycle contract described below on Unix and Windows alike. To select a PTY
+conditionally, use `Pty::check_supported()` for a capability result or `Pty::is_supported()` for a
+boolean. These report platform and runtime capability only; they do not suppress later
+configuration, compatibility, or spawn errors.
+
+#### Migrating from the former PTY prototype
+
+Move command and terminal configuration to the shared Tokio `Command` and `Pty` values. Register
+that `Pty` as the spawn provider with `.wrap(Pty::default())` (or `.wrap(configured_pty)`), then use
+ordinary `.spawn()` and its ordinary boxed-child result. Call `take_pty_controller()` once on that
+returned child to obtain terminal I/O and resize control.
 
 A PTY has one ordered terminal stream, so standard output and standard error are merged.
 `PtyInput` and `PtyOutput` are strong owners of one bidirectional master descriptor, so dropping
@@ -340,7 +363,7 @@ The trait provides extension or hook points into the lifecycle of a `Command`:
   only one registered wrapper may expose one.
 
 Pre-spawn, post-spawn, and child-wrapping hooks all run in registration order and stop at the first
-error or panic. The active wrapper remains registered but is temporarily unavailable through
+error or unwinding panic. The active wrapper remains registered but is temporarily unavailable through
 `get_wrap`; peer wrappers remain visible.
 
 ### Spawn providers
@@ -363,8 +386,11 @@ Callbacks run in this order:
 Validation must reject unsupported portable policy before allocating operating-system resources.
 `spawn` returns a child satisfying the frontend's complete `ChildWrapper` contract together with a
 fresh, armed `SpawnTransaction`. The transaction owns cleanup independently of the child chain. A
-later hook, wrapper, or commit error/panic causes best-effort rollback while preserving the original
-failure. Until `spawn` returns the product, cleanup remains the provider's responsibility.
+later hook, wrapper, or commit error or unwinding panic causes best-effort rollback while preserving
+the original failure. Rollback, wrapper restoration, original panic-payload preservation, and
+cleanup-diagnostic panic containment apply only to unwinding panics. With `panic=abort`, the process
+terminates before those guarantees can run. Until `spawn` returns the product, cleanup remains the
+provider's responsibility.
 
 A command may register only one provider; conflicts are rejected before any provider callback or
 operating-system allocation. Both providers and wrapper state are reused across repeated spawns.
