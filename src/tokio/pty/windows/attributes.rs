@@ -1,11 +1,10 @@
 //! Aligned ownership for a pseudo-console process-thread attribute list.
 //!
-//! # External premise
+//! # Supported-Windows ABI assumption
 //!
-//! This module accepts **TCB premise G1**: on every supported Windows target ABI, storage aligned
-//! to `align_of::<usize>()` satisfies the alignment requirement of
-//! `InitializeProcThreadAttributeList` and every later access through
-//! `LPPROC_THREAD_ATTRIBUTE_LIST`. Microsoft documents the byte-size query but publishes no
+//! On every supported Windows target ABI, storage aligned to `align_of::<usize>()` is assumed to
+//! satisfy the alignment requirement of `InitializeProcThreadAttributeList` and every later access
+//! through `LPPROC_THREAD_ATTRIBUTE_LIST`. Microsoft documents the byte-size query but publishes no
 //! independent alignment bound in the
 //! [`InitializeProcThreadAttributeList` contract](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-initializeprocthreadattributelist).
 
@@ -40,8 +39,8 @@ impl AttributeList {
 		let list = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast());
 		// SAFETY: storage starts at an address aligned to align_of::<usize>(), has at least the queried
 		// byte capacity, and remains owned by the returned guard until after
-		// DeleteProcThreadAttributeList runs. TCB premise G1 above supplies the opaque Win32 list's
-		// alignment requirement.
+		// DeleteProcThreadAttributeList runs. The supported-Windows ABI assumption above supplies the
+		// opaque Win32 list's alignment requirement.
 		unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut bytes) }
 			.map_err(io::Error::other)?;
 

@@ -1,10 +1,10 @@
 //! Exact `CreateProcessW` spawning for a prepared ConPTY command.
 //!
-//! # External premise
+//! # ConPTY platform assumption
 //!
-//! This module accepts **TCB premise G2**: process creation with
-//! `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` is an attachment to a new console for the null-standard-
-//! handle replacement rule when `STARTF_USESTDHANDLES` is present. This premise reconciles the
+//! Process creation with `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` is assumed to attach the process to
+//! a new console for the null-standard-handle replacement rule when `STARTF_USESTDHANDLES` is
+//! present. This assumption reconciles the
 //! [`CreateProcessW` contract](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw),
 //! which requires valid standard-handle slots, with the
 //! [`GetStdHandle` contract](https://learn.microsoft.com/en-us/windows/console/getstdhandle), which
@@ -65,9 +65,9 @@ pub(super) fn spawn(
 
 	// SAFETY: every pointer references live, NUL-terminated or explicitly bounded storage for the
 	// duration of the call. The command line is uniquely mutable, the startup attribute list owns its
-	// aligned backing storage, and no native handles are inherited. Under TCB premise G2 above,
-	// STARTF_USESTDHANDLES with three null slots causes ConPTY to install its console handles. The
-	// process-information value is writable output storage.
+	// aligned backing storage, and no native handles are inherited. Under the ConPTY platform
+	// assumption above, STARTF_USESTDHANDLES with three null slots causes ConPTY to install its console
+	// handles. The process-information value is writable output storage.
 	let created = unsafe {
 		CreateProcessW(
 			PCWSTR(command.application_name.as_ptr()),
