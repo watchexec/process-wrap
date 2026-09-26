@@ -716,7 +716,10 @@ mod tests {
 		assert_eq!(Arc::strong_count(&child), 1);
 		assert_eq!(Arc::strong_count(&controller), 1);
 
-		let mut child = child.lock().unwrap();
+		let mut child = Arc::try_unwrap(child)
+			.expect("the committed transaction released its child owner")
+			.into_inner()
+			.unwrap();
 		if child.try_wait().unwrap().is_none() {
 			child.start_kill().expect("terminate transaction child");
 			child.wait().await.expect("reap transaction child");

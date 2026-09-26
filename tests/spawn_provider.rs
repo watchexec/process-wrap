@@ -1655,6 +1655,7 @@ macro_rules! spawn_provider_tests {
 	};
 }
 
+#[cfg(feature = "std")]
 macro_rules! std_shared_process_methods {
 	() => {
 		fn id(&self) -> u32 {
@@ -1673,6 +1674,7 @@ macro_rules! std_shared_process_methods {
 	};
 }
 
+#[cfg(feature = "tokio1")]
 macro_rules! tokio_shared_process_methods {
 	() => {
 		fn id(&self) -> Option<u32> {
@@ -1703,6 +1705,7 @@ macro_rules! tokio_shared_process_methods {
 	};
 }
 
+#[cfg(feature = "std")]
 macro_rules! std_wait_for_child {
 	($runtime:expr, $child:expr) => {{
 		let _ = &$runtime;
@@ -1710,6 +1713,7 @@ macro_rules! std_wait_for_child {
 	}};
 }
 
+#[cfg(feature = "tokio1")]
 macro_rules! tokio_wait_for_child {
 	($runtime:expr, $child:expr) => {
 		$runtime
@@ -1784,6 +1788,7 @@ macro_rules! provider_capability_tests {
 			#[derive(Debug)]
 			struct Provider {
 				drops: Arc<AtomicUsize>,
+				wait_for_completion: bool,
 			}
 
 			impl SpawnProvider for Provider {
@@ -1793,25 +1798,31 @@ macro_rules! provider_capability_tests {
 					_command: &CommandWrap,
 				) -> io::Result<ProviderProduct> {
 					let mut command = <$native_command>::new(std::env::current_exe()?);
+					let child_test = if self.wait_for_completion {
+						concat!(stringify!($module), "::completed_child_process")
+					} else {
+						concat!(stringify!($module), "::live_child_process")
+					};
 					command
-						.args([
-							"--exact",
-							concat!(stringify!($module), "::completed_child_process"),
-							"--nocapture",
-						])
+						.args(["--exact", child_test, "--nocapture"])
 						.stdin(Stdio::piped())
 						.stdout(Stdio::piped())
 						.stderr(Stdio::piped());
+					if !self.wait_for_completion {
+						command.env("PROCESS_WRAP_LIVE_CAPABILITY_CHILD", "1");
+					}
 					let mut child = command.spawn()?;
-					let deadline = Instant::now() + Duration::from_secs(5);
-					while child.try_wait()?.is_none() {
-						if Instant::now() >= deadline {
-							return Err(io::Error::new(
-								io::ErrorKind::TimedOut,
-								"capability child did not exit",
-							));
+					if self.wait_for_completion {
+						let deadline = Instant::now() + Duration::from_secs(5);
+						while child.try_wait()?.is_none() {
+							if Instant::now() >= deadline {
+								return Err(io::Error::new(
+									io::ErrorKind::TimedOut,
+									"capability child did not exit",
+								));
+							}
+							sleep(Duration::from_millis(5));
 						}
-						sleep(Duration::from_millis(5));
 					}
 					Ok(ProviderProduct::new(
 						Box::new(child),
@@ -1871,16 +1882,33 @@ macro_rules! provider_capability_tests {
 				$runtime
 			}
 
-			fn command(drops: Arc<AtomicUsize>) -> CommandWrap {
+			fn command_with_completion(
+				drops: Arc<AtomicUsize>,
+				wait_for_completion: bool,
+			) -> CommandWrap {
 				let mut command = CommandWrap::new("provider-owned-program");
 				command
-					.wrap(ProviderWrapper(Provider { drops }))
+					.wrap(ProviderWrapper(Provider {
+						drops,
+						wait_for_completion,
+					}))
 					.wrap(OuterWrapper);
 				command
 			}
 
+			fn command(drops: Arc<AtomicUsize>) -> CommandWrap {
+				command_with_completion(drops, true)
+			}
+
 			#[test]
 			fn completed_child_process() {}
+
+			#[test]
+			fn live_child_process() {
+				if std::env::var_os("PROCESS_WRAP_LIVE_CAPABILITY_CHILD").is_some() {
+					sleep(Duration::from_secs(30));
+				}
+			}
 
 			#[test]
 			#[cfg_attr(miri, ignore = "requires native child processes")]
@@ -1912,20 +1940,42 @@ macro_rules! provider_capability_tests {
 				assert_eq!(first, second);
 				assert_eq!(child.try_wait().expect("repeat try_wait"), Some(first));
 				assert!(child.try_clone().is_none());
-				#[cfg(windows)]
-				assert!(child.try_process_handle().is_some());
 				drop(child);
 				assert_eq!(drops.load(Ordering::SeqCst), 1);
 
 				let child = command.spawn().expect("spawn child for native extraction");
 				// SAFETY: the process is complete, the transaction has no cleanup resources after commit,
 				// and the forwarding layer owns no supervision state.
-				let mut child =
-					unsafe { child.try_into_inner_child() }.expect("extract native child");
+				let child = unsafe { child.try_into_inner_child() };
+				let mut child = child.expect("extract native child");
 				assert_eq!(drops.load(Ordering::SeqCst), 2);
 				let first = $wait_for_child!(runtime, child).expect("wait extracted native child");
 				let second = $wait_for_child!(runtime, child).expect("repeat extracted child wait");
 				assert_eq!(first, second);
+			}
+
+			#[cfg(windows)]
+			#[test]
+			#[cfg_attr(miri, ignore = "requires native child processes")]
+			fn committed_sidecar_delegates_a_live_process_handle() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let drops = Arc::new(AtomicUsize::new(0));
+				let mut command = command_with_completion(Arc::clone(&drops), false);
+
+				let mut child = command.spawn().expect("spawn live provider child");
+				assert_eq!(drops.load(Ordering::SeqCst), 0);
+				assert!(child.try_process_handle().is_some());
+				child.start_kill().expect("terminate live provider child");
+				let first = $wait_for_child!(runtime, child).expect("reap live provider child");
+				let second = $wait_for_child!(runtime, child).expect("repeat live child wait");
+				assert_eq!(first, second);
+				assert_eq!(
+					child.try_wait().expect("repeat live child try_wait"),
+					Some(first)
+				);
+				drop(child);
+				assert_eq!(drops.load(Ordering::SeqCst), 1);
 			}
 		}
 	};
