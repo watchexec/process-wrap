@@ -3,14 +3,19 @@
 use std::{
 	env,
 	io::{self, Read, Write},
-	os::windows::process::CommandExt,
+	os::windows::{
+		io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle},
+		process::CommandExt,
+	},
 	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Path, PathBuf},
 	process::{ExitStatus, Stdio},
 	sync::{
 		Arc, Mutex,
 		atomic::{AtomicBool, Ordering},
+		mpsc,
 	},
+	thread,
 	time::{Duration, Instant},
 };
 
@@ -37,11 +42,12 @@ use windows::Win32::{
 			GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
 		},
 		Threading::{
-			DETACHED_PROCESS, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-			TerminateProcess, WaitForSingleObject,
+			CreateEventW, DETACHED_PROCESS, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+			SetEvent, TerminateProcess, WaitForSingleObject,
 		},
 	},
 };
+use windows::core::PCWSTR;
 
 #[cfg(all(feature = "creation-flags", feature = "job-object"))]
 #[allow(dead_code)]
@@ -50,6 +56,7 @@ mod windows_thread;
 
 const HELPER_MODE: &str = "PROCESS_WRAP_CONPTY_HELPER";
 const TIMEOUT: Duration = Duration::from_secs(10);
+const DROP_CLEANUP_TIMEOUT_MS: u32 = 1_000;
 
 macro_rules! require_conpty {
 	() => {
@@ -146,8 +153,10 @@ impl Drop for ReleaseOnDrop {
 #[derive(Debug)]
 struct ProcessExitGuard(Option<HANDLE>);
 
-// SAFETY: the guard uniquely owns a process-wide Windows handle. Moving it to another thread
-// transfers that ownership without exposing Rust memory or retaining an alias which could close it.
+// SAFETY: the normal constructor installs a uniquely owned process handle with no thread affinity.
+// Moving the guard transfers sole close authority without exposing Rust memory. The drop regression
+// constructs its event-backed guard only after the independently owned duplicate reaches its worker,
+// so that controlled event handle does not rely on this Send implementation.
 unsafe impl Send for ProcessExitGuard {}
 
 impl ProcessExitGuard {
@@ -186,15 +195,56 @@ impl ProcessExitGuard {
 impl Drop for ProcessExitGuard {
 	fn drop(&mut self) {
 		if let Some(handle) = self.0.take() {
-			// SAFETY: taking the handle removes the guard's only owner. It remains live until the final
-			// CloseHandle below, and all three operations use it only as a process handle.
+			// SAFETY: handle remains live through the close below. In normal use it is the uniquely owned
+			// process handle from OpenProcess. The controlled regression instead supplies a live event
+			// handle, which TerminateProcess rejects without consuming or closing it.
 			unsafe { TerminateProcess(handle, 1) }.ok();
-			// SAFETY: the uniquely owned process handle remains live until the following close.
-			unsafe { WaitForSingleObject(handle, INFINITE) };
-			// SAFETY: this is the sole remaining owner and no subsequent operation uses the handle.
+			// SAFETY: process handles and the regression's event handle are waitable. This guard has sole
+			// close authority for this handle value, which remains live throughout the bounded wait.
+			unsafe { WaitForSingleObject(handle, DROP_CLEANUP_TIMEOUT_MS) };
+			// SAFETY: taking the handle removed the guard's only close owner. The wait has returned, and no
+			// subsequent operation uses this handle value, so this closes it exactly once.
 			unsafe { CloseHandle(handle) }.ok();
 		}
 	}
+}
+
+#[test]
+fn process_exit_guard_drop_is_bounded_when_termination_fails() {
+	// SAFETY: null security attributes and name request a new, unnamed manual-reset event. The
+	// successful call returns one owned handle, transferred exactly once into controller.
+	let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.unwrap();
+	// SAFETY: CreateEventW returned a live, uniquely owned handle, whose ownership is transferred
+	// exactly once here.
+	let controller = unsafe { OwnedHandle::from_raw_handle(event.0) };
+	// try_clone creates a separately owned handle to the same waitable event object. The controller
+	// remains independent so the old infinite drop can always be released before the worker joins.
+	let wait_handle = controller.try_clone().unwrap();
+	let (started, observe_start) = mpsc::channel();
+	let (completed, observe_completion) = mpsc::channel();
+	let worker = thread::spawn(move || {
+		// This controlled regression deliberately transfers an event handle, not a process handle,
+		// into the guard. The event is waitable, TerminateProcess rejects it, and into_raw_handle
+		// transfers the duplicate's sole close authority to the guard.
+		let guard = ProcessExitGuard(Some(HANDLE(wait_handle.into_raw_handle())));
+		started.send(()).unwrap();
+		drop(guard);
+		completed.send(()).unwrap();
+	});
+	observe_start.recv().unwrap();
+
+	let watchdog = Duration::from_millis(u64::from(DROP_CLEANUP_TIMEOUT_MS) * 5);
+	let completion = observe_completion.recv_timeout(watchdog);
+	if completion.is_err() {
+		// SAFETY: controller still owns the live event handle with event-modification access. Signaling
+		// changes the event state without transferring or closing the controller handle.
+		unsafe { SetEvent(HANDLE(controller.as_raw_handle())) }.unwrap();
+	}
+	worker.join().unwrap();
+	assert!(
+		completion.is_ok(),
+		"ProcessExitGuard::drop exceeded its {watchdog:?} watchdog"
+	);
 }
 
 async fn wait_for_process_exit(guard: ProcessExitGuard) -> io::Result<()> {
