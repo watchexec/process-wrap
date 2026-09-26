@@ -51,6 +51,19 @@ mod windows_thread;
 const HELPER_MODE: &str = "PROCESS_WRAP_CONPTY_HELPER";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+macro_rules! require_conpty {
+	() => {
+		match Pty::check_supported() {
+			Ok(()) => {}
+			Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+				eprintln!("skipping ConPTY-dependent test: {error}");
+				return Ok(());
+			}
+			Err(error) => return Err(error),
+		}
+	};
+}
+
 fn helper(mode: &str) -> io::Result<Command> {
 	let mut command = Command::new(env::current_exe()?);
 	command
@@ -355,6 +368,7 @@ fn print_size(output: HANDLE) -> io::Result<()> {
 
 #[tokio::test]
 async fn spawns_with_three_console_standard_handles() -> io::Result<()> {
+	require_conpty!();
 	let mut command = helper("terminal")?;
 	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
@@ -372,6 +386,7 @@ async fn spawns_with_three_console_standard_handles() -> io::Result<()> {
 #[tokio::test]
 async fn exposes_terminal_handles_and_preserves_environment_cwd_and_merged_output() -> io::Result<()>
 {
+	require_conpty!();
 	let directory = tempfile::tempdir()?;
 	let system_root = env::var_os("SystemRoot").expect("Windows must define SystemRoot");
 	let mut command = helper("terminal")?;
@@ -417,6 +432,7 @@ async fn exposes_terminal_handles_and_preserves_environment_cwd_and_merged_outpu
 
 #[tokio::test]
 async fn passes_bidirectional_terminal_bytes() -> io::Result<()> {
+	require_conpty!();
 	let mut command = helper("io")?;
 	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (mut input, mut output, _resize) = controller.into_parts();
@@ -443,6 +459,7 @@ async fn passes_bidirectional_terminal_bytes() -> io::Result<()> {
 
 #[tokio::test]
 async fn reports_initial_size_and_resize() -> io::Result<()> {
+	require_conpty!();
 	let mut command = helper("size")?;
 	let initial = PtySize::new(31, 97)?;
 	let (mut child, controller) = spawn_with_terminal(&mut command, initial)?;
@@ -457,6 +474,7 @@ async fn reports_initial_size_and_resize() -> io::Result<()> {
 
 #[tokio::test]
 async fn canceled_wait_kill_and_repeated_waits_remain_valid() -> io::Result<()> {
+	require_conpty!();
 	let mut command = helper("wait")?;
 	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (input, mut output, _resize) = controller.into_parts();
@@ -478,6 +496,7 @@ async fn canceled_wait_kill_and_repeated_waits_remain_valid() -> io::Result<()> 
 
 #[tokio::test]
 async fn shutting_down_input_releases_its_owner_without_early_hangup() -> io::Result<()> {
+	require_conpty!();
 	let mut command = helper("wait")?;
 	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (mut input, mut output, resize) = controller.into_parts();
@@ -501,6 +520,7 @@ async fn shutting_down_input_releases_its_owner_without_early_hangup() -> io::Re
 
 #[tokio::test]
 async fn dropping_output_keeps_the_terminal_live_while_input_exists() -> io::Result<()> {
+	require_conpty!();
 	let mut command = helper("wait")?;
 	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
 	let (input, mut output, resize) = controller.into_parts();
@@ -519,6 +539,7 @@ async fn dropping_output_keeps_the_terminal_live_while_input_exists() -> io::Res
 
 #[tokio::test]
 async fn direct_child_wait_is_independent_from_descendant_output_eof() -> io::Result<()> {
+	require_conpty!();
 	let directory = tempfile::tempdir()?;
 	let release = directory.path().join("release-descendant");
 	let _release_on_drop = ReleaseOnDrop(release.clone());
@@ -543,6 +564,7 @@ async fn direct_child_wait_is_independent_from_descendant_output_eof() -> io::Re
 
 #[tokio::test]
 async fn failed_spawn_leaves_the_tracked_command_reusable() -> io::Result<()> {
+	require_conpty!();
 	let directory = tempfile::tempdir()?;
 	let executable = directory.path().join("retry-helper.exe");
 	let mut command = Command::new(&executable);
@@ -577,6 +599,7 @@ async fn failed_spawn_leaves_the_tracked_command_reusable() -> io::Result<()> {
 
 #[tokio::test]
 async fn accepts_ordered_raw_argument_fragments() -> io::Result<()> {
+	require_conpty!();
 	let mut command = Command::new(env::current_exe()?);
 	command
 		.arg("--exact")
@@ -603,6 +626,7 @@ async fn accepts_ordered_raw_argument_fragments() -> io::Result<()> {
 #[cfg(feature = "creation-flags")]
 #[tokio::test]
 async fn creation_flags_compose_without_a_job_object() -> io::Result<()> {
+	require_conpty!();
 	use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
 	let mut command = helper("terminal")?;
@@ -627,6 +651,7 @@ async fn creation_flags_compose_without_a_job_object() -> io::Result<()> {
 #[cfg(feature = "job-object")]
 #[tokio::test]
 async fn job_object_resumes_its_temporarily_suspended_primary_thread() -> io::Result<()> {
+	require_conpty!();
 	let mut command = helper("terminal")?;
 	command.wrap(JobObject);
 	let (mut child, controller) = spawn_with_terminal(&mut command, PtySize::default())?;
@@ -649,6 +674,7 @@ async fn job_object_resumes_its_temporarily_suspended_primary_thread() -> io::Re
 #[cfg(all(feature = "creation-flags", feature = "job-object"))]
 #[tokio::test]
 async fn job_object_composes_with_creation_flags_in_both_orders() -> io::Result<()> {
+	require_conpty!();
 	use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
 	for reverse in [false, true] {
@@ -692,6 +718,7 @@ async fn job_object_composes_with_creation_flags_in_both_orders() -> io::Result<
 #[cfg(all(feature = "creation-flags", feature = "job-object"))]
 #[tokio::test]
 async fn job_object_preserves_explicit_suspension() -> io::Result<()> {
+	require_conpty!();
 	use windows::Win32::System::Threading::CREATE_SUSPENDED;
 
 	let mut command = helper("terminal")?;
@@ -750,6 +777,7 @@ async fn assert_killed_on_drop(mut command: Command) -> io::Result<()> {
 #[cfg(feature = "kill-on-drop")]
 #[tokio::test]
 async fn kill_on_drop_terminates_a_conpty_child() -> io::Result<()> {
+	require_conpty!();
 	let mut command = helper("wait")?;
 	command.wrap(KillOnDrop);
 	assert_killed_on_drop(command).await
@@ -758,6 +786,7 @@ async fn kill_on_drop_terminates_a_conpty_child() -> io::Result<()> {
 #[cfg(all(feature = "job-object", feature = "kill-on-drop"))]
 #[tokio::test]
 async fn job_object_composes_with_kill_on_drop_in_both_orders() -> io::Result<()> {
+	require_conpty!();
 	for reverse in [false, true] {
 		for pty_first in [false, true] {
 			let directory = tempfile::tempdir()?;
@@ -923,6 +952,7 @@ impl CommandWrapper for FailLifecycleOnce {
 
 #[tokio::test]
 async fn failed_windows_lifecycle_reaps_the_child_and_remains_reusable() -> io::Result<()> {
+	require_conpty!();
 	for stage in [
 		LifecycleStage::PostSpawn,
 		LifecycleStage::WrapChild,
@@ -1013,25 +1043,40 @@ impl CommandWrapper for MakeAttemptNative {
 }
 
 #[test]
-fn rejects_opaque_base_and_attempt_state() {
+fn rejects_opaque_base_and_attempt_state() -> io::Result<()> {
+	let supported = match Pty::check_supported() {
+		Ok(()) => true,
+		Err(error) if error.kind() == io::ErrorKind::Unsupported => false,
+		Err(error) => return Err(error),
+	};
+
 	let native = tokio::process::Command::new("ignored");
 	let mut command = Command::from(native);
 	command.wrap(Pty::default());
 	let error = command.spawn().unwrap_err();
-	assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-	assert_eq!(
-		error.to_string(),
-		"a spawn provider cannot use a native-only command"
-	);
+	if supported {
+		assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+		assert_eq!(
+			error.to_string(),
+			"a spawn provider cannot use a native-only command"
+		);
+	} else {
+		assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+	}
 
 	let mut command = Command::new("ignored");
 	command.wrap(Pty::default()).wrap(MakeAttemptNative);
 	let error = command.spawn().unwrap_err();
-	assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-	assert_eq!(
-		error.to_string(),
-		"a spawn provider cannot use a native-only spawn attempt"
-	);
+	if supported {
+		assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+		assert_eq!(
+			error.to_string(),
+			"a spawn provider cannot use a native-only spawn attempt"
+		);
+	} else {
+		assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+	}
+	Ok(())
 }
 
 #[test]
@@ -1051,6 +1096,7 @@ fn explicit_spawners_cannot_bypass_pty() {
 
 #[tokio::test]
 async fn duplicate_pty_registration_uses_the_later_size() -> io::Result<()> {
+	require_conpty!();
 	let mut command = helper("size")?;
 	command
 		.wrap(Pty::new(PtySize::new(31, 97)?))
@@ -1067,6 +1113,7 @@ async fn duplicate_pty_registration_uses_the_later_size() -> io::Result<()> {
 
 #[tokio::test]
 async fn provider_and_controller_are_reusable() -> io::Result<()> {
+	require_conpty!();
 	let mut command = helper("terminal")?;
 	command.wrap(Pty::default());
 
@@ -1149,6 +1196,7 @@ impl CommandWrapper for ObserveControllerLifecycle {
 
 #[tokio::test]
 async fn controller_commits_after_hooks_and_traverses_outer_wrappers() -> io::Result<()> {
+	require_conpty!();
 	let post_spawn = Arc::new(AtomicBool::new(false));
 	let wrap_child = Arc::new(AtomicBool::new(false));
 	let mut command = helper("terminal")?;
@@ -1186,6 +1234,7 @@ impl CommandWrapper for PortableWrapper {
 
 #[tokio::test]
 async fn portable_custom_wrappers_compose_with_conpty() -> io::Result<()> {
+	require_conpty!();
 	let called = Arc::new(AtomicBool::new(false));
 	let mut command = helper("terminal")?;
 	command
