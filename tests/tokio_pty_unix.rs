@@ -17,6 +17,8 @@
 use std::any::TypeId;
 #[cfg(feature = "reset-sigmask")]
 use std::os::unix::process::ExitStatusExt;
+#[cfg(any(feature = "process-group", feature = "process-session"))]
+use std::time::Instant;
 use std::{io, process::ExitStatus, time::Duration};
 
 #[cfg(all(feature = "kill-on-drop", feature = "process-session"))]
@@ -400,6 +402,58 @@ async fn cancelling_wait_preserves_child_ownership() -> io::Result<()> {
 struct ReapBeforeChildWrapping;
 
 #[cfg(any(feature = "process-group", feature = "process-session"))]
+const SYNCHRONOUS_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(feature = "process-group", feature = "process-session"))]
+const SYNCHRONOUS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(any(feature = "process-group", feature = "process-session"))]
+const SYNCHRONOUS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[cfg(any(feature = "process-group", feature = "process-session"))]
+fn poll_until_exit<T>(
+	timeout: Duration,
+	mut try_wait: impl FnMut() -> io::Result<Option<T>>,
+) -> io::Result<bool> {
+	let deadline = Instant::now() + timeout;
+	loop {
+		if try_wait()?.is_some() {
+			return Ok(true);
+		}
+		let now = Instant::now();
+		if now >= deadline {
+			return Ok(false);
+		}
+		std::thread::sleep(SYNCHRONOUS_POLL_INTERVAL.min(deadline - now));
+	}
+}
+
+#[cfg(any(feature = "process-group", feature = "process-session"))]
+fn wait_for_provider_child_exit(child: &mut dyn ChildWrapper, stage: &str) -> io::Result<()> {
+	if poll_until_exit(SYNCHRONOUS_POLL_TIMEOUT, || child.try_wait())? {
+		return Ok(());
+	}
+
+	let pid = child.id();
+	let kill_error = child.start_kill().err();
+	let reaped = poll_until_exit(SYNCHRONOUS_CLEANUP_TIMEOUT, || child.try_wait())?;
+	let process = pid.map_or_else(
+		|| "child with unknown PID".to_owned(),
+		|pid| format!("PID {pid}"),
+	);
+	let cleanup = if reaped {
+		"the provider child exited after a kill request; transaction rollback remains armed"
+			.to_owned()
+	} else if let Some(error) = kill_error {
+		format!("best-effort kill failed ({error}); transaction rollback remains armed")
+	} else {
+		"bounded cleanup did not observe exit; transaction rollback remains armed".to_owned()
+	};
+	Err(io::Error::new(
+		io::ErrorKind::TimedOut,
+		format!("{stage} timed out waiting for {process}; {cleanup}"),
+	))
+}
+
+#[cfg(any(feature = "process-group", feature = "process-session"))]
 impl CommandWrapper for ReapBeforeChildWrapping {
 	fn post_spawn(
 		&mut self,
@@ -407,12 +461,10 @@ impl CommandWrapper for ReapBeforeChildWrapping {
 		child: &mut dyn ChildWrapper,
 		_command: &Command,
 	) -> io::Result<()> {
-		loop {
-			if child.try_wait()?.is_some() {
-				return Ok(());
-			}
-			std::thread::yield_now();
-		}
+		wait_for_provider_child_exit(
+			child,
+			"post_spawn PTY child reaping before wrapper installation",
+		)
 	}
 }
 

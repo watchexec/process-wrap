@@ -18,7 +18,7 @@ use std::mem::MaybeUninit;
 use std::{
 	io,
 	panic::{AssertUnwindSafe, catch_unwind, panic_any},
-	sync::{Arc, Mutex},
+	sync::{Arc, Mutex, mpsc},
 	time::{Duration, Instant},
 };
 
@@ -281,6 +281,131 @@ async fn controller_is_committed_after_child_wrapping_hooks() -> io::Result<()> 
 #[derive(Debug)]
 struct SpawnPostAttempt;
 
+const SYNCHRONOUS_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+const SYNCHRONOUS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+const SYNCHRONOUS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn poll_until_exit<T>(
+	timeout: Duration,
+	mut try_wait: impl FnMut() -> io::Result<Option<T>>,
+) -> io::Result<bool> {
+	let deadline = Instant::now() + timeout;
+	loop {
+		if try_wait()?.is_some() {
+			return Ok(true);
+		}
+		let now = Instant::now();
+		if now >= deadline {
+			return Ok(false);
+		}
+		std::thread::sleep(SYNCHRONOUS_POLL_INTERVAL.min(deadline - now));
+	}
+}
+
+fn polling_timeout(stage: &str, pid: Option<u32>, cleanup: &str) -> io::Error {
+	let process = pid.map_or_else(
+		|| "child with unknown PID".to_owned(),
+		|pid| format!("PID {pid}"),
+	);
+	io::Error::new(
+		io::ErrorKind::TimedOut,
+		format!("{stage} timed out waiting for {process}; {cleanup}"),
+	)
+}
+
+fn wait_for_native_probe_exit(
+	probe: &mut tokio::process::Child,
+	timeout: Duration,
+	stage: &str,
+) -> io::Result<()> {
+	if poll_until_exit(timeout, || probe.try_wait())? {
+		return Ok(());
+	}
+
+	let pid = probe.id();
+	let kill_error = probe.start_kill().err();
+	let reaped = poll_until_exit(SYNCHRONOUS_CLEANUP_TIMEOUT, || probe.try_wait())?;
+	let cleanup = if reaped {
+		"the directly owned child was reaped after a kill request".to_owned()
+	} else if let Some(error) = kill_error {
+		format!("kill failed ({error}) and the directly owned child was not reaped")
+	} else {
+		"the directly owned child did not become reapable after a kill request".to_owned()
+	};
+	Err(polling_timeout(stage, pid, &cleanup))
+}
+
+fn wait_for_provider_child_exit(
+	child: &mut dyn ChildWrapper,
+	timeout: Duration,
+	stage: &str,
+) -> io::Result<()> {
+	if poll_until_exit(timeout, || child.try_wait())? {
+		return Ok(());
+	}
+
+	let pid = child.id();
+	let kill_error = child.start_kill().err();
+	let reaped = poll_until_exit(SYNCHRONOUS_CLEANUP_TIMEOUT, || child.try_wait())?;
+	let cleanup = if reaped {
+		"the provider child exited after a kill request; transaction rollback remains armed"
+			.to_owned()
+	} else if let Some(error) = kill_error {
+		format!("best-effort kill failed ({error}); transaction rollback remains armed")
+	} else {
+		"bounded cleanup did not observe exit; transaction rollback remains armed".to_owned()
+	};
+	Err(polling_timeout(stage, pid, &cleanup))
+}
+
+#[tokio::test]
+async fn synchronous_native_probe_polling_times_out_and_reaps() -> io::Result<()> {
+	let mut command = tokio::process::Command::new("sh");
+	command.args(["-c", "while :; do sleep 1; done"]);
+	let child = command.spawn()?;
+	let pid = child.id().expect("the long-lived probe has a PID");
+	let (finished, finished_rx) = mpsc::channel();
+	let worker = std::thread::spawn(move || {
+		let mut child = child;
+		let result = wait_for_native_probe_exit(
+			&mut child,
+			Duration::from_millis(50),
+			"controlled native probe",
+		);
+		let reaped = child.try_wait();
+		finished.send((result, reaped)).unwrap();
+	});
+
+	let report = match finished_rx.recv_timeout(Duration::from_secs(2)) {
+		Ok(report) => report,
+		Err(mpsc::RecvTimeoutError::Timeout) => {
+			// SAFETY: `pid` identifies the still-live controlled child; this external release keeps the
+			// unbounded mutation from leaking its process or worker thread.
+			unsafe { libc::kill(i32::try_from(pid).unwrap(), libc::SIGKILL) };
+			finished_rx
+				.recv_timeout(Duration::from_secs(2))
+				.expect("the externally released polling worker returns")
+		}
+		Err(mpsc::RecvTimeoutError::Disconnected) => {
+			panic!("the polling worker disconnected without a result")
+		}
+	};
+	worker.join().unwrap();
+
+	let error = report
+		.0
+		.expect_err("the local polling deadline must expire for a long-lived child");
+	assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+	let message = error.to_string();
+	assert!(message.contains("controlled native probe"));
+	assert!(message.contains(&format!("PID {pid}")));
+	assert!(
+		report.1?.is_some(),
+		"the directly owned probe must be reaped before timeout returns"
+	);
+	Ok(())
+}
+
 impl CommandWrapper for SpawnPostAttempt {
 	fn post_spawn(
 		&mut self,
@@ -289,12 +414,11 @@ impl CommandWrapper for SpawnPostAttempt {
 		_command: &Command,
 	) -> io::Result<()> {
 		let mut probe = attempt.native_mut().spawn()?;
-		loop {
-			if probe.try_wait()?.is_some() {
-				return Ok(());
-			}
-			std::thread::yield_now();
-		}
+		wait_for_native_probe_exit(
+			&mut probe,
+			SYNCHRONOUS_POLL_TIMEOUT,
+			"post_spawn native probe",
+		)
 	}
 }
 
@@ -494,12 +618,12 @@ impl CommandWrapper for ReapThenFail {
 			.pid
 			.lock()
 			.unwrap_or_else(std::sync::PoisonError::into_inner) = child.id();
-		loop {
-			if child.try_wait()?.is_some() {
-				return Err(io::Error::other("fail after reaping PTY child"));
-			}
-			std::thread::yield_now();
-		}
+		wait_for_provider_child_exit(
+			child,
+			SYNCHRONOUS_POLL_TIMEOUT,
+			"post_spawn PTY child reaping",
+		)?;
+		Err(io::Error::other("fail after reaping PTY child"))
 	}
 }
 
