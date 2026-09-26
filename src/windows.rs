@@ -101,6 +101,20 @@ mod job_wait_tests {
 	const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
 
 	#[test]
+	fn finite_timeout_milliseconds_never_uses_infinite() {
+		assert_eq!(finite_timeout_millis(Duration::ZERO), 0);
+		assert_eq!(finite_timeout_millis(Duration::from_millis(17)), 17);
+		assert_eq!(
+			finite_timeout_millis(Duration::from_millis(u64::from(u32::MAX))),
+			u32::MAX - 1
+		);
+		assert_eq!(
+			finite_timeout_millis(Duration::from_millis(u64::from(u32::MAX) + 1)),
+			u32::MAX - 1
+		);
+	}
+
+	#[test]
 	fn nonterminal_completion_packet_does_not_report_job_drain() {
 		// SAFETY: these arguments create a new completion port which is immediately owned below.
 		let raw = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1) }.unwrap();
@@ -325,6 +339,14 @@ fn job_is_drained(job: JobHandle) -> Result<bool> {
 	Ok(accounting.ActiveProcesses == 0)
 }
 
+fn finite_timeout_millis(timeout: Duration) -> u32 {
+	timeout
+		.as_millis()
+		.try_into()
+		.unwrap_or(u32::MAX - 1)
+		.min(u32::MAX - 1)
+}
+
 fn poll_job_drain_with(
 	completion_port: BorrowedHandle<'_>,
 	timeout: Duration,
@@ -337,7 +359,7 @@ fn poll_job_drain_with(
 	let mut code = 0;
 	let mut key = 0;
 	let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
-	let timeout_ms = timeout.as_millis().try_into().unwrap_or(u32::MAX - 1);
+	let timeout_ms = finite_timeout_millis(timeout);
 
 	// SAFETY: `completion_port` is lifetime-bound to a live owned handle, and every output pointer
 	// refers to initialized writable stack storage for the duration of the call. The finite timeout

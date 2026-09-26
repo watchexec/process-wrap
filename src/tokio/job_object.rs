@@ -5,7 +5,7 @@ use std::{
 	os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle},
 	pin::Pin,
 	process::ExitStatus,
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 #[cfg(feature = "tracing")]
@@ -180,6 +180,7 @@ pub struct JobObjectChild {
 	inner: Box<dyn ChildWrapper>,
 	exit_status: ChildExitStatus,
 	job_drained: bool,
+	poll_cadence: Option<tokio::task::JoinHandle<()>>,
 	job_port: JobPort,
 	final_kill_on_drop: bool,
 	spawn_finalized: bool,
@@ -196,9 +197,39 @@ impl JobObjectChild {
 			inner,
 			exit_status: ChildExitStatus::Running,
 			job_drained: false,
+			poll_cadence: None,
 			job_port,
 			final_kill_on_drop,
 			spawn_finalized: false,
+		}
+	}
+
+	fn arm_poll_cadence(&mut self, elapsed: Duration) {
+		debug_assert!(self.poll_cadence.is_none());
+		let remaining = JOB_POLL_INTERVAL.saturating_sub(elapsed);
+		if !remaining.is_zero() {
+			// The blocking task owns only inert timing data. In particular, it cannot prolong or
+			// outlive any borrow of the JobObject or completion-port handles.
+			self.poll_cadence = Some(tokio::task::spawn_blocking(move || {
+				std::thread::sleep(remaining);
+			}));
+		}
+	}
+
+	async fn wait_for_poll_cadence(&mut self) -> Result<()> {
+		let Some(cadence) = self.poll_cadence.as_mut() else {
+			return Ok(());
+		};
+		let result = cadence.await;
+		self.poll_cadence = None;
+		result.map_err(Error::other)
+	}
+
+	fn clear_poll_cadence(&mut self) {
+		if let Some(cadence) = self.poll_cadence.take() {
+			// `abort` can prevent a queued blocking task from starting. If it has started, Tokio
+			// lets the short sleep finish detached; its closure owns no native resource.
+			cadence.abort();
 		}
 	}
 }
@@ -263,6 +294,10 @@ impl ChildWrapper for JobObjectChild {
 			};
 
 			while !self.job_drained {
+				// A canceled wait leaves this handle in `self`, so its successor cannot poll again
+				// until the already-armed cadence completes.
+				self.wait_for_poll_cadence().await?;
+				let poll_started = Instant::now();
 				if poll_job_drain(
 					self.job_port.job,
 					self.job_port.completion_port.as_handle(),
@@ -273,9 +308,10 @@ impl ChildWrapper for JobObjectChild {
 					// No await occurs between the authoritative accounting result and this durable
 					// transition, so a canceled future cannot consume the drain state.
 					self.job_drained = true;
+					self.clear_poll_cadence();
 					break;
 				}
-				tokio::time::sleep(JOB_POLL_INTERVAL).await;
+				self.arm_poll_cadence(poll_started.elapsed());
 			}
 			Ok(status)
 		})
@@ -299,6 +335,7 @@ impl ChildWrapper for JobObjectChild {
 			.is_break()
 		{
 			self.job_drained = true;
+			self.clear_poll_cadence();
 		}
 
 		match (self.exit_status, self.job_drained) {

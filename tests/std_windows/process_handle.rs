@@ -457,6 +457,32 @@ impl Drop for ReleaseOnDrop {
 	}
 }
 
+#[derive(Debug)]
+struct WaiterGuard {
+	release_file: PathBuf,
+	thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WaiterGuard {
+	fn join(&mut self) -> Result<()> {
+		if let Some(thread) = self.thread.take() {
+			thread
+				.join()
+				.map_err(|_| std::io::Error::other("JobObject wait thread panicked"))?;
+		}
+		Ok(())
+	}
+}
+
+impl Drop for WaiterGuard {
+	fn drop(&mut self) {
+		let _ = fs::File::create(&self.release_file);
+		if let Some(thread) = self.thread.take() {
+			let _ = thread.join();
+		}
+	}
+}
+
 fn wait_for_pid(path: &Path) -> Result<u32> {
 	let deadline = Instant::now() + JOB_WAIT_TIMEOUT;
 	loop {
@@ -575,15 +601,38 @@ fn job_waits_for_descendant_after_direct_child_exits() -> Result<()> {
 		"direct-child exit must remain pending while the job has a live descendant"
 	);
 
+	let (drain_entered, drain_entry) = mpsc::channel();
 	let (completed, completion) = mpsc::channel();
-	let waiter = std::thread::spawn(move || {
-		let result = child.wait();
+	let waiter_release = release_file.clone();
+	let thread = std::thread::spawn(move || {
+		let pending = child.try_wait();
+		let entered = match &pending {
+			Ok(None) => Ok(()),
+			Ok(Some(_)) => Err(std::io::Error::other(
+				"blocking wait setup observed a drained job before release",
+			)),
+			Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+		};
+		let _ = drain_entered.send(entered);
+		let result = match pending {
+			Ok(None) => child.wait(),
+			Ok(Some(status)) => Ok(status),
+			Err(error) => Err(error),
+		};
 		let _ = completed.send((result, child));
 	});
-	assert!(
-		completion.recv_timeout(Duration::from_millis(100)).is_err(),
-		"blocking JobObject wait returned while the descendant remained alive"
-	);
+	let mut waiter = WaiterGuard {
+		release_file: waiter_release,
+		thread: Some(thread),
+	};
+	drain_entry
+		.recv_timeout(JOB_WAIT_TIMEOUT)
+		.map_err(|error| {
+			std::io::Error::new(
+				std::io::ErrorKind::TimedOut,
+				format!("waiter did not enter job drain after a false query: {error}"),
+			)
+		})??;
 	fs::File::create(&release_file)?;
 	let (status, mut child) = completion.recv_timeout(JOB_WAIT_TIMEOUT).map_err(|error| {
 		std::io::Error::new(
@@ -591,9 +640,7 @@ fn job_waits_for_descendant_after_direct_child_exits() -> Result<()> {
 			format!("JobObject wait did not finish after descendant release: {error}"),
 		)
 	})?;
-	waiter
-		.join()
-		.map_err(|_| std::io::Error::other("JobObject wait thread panicked"))?;
+	waiter.join()?;
 	let status = status?;
 	assert!(status.success());
 	assert_eq!(child.try_wait()?, Some(status));
