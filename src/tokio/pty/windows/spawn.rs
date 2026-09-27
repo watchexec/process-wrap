@@ -400,8 +400,9 @@ impl PendingDiagnostics {
 						);
 					});
 				}));
-				if result.is_ok() {
-					emitted.push(diagnostic.id);
+				match result {
+					Ok(()) => emitted.push(diagnostic.id),
+					Err(payload) => std::mem::forget(payload),
 				}
 			}
 			let mut state = self
@@ -431,11 +432,16 @@ impl PendingDiagnostics {
 
 	#[cfg(all(test, feature = "tracing"))]
 	fn len(&self) -> usize {
-		self.state
+		self.snapshot().2
+	}
+
+	#[cfg(all(test, feature = "tracing"))]
+	fn snapshot(&self) -> (bool, bool, usize) {
+		let state = self
+			.state
 			.lock()
-			.unwrap_or_else(std::sync::PoisonError::into_inner)
-			.pending
-			.len()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		(state.emitting, state.queued, state.pending.len())
 	}
 }
 
@@ -964,11 +970,27 @@ mod tests {
 	}
 
 	#[cfg(feature = "tracing")]
-	#[derive(Clone, Copy, Debug)]
+	#[derive(Debug)]
 	enum SubscriberBehavior {
 		Block,
 		Panic,
+		PanicDrop {
+			fired: std::sync::atomic::AtomicBool,
+			drops: Arc<AtomicUsize>,
+		},
 		Record,
+	}
+
+	#[cfg(feature = "tracing")]
+	#[derive(Debug)]
+	struct PanickingDiagnosticPayload(Arc<AtomicUsize>);
+
+	#[cfg(feature = "tracing")]
+	impl Drop for PanickingDiagnosticPayload {
+		fn drop(&mut self) {
+			self.0.fetch_add(1, Ordering::SeqCst);
+			panic_any("a caught diagnostic panic payload was dropped");
+		}
 	}
 
 	#[cfg(feature = "tracing")]
@@ -1063,13 +1085,18 @@ mod tests {
 				.unwrap_or_else(std::sync::PoisonError::into_inner);
 			gate.events += 1;
 			self.state.changed.notify_all();
-			match self.state.behavior {
+			match &self.state.behavior {
 				SubscriberBehavior::Block => {
 					while !gate.released {
 						gate = self.state.changed.wait(gate).unwrap();
 					}
 				}
 				SubscriberBehavior::Panic => panic!("injected cleanup diagnostic panic"),
+				SubscriberBehavior::PanicDrop { fired, drops } => {
+					if !fired.swap(true, Ordering::SeqCst) {
+						panic_any(PanickingDiagnosticPayload(Arc::clone(drops)));
+					}
+				}
 				SubscriberBehavior::Record => {}
 			}
 		}
@@ -1112,6 +1139,14 @@ mod tests {
 	struct ReaperGate {
 		signaled: bool,
 		waiters: usize,
+	}
+
+	struct ActiveDiagnosticThread<'a>(&'a AtomicUsize);
+
+	impl Drop for ActiveDiagnosticThread<'_> {
+		fn drop(&mut self) {
+			self.0.fetch_sub(1, Ordering::SeqCst);
+		}
 	}
 
 	struct TestState {
@@ -1329,13 +1364,11 @@ mod tests {
 						.active_diagnostic_threads
 						.fetch_add(1, Ordering::SeqCst)
 						+ 1;
+					let _active = ActiveDiagnosticThread(&state.active_diagnostic_threads);
 					state
 						.max_active_diagnostic_threads
 						.fetch_max(active, Ordering::SeqCst);
 					task();
-					state
-						.active_diagnostic_threads
-						.fetch_sub(1, Ordering::SeqCst);
 				})
 				.map(drop)
 		}
@@ -1629,6 +1662,52 @@ mod tests {
 		assert_eq!(operations.queued_diagnostics_len(), 0);
 		assert_eq!(operations.max_active_diagnostic_threads(), 1);
 		assert_eq!(subscriber.event_count(), 1);
+	}
+
+	#[cfg(feature = "tracing")]
+	#[test]
+	fn panicking_drop_diagnostic_payload_is_quarantined_and_retried() {
+		let operations = TestOperations::new(None, [WaitPlan::Timeout, WaitPlan::Signaled], 1);
+		let payload_drops = Arc::new(AtomicUsize::new(0));
+		let subscriber = SubscriberState::new(SubscriberBehavior::PanicDrop {
+			fired: std::sync::atomic::AtomicBool::new(false),
+			drops: Arc::clone(&payload_drops),
+		});
+		let dispatch = diagnostic_dispatch(Arc::clone(&subscriber));
+		let (process, raw, released) = tracked_handle();
+		let diagnostics = process.pending_diagnostics();
+
+		let error = tracing::dispatcher::with_default(&dispatch, || {
+			terminate_and_reap_with(process, operations.clone())
+		})
+		.expect_err("the first reaper start failure remains the primary result");
+		assert_eq!(error.to_string(), "injected ConPTY reaper start failure");
+		subscriber.wait_for_event();
+		operations.wait_for_no_diagnostic_threads();
+		assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
+		assert_eq!(diagnostics.snapshot(), (false, true, 1));
+		assert_eq!(operations.queued_diagnostics_len(), 1);
+		assert_eq!(operations.quarantine_len(), 1);
+		assert_not_released(&released);
+
+		let (next, next_raw, next_released) = tracked_handle();
+		tracing::dispatcher::with_default(&dispatch, || {
+			terminate_and_reap_with(next, operations.clone())
+		})
+		.expect("the later cleanup retains its own primary result");
+		operations.wait_for_reaper();
+		subscriber.wait_for_events(2);
+		operations.wait_for_no_diagnostic_threads();
+		assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
+		assert_eq!(diagnostics.snapshot(), (false, false, 0));
+		assert_eq!(operations.queued_diagnostics_len(), 0);
+		assert_eq!(operations.quarantine_len(), 0);
+		assert_eq!(operations.max_active_diagnostic_threads(), 1);
+		assert_released(&next_released, next_raw);
+		assert_not_released(&released);
+
+		operations.signal_reapers();
+		assert_released(&released, raw);
 	}
 
 	#[cfg(feature = "tracing")]

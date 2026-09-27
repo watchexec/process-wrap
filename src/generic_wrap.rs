@@ -1630,17 +1630,17 @@ macro_rules! Wrap {
 			) -> ::std::result::Result<(), SpawnFailure> {
 				let len = self.wrapper_registry().wrappers.len();
 				for index in 0..len {
-					#[cfg(feature = "tracing")]
-					{
-						let id = self
-							.wrapper_registry()
-							.wrappers
-							.get_index(index)
-							.expect("wrapper indices cannot disappear during ordered hook traversal")
-							.0;
-						::tracing::debug!(?id, "prepare_child");
-					}
 					let value = Self::capture_io(|| {
+						#[cfg(feature = "tracing")]
+						{
+							let id = self
+								.wrapper_registry()
+								.wrappers
+								.get_index(index)
+								.expect("wrapper indices cannot disappear during ordered hook traversal")
+								.0;
+							::tracing::debug!(?id, "prepare_child");
+						}
 						self.with_wrapper_at(index, |wrapper, command| {
 							wrapper.prepare_child(attempt, child, command)
 						})
@@ -1659,17 +1659,17 @@ macro_rules! Wrap {
 			) -> ::std::result::Result<(), SpawnFailure> {
 				let len = self.wrapper_registry().wrappers.len();
 				for index in 0..len {
-					#[cfg(feature = "tracing")]
-					{
-						let id = self
-							.wrapper_registry()
-							.wrappers
-							.get_index(index)
-							.expect("wrapper indices cannot disappear during ordered hook traversal")
-							.0;
-						::tracing::debug!(?id, "post_spawn");
-					}
 					Self::capture_io(|| {
+						#[cfg(feature = "tracing")]
+						{
+							let id = self
+								.wrapper_registry()
+								.wrappers
+								.get_index(index)
+								.expect("wrapper indices cannot disappear during ordered hook traversal")
+								.0;
+							::tracing::debug!(?id, "post_spawn");
+						}
 						self.with_wrapper_at(index, |wrapper, command| {
 							wrapper.post_spawn(attempt, child, command)
 						})
@@ -1688,17 +1688,17 @@ macro_rules! Wrap {
 			) -> ::std::result::Result<(), SpawnFailure> {
 				let len = self.wrapper_registry().wrappers.len();
 				for index in 0..len {
-					#[cfg(feature = "tracing")]
-					{
-						let id = self
-							.wrapper_registry()
-							.wrappers
-							.get_index(index)
-							.expect("wrapper indices cannot disappear during ordered hook traversal")
-							.0;
-						::tracing::debug!(?id, "wrap_child");
-					}
 					let layer = Self::capture_io(|| {
+						#[cfg(feature = "tracing")]
+						{
+							let id = self
+								.wrapper_registry()
+								.wrappers
+								.get_index(index)
+								.expect("wrapper indices cannot disappear during ordered hook traversal")
+								.0;
+							::tracing::debug!(?id, "wrap_child");
+						}
 						self.with_wrapper_at(index, |wrapper, command| {
 							let child = child
 								.as_deref_mut()

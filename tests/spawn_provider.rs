@@ -3,6 +3,113 @@
 #[path = "support/bounded_process.rs"]
 mod bounded_process;
 
+#[cfg(feature = "tracing")]
+mod lifecycle_tracing {
+	use std::{
+		fmt,
+		sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering},
+		},
+	};
+
+	use tracing::{
+		Event, Metadata, Subscriber,
+		field::{Field, Visit},
+		span::{Attributes, Id, Record},
+	};
+
+	#[derive(Debug)]
+	pub struct LifecyclePanic(pub Arc<()>);
+
+	#[derive(Debug)]
+	pub struct PanicOnLifecycleEvent {
+		message: &'static str,
+		match_count: AtomicUsize,
+		panic_on_match: usize,
+		identity: Arc<()>,
+	}
+
+	impl PanicOnLifecycleEvent {
+		pub fn dispatch(
+			message: &'static str,
+			panic_on_match: usize,
+			identity: Arc<()>,
+		) -> tracing::Dispatch {
+			tracing::Dispatch::new(Self {
+				message,
+				match_count: AtomicUsize::new(0),
+				panic_on_match,
+				identity,
+			})
+		}
+	}
+
+	pub fn serial() -> std::sync::MutexGuard<'static, ()> {
+		static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+		LOCK.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	pub fn with_dispatch<R>(dispatch: &tracing::Dispatch, invoke: impl FnOnce() -> R) -> R {
+		tracing::dispatcher::with_default(dispatch, || {
+			tracing::callsite::rebuild_interest_cache();
+			invoke()
+		})
+	}
+
+	#[derive(Default)]
+	struct MessageVisitor {
+		message: Option<String>,
+	}
+
+	impl Visit for MessageVisitor {
+		fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+			if field.name() == "message" {
+				self.message = Some(format!("{value:?}"));
+			}
+		}
+	}
+
+	impl Subscriber for PanicOnLifecycleEvent {
+		fn register_callsite(
+			&self,
+			_metadata: &'static Metadata<'static>,
+		) -> tracing::subscriber::Interest {
+			tracing::subscriber::Interest::always()
+		}
+
+		fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+			true
+		}
+
+		fn new_span(&self, _span: &Attributes<'_>) -> Id {
+			Id::from_u64(1)
+		}
+
+		fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+		fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+		fn event(&self, event: &Event<'_>) {
+			let mut visitor = MessageVisitor::default();
+			event.record(&mut visitor);
+			if visitor.message.as_deref() != Some(self.message) {
+				return;
+			}
+			let matched = self.match_count.fetch_add(1, Ordering::SeqCst) + 1;
+			if matched == self.panic_on_match {
+				std::panic::panic_any(LifecyclePanic(Arc::clone(&self.identity)));
+			}
+		}
+
+		fn enter(&self, _span: &Id) {}
+
+		fn exit(&self, _span: &Id) {}
+	}
+}
+
 macro_rules! spawn_provider_tests {
 	(
 		$module:ident,
@@ -2207,6 +2314,203 @@ macro_rules! spawn_provider_tests {
 				}
 			}
 
+			#[cfg(feature = "tracing")]
+			#[test]
+			fn lifecycle_event_panics_roll_back_exactly_once_and_allow_reuse() {
+				let _tracing_guard = super::lifecycle_tracing::serial();
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for event in ["post_spawn", "wrap_child"] {
+					let shared = Arc::new(Shared::default());
+					let identity = Arc::new(());
+					let dispatch = super::lifecycle_tracing::PanicOnLifecycleEvent::dispatch(
+						event,
+						1,
+						Arc::clone(&identity),
+					);
+					let mut command = provider_command(Arc::clone(&shared), "provider");
+
+					let outcome = catch_unwind(AssertUnwindSafe(|| {
+						super::lifecycle_tracing::with_dispatch(&dispatch, || command.spawn())
+					}));
+					let payload = match outcome {
+						Err(payload) => payload,
+						Ok(result) => {
+							panic!("the {event} lifecycle event must resume its panic: {result:?}")
+						}
+					};
+					let payload = payload
+						.downcast::<super::lifecycle_tracing::LifecyclePanic>()
+						.expect("the exact typed subscriber payload is preserved");
+					assert!(Arc::ptr_eq(&payload.0, &identity));
+					assert_eq!(
+						shared
+							.events()
+							.iter()
+							.filter(|candidate| **candidate == Event::Rollback)
+							.count(),
+						1,
+						"the armed transaction rolls back exactly once"
+					);
+
+					shared.clear_events();
+					let child = super::lifecycle_tracing::with_dispatch(&dispatch, || command.spawn())
+						.expect("the one-shot subscriber leaves the command reusable");
+					drop(child);
+					assert_eq!(shared.events(), successful_events("provider"));
+				}
+			}
+
+			#[cfg(feature = "tracing")]
+			#[test]
+			#[cfg_attr(miri, ignore = "requires a native child process")]
+			fn lifecycle_event_panics_quarantine_child_and_transaction_destructors() {
+				let _tracing_guard = super::lifecycle_tracing::serial();
+				const CHILD_ENV: &str = "PROCESS_WRAP_PROVIDER_TRACE_CLEANUP_PANICS";
+				let module = stringify!($module);
+				let selected = std::env::var(CHILD_ENV).ok();
+				if selected.as_deref().is_none_or(|value| !value.starts_with(module)) {
+					for event in ["post_spawn", "wrap_child"] {
+						let child_value = format!("{module}:{event}");
+						let (output, timed_out) = bounded_test_process(
+							concat!(
+								stringify!($module),
+								"::lifecycle_event_panics_quarantine_child_and_transaction_destructors"
+							),
+							(CHILD_ENV, &child_value),
+							EXIT_TIMEOUT,
+						);
+						assert!(!timed_out, "lifecycle tracing cleanup exceeded its deadline");
+						assert!(
+							output.status.success(),
+							"{event} tracing cleanup did not preserve containment:\nstdout:\n{}\nstderr:\n{}",
+							String::from_utf8_lossy(&output.stdout),
+							String::from_utf8_lossy(&output.stderr),
+						);
+					}
+					return;
+				}
+
+				let event = if selected
+					.as_deref()
+					.expect("the subprocess selects a lifecycle event")
+					.ends_with(":post_spawn")
+				{
+					"post_spawn"
+				} else {
+					"wrap_child"
+				};
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let shared = Arc::new(Shared::default());
+				let child_payload_drops = Arc::new(AtomicUsize::new(0));
+				let transaction_payload_drops = Arc::new(AtomicUsize::new(0));
+				shared.set_child_drop_payload(PanickingDropPayload::new(&child_payload_drops));
+				shared.set_transaction_drop_behavior(TransactionDropBehavior::PanicSecondary(
+					PanickingDropPayload::new(&transaction_payload_drops),
+				));
+				let identity = Arc::new(());
+				let dispatch = super::lifecycle_tracing::PanicOnLifecycleEvent::dispatch(
+					event,
+					1,
+					Arc::clone(&identity),
+				);
+				let mut command = provider_command(Arc::clone(&shared), "provider");
+
+				let outcome = catch_unwind(AssertUnwindSafe(|| {
+					super::lifecycle_tracing::with_dispatch(&dispatch, || command.spawn())
+				}));
+				let payload = outcome.expect_err("the lifecycle event must resume its panic");
+				let payload = payload
+					.downcast::<super::lifecycle_tracing::LifecyclePanic>()
+					.expect("the exact typed subscriber payload is preserved");
+				assert!(Arc::ptr_eq(&payload.0, &identity));
+				assert_eq!(child_payload_drops.load(Ordering::SeqCst), 0);
+				assert_eq!(transaction_payload_drops.load(Ordering::SeqCst), 0);
+				assert!(shared.events().contains(&Event::Rollback));
+				assert!(shared.events().contains(&Event::TransactionDrop));
+				assert!(shared.events().contains(&Event::ChildDrop));
+
+				shared.clear_events();
+				drop(
+					super::lifecycle_tracing::with_dispatch(&dispatch, || command.spawn())
+						.expect("the command remains reusable"),
+				);
+				assert_eq!(shared.events(), successful_events("provider"));
+			}
+
+			#[cfg(all(windows, feature = "tracing"))]
+			#[test]
+			#[cfg_attr(miri, ignore = "requires a native child process")]
+			fn prepare_event_panic_quarantines_prepared_destructor_and_allows_reuse() {
+				let _tracing_guard = super::lifecycle_tracing::serial();
+				const CHILD_ENV: &str = "PROCESS_WRAP_PROVIDER_PREPARE_TRACE_PANIC";
+				let module = stringify!($module);
+				if std::env::var_os(CHILD_ENV).as_deref() != Some(OsStr::new(module)) {
+					let (output, timed_out) = bounded_test_process(
+						concat!(
+							stringify!($module),
+							"::prepare_event_panic_quarantines_prepared_destructor_and_allows_reuse"
+						),
+						(CHILD_ENV, module),
+						EXIT_TIMEOUT,
+					);
+					assert!(!timed_out, "prepare tracing cleanup exceeded its deadline");
+					assert!(
+						output.status.success(),
+						"prepare tracing cleanup did not preserve containment:\nstdout:\n{}\nstderr:\n{}",
+						String::from_utf8_lossy(&output.stdout),
+						String::from_utf8_lossy(&output.stderr),
+					);
+					return;
+				}
+
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let shared = Arc::new(Shared::default());
+				let prepared_payload_drops = Arc::new(AtomicUsize::new(0));
+				let identity = Arc::new(());
+				let dispatch = super::lifecycle_tracing::PanicOnLifecycleEvent::dispatch(
+					"prepare_child",
+					4,
+					Arc::clone(&identity),
+				);
+				let mut command = provider_command(Arc::clone(&shared), "provider");
+				command
+					.wrap(FirstPrepared {
+						shared: Arc::clone(&shared),
+						payload: Mutex::new(Some(PanickingDropPayload::new(
+							&prepared_payload_drops,
+						))),
+					})
+					.wrap(FailPrepare(Mutex::new(None)));
+
+				let outcome = catch_unwind(AssertUnwindSafe(|| {
+					super::lifecycle_tracing::with_dispatch(&dispatch, || command.spawn())
+				}));
+				let payload = outcome.expect_err("the prepare event must resume its panic");
+				let payload = payload
+					.downcast::<super::lifecycle_tracing::LifecyclePanic>()
+					.expect("the exact typed subscriber payload is preserved");
+				assert!(Arc::ptr_eq(&payload.0, &identity));
+				assert_eq!(prepared_payload_drops.load(Ordering::SeqCst), 0);
+				assert_eq!(
+					shared
+						.events()
+						.iter()
+						.filter(|candidate| **candidate == Event::Rollback)
+						.count(),
+					1
+				);
+
+				shared.clear_events();
+				drop(
+					super::lifecycle_tracing::with_dispatch(&dispatch, || command.spawn())
+						.expect("the command remains reusable"),
+				);
+				assert_eq!(shared.events(), successful_events("provider"));
+			}
+
 			#[test]
 			fn rollback_failures_preserve_the_original_failure() {
 				let runtime = runtime();
@@ -3753,6 +4057,7 @@ macro_rules! real_provider_tests {
 				paths: Mutex<Option<MarkerPaths>>,
 				last_child: Mutex<Option<Arc<Mutex<Box<dyn ChildWrapper>>>>>,
 				drop_behavior: Mutex<Option<DropBehavior>>,
+				wait_for_ready_before_return: std::sync::atomic::AtomicBool,
 			}
 
 			impl Shared {
@@ -3922,6 +4227,13 @@ macro_rules! real_provider_tests {
 					let child = command.spawn()?;
 					let child = Arc::new(Mutex::new(Box::new(child) as Box<dyn ChildWrapper>));
 					*self.0.last_child.lock().unwrap() = Some(Arc::clone(&child));
+					if self
+						.0
+						.wait_for_ready_before_return
+						.swap(false, Ordering::SeqCst)
+					{
+						wait_for_path(&paths.ready);
+					}
 					Ok(ProviderProduct::new(
 						Box::new(SharedProcessChild {
 							child: Arc::clone(&child),
@@ -4111,6 +4423,81 @@ macro_rules! real_provider_tests {
 					shared.events(),
 					vec![Event::Commit, Event::TransactionDrop, Event::Commit]
 				);
+			}
+
+			#[cfg(feature = "tracing")]
+			#[test]
+			#[cfg_attr(miri, ignore = "requires native child processes")]
+			fn lifecycle_event_panic_rolls_back_and_reaps_a_live_child() {
+				let _tracing_guard = super::lifecycle_tracing::serial();
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for event in ["post_spawn", "wrap_child"] {
+					let directory = tempfile::tempdir().unwrap();
+					let paths = MarkerPaths::new(directory.path());
+					let shared = Arc::new(Shared::default());
+					shared.set_paths(paths.clone());
+					shared
+						.wait_for_ready_before_return
+						.store(true, Ordering::SeqCst);
+					let identity = Arc::new(());
+					let dispatch = super::lifecycle_tracing::PanicOnLifecycleEvent::dispatch(
+						event,
+						1,
+						Arc::clone(&identity),
+					);
+					let mut command = command(Arc::clone(&shared));
+
+					let outcome = catch_unwind(AssertUnwindSafe(|| {
+						super::lifecycle_tracing::with_dispatch(&dispatch, || command.spawn())
+					}));
+					let payload = match outcome {
+						Err(payload) => payload,
+						Ok(result) => {
+							panic!("the {event} lifecycle event must resume its panic: {result:?}")
+						}
+					};
+					let payload = payload
+						.downcast::<super::lifecycle_tracing::LifecyclePanic>()
+						.expect("the exact typed subscriber payload is preserved");
+					assert!(Arc::ptr_eq(&payload.0, &identity));
+					assert_eq!(shared.events(), [Event::Rollback]);
+					assert!(
+						shared
+							.child()
+							.lock()
+							.unwrap_or_else(std::sync::PoisonError::into_inner)
+							.try_wait()
+							.unwrap()
+							.is_some(),
+						"rollback reaps the live provider child before resuming the panic"
+					);
+					fs::write(&paths.go, b"go").unwrap();
+					sleep(Duration::from_millis(900));
+					assert!(
+						!paths.marker.exists(),
+						"the rolled-back child wrote its delayed marker"
+					);
+					shared.clear_child();
+
+					let reused_directory = tempfile::tempdir().unwrap();
+					let reused_paths = MarkerPaths::new(reused_directory.path());
+					shared.set_paths(reused_paths.clone());
+					shared
+						.wait_for_ready_before_return
+						.store(true, Ordering::SeqCst);
+					shared.events.lock().unwrap().clear();
+					let mut child =
+						super::lifecycle_tracing::with_dispatch(&dispatch, || command.spawn())
+							.expect("the command remains reusable");
+					child
+						.start_kill()
+						.expect("terminate the reused provider child");
+					$wait_for_child!(runtime, child).expect("reap the reused provider child");
+					drop(child);
+					shared.clear_child();
+					assert_eq!(shared.events(), [Event::Commit]);
+				}
 			}
 
 			#[test]
