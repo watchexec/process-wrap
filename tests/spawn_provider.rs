@@ -2287,6 +2287,7 @@ macro_rules! spawn_provider_tests {
 			}
 
 			#[test]
+			#[cfg_attr(miri, ignore = "requires a native child process")]
 			fn bounded_subprocess_reaps_the_timeout_path() {
 				const CHILD_ENV: &str = "PROCESS_WRAP_PROVIDER_TIMEOUT_HELPER";
 				let child_value = stringify!($module);
@@ -2305,6 +2306,7 @@ macro_rules! spawn_provider_tests {
 			}
 
 			#[test]
+			#[cfg_attr(miri, ignore = "requires a native child process")]
 			fn rollback_and_transaction_unwinds_are_separated() {
 				const CHILD_ENV: &str = "PROCESS_WRAP_SEPARATE_PROVIDER_UNWINDS";
 				let child_value = stringify!($module);
@@ -2383,6 +2385,7 @@ macro_rules! spawn_provider_tests {
 			}
 
 			#[test]
+			#[cfg_attr(miri, ignore = "requires a native child process")]
 			fn child_destructor_panics_do_not_replace_post_spawn_or_commit_panics() {
 				const CHILD_ENV: &str = "PROCESS_WRAP_PROVIDER_CHILD_PANIC";
 				let module = stringify!($module);
