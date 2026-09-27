@@ -284,6 +284,7 @@ mod tests {
 	use super::*;
 
 	#[test]
+	#[cfg_attr(miri, ignore = "requires a native child process")]
 	fn reader_start_failures_terminate_reap_and_join_before_returning() {
 		const MARKER_ENV: &str = "PROCESS_WRAP_READER_SETUP_MARKER";
 
