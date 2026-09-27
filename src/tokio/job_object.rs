@@ -928,6 +928,7 @@ mod tests {
 	async fn extraction_failures_use_one_shared_custodian_then_close_every_port() -> Result<()> {
 		let _serial = serial_job_extraction();
 		let _fault_cleanup = ExtractionFaultCleanup;
+		reset_job_port_custodian_for_test();
 		let worker_starts = job_custodian_worker_starts();
 		set_job_extraction_query_failures(usize::MAX);
 		set_job_extraction_disarm_failures(usize::MAX);
@@ -971,6 +972,7 @@ mod tests {
 	async fn persistent_disarm_failure_closes_only_after_authoritative_tree_drain() -> Result<()> {
 		let _serial = serial_job_extraction();
 		let _fault_cleanup = ExtractionFaultCleanup;
+		reset_job_port_custodian_for_test();
 		let directory = tempfile::tempdir()?;
 		let pid_file = directory.path().join("descendant.pid");
 		let release = directory.path().join("release-descendant");
