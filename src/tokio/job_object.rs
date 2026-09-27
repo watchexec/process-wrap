@@ -722,6 +722,7 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "current_thread")]
+	#[allow(clippy::await_holding_lock)] // Serializes process-global native fault injection.
 	async fn drained_kill_on_drop_extraction_closes_complete_job_ports_repeatedly() -> Result<()> {
 		let _serial = serial_job_extraction();
 		for job_first in [false, true] {
@@ -741,6 +742,7 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "current_thread")]
+	#[allow(clippy::await_holding_lock)] // Serializes process-global native fault injection.
 	async fn live_kill_on_drop_extraction_disarms_and_closes_before_returning() -> Result<()> {
 		let _serial = serial_job_extraction();
 		for job_first in [false, true] {
@@ -759,6 +761,7 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "current_thread")]
+	#[allow(clippy::await_holding_lock)] // Serializes process-global native fault injection.
 	async fn extraction_failures_use_one_shared_custodian_then_close_every_port() -> Result<()> {
 		let _serial = serial_job_extraction();
 		let _fault_cleanup = ExtractionFaultCleanup;
@@ -801,6 +804,7 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "current_thread")]
+	#[allow(clippy::await_holding_lock)] // Serializes process-global native fault injection.
 	async fn custodian_start_failure_uses_only_exact_last_resort_retention() -> Result<()> {
 		let _serial = serial_job_extraction();
 		let _fault_cleanup = ExtractionFaultCleanup;

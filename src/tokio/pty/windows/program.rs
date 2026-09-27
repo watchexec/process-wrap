@@ -54,10 +54,10 @@ pub(super) fn resolve<'a>(
 
 	let has_extension = encoded.contains(&(b'.' as u16));
 	let child_path = child_path(changes)?;
-	if let Some(path) = child_path.as_deref() {
-		if let Some(program) = search_path(path, program, has_extension) {
-			return WideCString::from_os(program.as_os_str(), "PTY program");
-		}
+	if let Some(path) = child_path.as_deref()
+		&& let Some(program) = search_path(path, program, has_extension)
+	{
+		return WideCString::from_os(program.as_os_str(), "PTY program");
 	}
 	if let Ok(mut directory) = env::current_exe() {
 		directory.pop();
@@ -65,20 +65,20 @@ pub(super) fn resolve<'a>(
 			return WideCString::from_os(program.as_os_str(), "PTY program");
 		}
 	}
-	if let Ok(directory) = system_directory() {
-		if let Some(program) = candidate(directory, program, has_extension) {
-			return WideCString::from_os(program.as_os_str(), "PTY program");
-		}
+	if let Ok(directory) = system_directory()
+		&& let Some(program) = candidate(directory, program, has_extension)
+	{
+		return WideCString::from_os(program.as_os_str(), "PTY program");
 	}
-	if let Ok(directory) = windows_directory() {
-		if let Some(program) = candidate(directory, program, has_extension) {
-			return WideCString::from_os(program.as_os_str(), "PTY program");
-		}
+	if let Ok(directory) = windows_directory()
+		&& let Some(program) = candidate(directory, program, has_extension)
+	{
+		return WideCString::from_os(program.as_os_str(), "PTY program");
 	}
-	if let Some(path) = env::var_os("PATH") {
-		if let Some(program) = search_path(&path, program, has_extension) {
-			return WideCString::from_os(program.as_os_str(), "PTY program");
-		}
+	if let Some(path) = env::var_os("PATH")
+		&& let Some(program) = search_path(&path, program, has_extension)
+	{
+		return WideCString::from_os(program.as_os_str(), "PTY program");
 	}
 
 	Err(io::Error::new(

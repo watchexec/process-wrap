@@ -819,8 +819,7 @@ async fn passes_bidirectional_terminal_bytes() -> io::Result<()> {
 		bytes
 			.windows(expected.len())
 			.any(|window| window == expected),
-		"{:?}",
-		bytes
+		"{bytes:?}"
 	);
 	Ok(())
 }
@@ -1007,8 +1006,7 @@ async fn failed_spawn_leaves_the_tracked_command_reusable() -> io::Result<()> {
 		.wrap(Pty::default());
 	let error = command
 		.spawn()
-		.err()
-		.expect("the first spawn must fail while the executable is absent");
+		.expect_err("the first spawn must fail while the executable is absent");
 	assert_eq!(error.kind(), io::ErrorKind::NotFound);
 
 	std::fs::copy(env::current_exe()?, &executable)?;
