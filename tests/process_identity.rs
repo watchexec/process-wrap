@@ -3,6 +3,7 @@
 use std::{
 	future::Future,
 	io,
+	os::unix::process::ExitStatusExt,
 	pin::Pin,
 	process::ExitStatus,
 	sync::{
@@ -303,40 +304,227 @@ async fn sticky_custom_id_does_not_authorize_a_signal_after_wait() {
 	assert_eq!(child.try_wait().unwrap(), Some(status));
 }
 
+#[derive(Debug)]
+struct SyntheticSharedState {
+	status: Mutex<Option<ExitStatus>>,
+	wait_acquired: Mutex<Option<mpsc::Sender<()>>>,
+	completion: Mutex<Option<mpsc::Receiver<ExitStatus>>>,
+	group_signals: AtomicUsize,
+}
+
+impl SyntheticSharedState {
+	fn wait_under_custody(&self) -> io::Result<ExitStatus> {
+		let mut status = self
+			.status
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		if let Some(status) = *status {
+			return Ok(status);
+		}
+		if let Some(acquired) = self
+			.wait_acquired
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.take()
+		{
+			let _ = acquired.send(());
+		}
+		let completion = self
+			.completion
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.take()
+			.ok_or_else(|| {
+				io::Error::other("synthetic completion receiver was already consumed")
+			})?;
+		let completed = completion.recv_timeout(EXIT_TIMEOUT).map_err(|error| {
+			io::Error::new(
+				io::ErrorKind::TimedOut,
+				format!("synthetic child completion was not released: {error}"),
+			)
+		})?;
+		*status = Some(completed);
+		Ok(completed)
+	}
+}
+
+#[derive(Debug)]
+struct SyntheticSharedChild {
+	state: Arc<SyntheticSharedState>,
+	spawned_id: u32,
+}
+
+impl ChildWrapper for SyntheticSharedChild {
+	fn inner(&self) -> &dyn ChildWrapper {
+		self
+	}
+
+	fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+		self
+	}
+
+	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+		self
+	}
+
+	fn try_clone(&self) -> Option<Box<dyn ChildWrapper>> {
+		Some(Box::new(Self {
+			state: Arc::clone(&self.state),
+			spawned_id: self.spawned_id,
+		}))
+	}
+
+	fn id(&self) -> Option<u32> {
+		Some(self.spawned_id)
+	}
+
+	fn spawned_id_layer(&self) -> Option<u32> {
+		Some(self.spawned_id)
+	}
+
+	fn has_process_group_signal_layer(&self) -> bool {
+		true
+	}
+
+	fn signal_process_group_layer(
+		&mut self,
+		_process_group: i32,
+		_signal: i32,
+	) -> Option<io::Result<Option<ExitStatus>>> {
+		let status = self
+			.state
+			.status
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		if let Some(status) = *status {
+			Some(Ok(Some(status)))
+		} else {
+			self.state.group_signals.fetch_add(1, Ordering::SeqCst);
+			Some(Ok(None))
+		}
+	}
+
+	fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+		Ok(*self
+			.state
+			.status
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner))
+	}
+
+	fn wait(&mut self) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send + '_>> {
+		let state = Arc::clone(&self.state);
+		Box::pin(async move { state.wait_under_custody() })
+	}
+}
+
+struct SharedSignalCleanup {
+	completion: Option<mpsc::Sender<ExitStatus>>,
+	status: ExitStatus,
+	workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl SharedSignalCleanup {
+	fn release(&mut self) {
+		if let Some(completion) = self.completion.take() {
+			let _ = completion.send(self.status);
+		}
+	}
+
+	fn finish(mut self) {
+		self.release();
+		for worker in std::mem::take(&mut self.workers) {
+			worker.join().expect("shared-child worker does not panic");
+		}
+	}
+}
+
+impl Drop for SharedSignalCleanup {
+	fn drop(&mut self) {
+		self.release();
+		for worker in std::mem::take(&mut self.workers) {
+			if let Err(payload) = worker.join() {
+				std::mem::forget(payload);
+			}
+		}
+	}
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shared_wait_and_group_signal_linearize_under_child_custody() {
-	let published = Arc::new(Mutex::new(None));
-	let mut command = Command::with_new("sh", |command| {
-		command.args(["-c", "sleep 0.2; exit 37"]);
+	let status = ExitStatus::from_raw(37 << 8);
+	let (wait_acquired_tx, wait_acquired_rx) = mpsc::channel();
+	let (completion_tx, completion_rx) = mpsc::channel();
+	let state = Arc::new(SyntheticSharedState {
+		status: Mutex::new(None),
+		wait_acquired: Mutex::new(Some(wait_acquired_tx)),
+		completion: Mutex::new(Some(completion_rx)),
+		group_signals: AtomicUsize::new(0),
 	});
+	let mut command = Command::new("synthetic-child");
 	command.wrap(ProcessGroup::leader());
 	let mut child = command
 		.spawn_with_child({
-			let published = Arc::clone(&published);
-			move |native| Ok(sticky_child(native.spawn()?, &published))
+			let state = Arc::clone(&state);
+			move |_| {
+				Ok(Box::new(SyntheticSharedChild {
+					state,
+					spawned_id: 42,
+				}) as Box<dyn ChildWrapper>)
+			}
 		})
 		.unwrap();
-	let state = published
-		.lock()
-		.unwrap_or_else(std::sync::PoisonError::into_inner)
-		.take()
-		.unwrap();
-	let waiter_state = Arc::clone(&state);
-	let (locked, observe_locked) = mpsc::channel();
-	let runtime = tokio::runtime::Handle::current();
-	let waiter = tokio::task::spawn_blocking(move || {
-		let mut child = waiter_state
-			.child
-			.lock()
-			.unwrap_or_else(std::sync::PoisonError::into_inner);
-		locked.send(()).unwrap();
-		runtime.block_on(child.wait())
+	let mut lower = child
+		.inner()
+		.try_clone()
+		.expect("the shared custom child exposes a clone");
+	let (waited_tx, waited_rx) = mpsc::channel();
+	let waiter = std::thread::spawn(move || {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.build()
+			.expect("build synthetic waiter runtime");
+		let result = runtime.block_on(lower.wait());
+		let _ = waited_tx.send(result);
 	});
-	observe_locked.recv_timeout(EXIT_TIMEOUT).unwrap();
+	let mut cleanup = SharedSignalCleanup {
+		completion: Some(completion_tx),
+		status,
+		workers: vec![waiter],
+	};
+	wait_acquired_rx
+		.recv_timeout(EXIT_TIMEOUT)
+		.expect("wait owns lower-child custody before signal starts");
 
-	child.signal(nix::libc::SIGCONT).unwrap();
-	let status = waiter.await.unwrap().unwrap();
-	assert_eq!(status.code(), Some(37));
+	let (signaled_tx, signaled_rx) = mpsc::channel();
+	cleanup.workers.push(std::thread::spawn(move || {
+		let result = child.signal(nix::libc::SIGCONT);
+		let _ = signaled_tx.send((child, result));
+	}));
+	let early_signal = signaled_rx.recv_timeout(Duration::from_millis(100));
+	let signal_was_pending = matches!(&early_signal, Err(mpsc::RecvTimeoutError::Timeout));
+	cleanup.release();
+	let waited = waited_rx
+		.recv_timeout(EXIT_TIMEOUT)
+		.expect("wait completes after explicit terminal release")
+		.expect("synthetic wait succeeds");
+	let (mut child, signal_result) = match early_signal {
+		Ok(result) => result,
+		Err(mpsc::RecvTimeoutError::Timeout) => signaled_rx
+			.recv_timeout(EXIT_TIMEOUT)
+			.expect("signal completes after wait releases custody"),
+		Err(mpsc::RecvTimeoutError::Disconnected) => {
+			cleanup.finish();
+			panic!("signal worker disconnected without a result")
+		}
+	};
+	cleanup.finish();
+
+	assert!(
+		signal_was_pending,
+		"signal did not block behind wait custody"
+	);
+	signal_result.unwrap();
+	assert_eq!(waited, status);
 	assert_eq!(state.group_signals.load(Ordering::SeqCst), 0);
 	assert_eq!(child.wait().await.unwrap(), status);
 	assert_eq!(child.try_wait().unwrap(), Some(status));

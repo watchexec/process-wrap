@@ -859,39 +859,74 @@ mod signal_tests {
 
 	use super::*;
 
+	struct ChildGuard(Option<Child>);
+
+	impl ChildGuard {
+		fn new(child: Child) -> Self {
+			Self(Some(child))
+		}
+
+		fn child_mut(&mut self) -> &mut Child {
+			self.0.as_mut().expect("an armed test guard owns its child")
+		}
+
+		fn finish(mut self) -> Result<()> {
+			let child = self.child_mut();
+			match child.kill() {
+				Ok(()) => {}
+				Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+				Err(error) => return Err(error),
+			}
+			let _ = child.wait()?;
+			self.0.take();
+			Ok(())
+		}
+	}
+
+	impl Drop for ChildGuard {
+		fn drop(&mut self) {
+			if let Some(child) = self.0.as_mut() {
+				let _ = child.kill();
+				let _ = child.wait();
+			}
+		}
+	}
+
 	#[test]
 	#[cfg_attr(miri, ignore = "requires a native child process")]
 	fn terminal_status_prevents_the_production_signal_seam() -> Result<()> {
-		let mut child = Command::new("true").spawn()?;
-		let status = child.wait()?;
+		let child = Command::new("true").spawn()?;
+		let mut child = ChildGuard::new(child);
+		let status = child.child_mut().wait()?;
 		let calls = AtomicUsize::new(0);
 
-		let observed = signal_child_if_running_with(&mut child, Signal::SIGCONT, |_, _| {
+		let observed = signal_child_if_running_with(child.child_mut(), Signal::SIGCONT, |_, _| {
 			calls.fetch_add(1, Ordering::SeqCst);
 			Ok(())
 		})?;
 
 		assert_eq!(observed, Some(status));
 		assert_eq!(calls.load(Ordering::SeqCst), 0);
-		assert_eq!(child.wait()?, status);
+		assert_eq!(child.child_mut().wait()?, status);
+		child.finish()?;
 		Ok(())
 	}
 
 	#[test]
 	#[cfg_attr(miri, ignore = "requires a native child process")]
 	fn live_status_reaches_the_production_signal_seam_once() -> Result<()> {
-		let mut child = Command::new("sh").args(["-c", "sleep 30"]).spawn()?;
+		let child = Command::new("sh").args(["-c", "sleep 30"]).spawn()?;
+		let mut child = ChildGuard::new(child);
 		let calls = AtomicUsize::new(0);
 
-		let observed = signal_child_if_running_with(&mut child, Signal::SIGCONT, |_, _| {
+		let observed = signal_child_if_running_with(child.child_mut(), Signal::SIGCONT, |_, _| {
 			calls.fetch_add(1, Ordering::SeqCst);
 			Ok(())
 		})?;
 
 		assert_eq!(observed, None);
 		assert_eq!(calls.load(Ordering::SeqCst), 1);
-		child.kill()?;
-		let _ = child.wait()?;
+		child.finish()?;
 		Ok(())
 	}
 }

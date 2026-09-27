@@ -849,42 +849,95 @@ impl dyn ChildWrapper + '_ {
 
 #[cfg(all(test, unix))]
 mod signal_tests {
-	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::{
+		sync::atomic::{AtomicUsize, Ordering},
+		time::{Duration, Instant},
+	};
 
 	use super::*;
+
+	struct ChildGuard(Option<Child>);
+
+	impl ChildGuard {
+		fn new(child: Child) -> Self {
+			Self(Some(child))
+		}
+
+		fn child_mut(&mut self) -> &mut Child {
+			self.0.as_mut().expect("an armed test guard owns its child")
+		}
+
+		fn cleanup(&mut self) -> Result<()> {
+			let child = self.child_mut();
+			match child.start_kill() {
+				Ok(()) => {}
+				Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+				Err(error) => return Err(error),
+			}
+			let deadline = Instant::now() + Duration::from_secs(5);
+			loop {
+				if child.try_wait()?.is_some() {
+					self.0.take();
+					return Ok(());
+				}
+				if Instant::now() >= deadline {
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::TimedOut,
+						"Tokio signal seam child was not reaped",
+					));
+				}
+				std::thread::sleep(Duration::from_millis(5));
+			}
+		}
+
+		fn finish(mut self) -> Result<()> {
+			self.cleanup()
+		}
+	}
+
+	impl Drop for ChildGuard {
+		fn drop(&mut self) {
+			if self.0.is_some() {
+				let _ = self.cleanup();
+			}
+		}
+	}
 
 	#[tokio::test]
 	#[cfg_attr(miri, ignore = "requires a native child process")]
 	async fn terminal_status_prevents_the_production_signal_seam() -> Result<()> {
-		let mut child = NativeCommand::new("true").spawn()?;
-		let status = child.wait().await?;
+		let child = NativeCommand::new("true").spawn()?;
+		let mut child = ChildGuard::new(child);
+		let status = child.child_mut().wait().await?;
 		let calls = AtomicUsize::new(0);
 
-		let observed = signal_child_if_running_with(&mut child, Signal::SIGCONT, |_, _| {
+		let observed = signal_child_if_running_with(child.child_mut(), Signal::SIGCONT, |_, _| {
 			calls.fetch_add(1, Ordering::SeqCst);
 			Ok(())
 		})?;
 
 		assert_eq!(observed, Some(status));
 		assert_eq!(calls.load(Ordering::SeqCst), 0);
-		assert_eq!(child.wait().await?, status);
+		assert_eq!(child.child_mut().wait().await?, status);
+		child.finish()?;
 		Ok(())
 	}
 
 	#[tokio::test]
 	#[cfg_attr(miri, ignore = "requires a native child process")]
 	async fn live_status_reaches_the_production_signal_seam_once() -> Result<()> {
-		let mut child = NativeCommand::new("sh").args(["-c", "sleep 30"]).spawn()?;
+		let child = NativeCommand::new("sh").args(["-c", "sleep 30"]).spawn()?;
+		let mut child = ChildGuard::new(child);
 		let calls = AtomicUsize::new(0);
 
-		let observed = signal_child_if_running_with(&mut child, Signal::SIGCONT, |_, _| {
+		let observed = signal_child_if_running_with(child.child_mut(), Signal::SIGCONT, |_, _| {
 			calls.fetch_add(1, Ordering::SeqCst);
 			Ok(())
 		})?;
 
 		assert_eq!(observed, None);
 		assert_eq!(calls.load(Ordering::SeqCst), 1);
-		child.kill().await?;
+		child.finish()?;
 		Ok(())
 	}
 }
