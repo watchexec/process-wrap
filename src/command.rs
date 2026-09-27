@@ -747,6 +747,8 @@ pub struct SpawnAttempt<B: Backend> {
 	platform: PlatformCommandState,
 	#[cfg_attr(not(unix), allow(dead_code))]
 	native_only_base: bool,
+	#[cfg(all(unix, feature = "process-group"))]
+	spawned_id: Option<u32>,
 	kill_on_drop: Option<bool>,
 	#[cfg(windows)]
 	windows_policy: WindowsSpawnPolicy,
@@ -1108,6 +1110,8 @@ impl<B: Backend> Command<B> {
 			native,
 			platform,
 			native_only_base,
+			#[cfg(all(unix, feature = "process-group"))]
+			spawned_id: None,
 			kill_on_drop: None,
 			#[cfg(windows)]
 			windows_policy: WindowsSpawnPolicy::default(),
@@ -1370,6 +1374,16 @@ impl<B: Backend> SpawnAttempt<B> {
 	#[cfg(windows)]
 	pub(crate) fn starts_suspended(&self) -> bool {
 		self.windows_policy.starts_suspended()
+	}
+
+	#[cfg(all(unix, feature = "process-group"))]
+	pub(crate) fn set_spawned_id(&mut self, spawned_id: Option<u32>) {
+		self.spawned_id = spawned_id;
+	}
+
+	#[cfg(all(unix, feature = "process-group"))]
+	pub(crate) fn spawned_id(&self) -> Option<u32> {
+		self.spawned_id
 	}
 
 	/// Return the process-group setup requested for this attempt.

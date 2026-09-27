@@ -57,3 +57,40 @@ fn process_session() -> Result<()> {
 
 	Ok(())
 }
+
+#[test]
+fn direct_wait_then_signal_and_start_kill_are_noops() -> Result<()> {
+	let mut child = CommandWrap::new("true").spawn()?;
+	let status = child.inner_mut().wait()?;
+	child.signal(Signal::SIGCONT as _)?;
+	child.start_kill()?;
+	assert_eq!(child.wait()?, status);
+	assert_eq!(child.try_wait()?, Some(status));
+	Ok(())
+}
+
+#[cfg(feature = "process-group")]
+#[test]
+fn process_group_inner_wait_then_signals_are_noops() -> Result<()> {
+	let mut child = CommandWrap::new("true")
+		.wrap(ProcessGroup::leader())
+		.spawn()?;
+	let status = child.inner_mut().wait()?;
+	child.signal(Signal::SIGCONT as _)?;
+	child.start_kill()?;
+	assert_eq!(child.wait()?, status);
+	assert_eq!(child.try_wait()?, Some(status));
+	Ok(())
+}
+
+#[cfg(feature = "process-session")]
+#[test]
+fn process_session_inner_wait_then_signals_are_noops() -> Result<()> {
+	let mut child = CommandWrap::new("true").wrap(ProcessSession).spawn()?;
+	let status = child.inner_mut().wait()?;
+	child.signal(Signal::SIGCONT as _)?;
+	child.start_kill()?;
+	assert_eq!(child.wait()?, status);
+	assert_eq!(child.try_wait()?, Some(status));
+	Ok(())
+}

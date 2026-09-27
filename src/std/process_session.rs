@@ -1,6 +1,5 @@
-use std::io::{Error, Result};
+use std::io::Result;
 
-use nix::unistd::Pid;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -33,11 +32,20 @@ impl CommandWrapper for ProcessSession {
 		inner: &mut dyn ChildWrapper,
 		_core: &CommandWrap,
 	) -> Result<Option<PendingChildWrapper>> {
-		let direct_pid = Pid::from_raw(i32::try_from(inner.id()).map_err(Error::other)?);
-		let exit_status = inner.try_wait()?;
+		let spawned_id = inner.try_spawned_id();
+		super::ProcessGroup::leader()
+			.detached_child(inner, spawned_id)
+			.map(Some)
+	}
 
-		Ok(Some(PendingChildWrapper::new(
-			super::ProcessGroupChild::detached(direct_pid, exit_status),
-		)))
+	fn wrap_child_with_spawned_id(
+		&mut self,
+		inner: &mut dyn ChildWrapper,
+		spawned_id: Option<u32>,
+		_core: &CommandWrap,
+	) -> Result<Option<PendingChildWrapper>> {
+		super::ProcessGroup::leader()
+			.detached_child(inner, spawned_id)
+			.map(Some)
 	}
 }

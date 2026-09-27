@@ -1690,6 +1690,7 @@ macro_rules! Wrap {
 				&mut self,
 				child: &mut Option<Box<dyn $childer>>,
 				pending: &mut Option<PendingChildWrapper>,
+				#[cfg(all(unix, feature = "process-group"))] spawned_id: Option<u32>,
 				#[cfg(windows)] prepared: &mut [Option<PreparedChildOwner>],
 			) -> ::std::result::Result<(), SpawnFailure> {
 				let len = self.wrapper_registry().wrappers.len();
@@ -1717,7 +1718,11 @@ macro_rules! Wrap {
 									command,
 								)
 							}
-							#[cfg(not(windows))]
+							#[cfg(all(not(windows), unix, feature = "process-group"))]
+							{
+								wrapper.wrap_child_with_spawned_id(child, spawned_id, command)
+							}
+							#[cfg(all(not(windows), not(all(unix, feature = "process-group"))))]
 							{
 								wrapper.wrap_child(child, command)
 							}
@@ -1802,6 +1807,16 @@ macro_rules! Wrap {
 				};
 
 				let before_owner: ::std::result::Result<(), SpawnFailure> = (|| {
+					#[cfg(all(unix, feature = "process-group"))]
+					{
+						let spawned_id = Self::capture_io(|| {
+							Ok(child
+								.as_deref()
+								.expect("the spawn lifecycle retains child custody")
+								.try_spawned_id())
+						})?;
+						attempt.set_spawned_id(spawned_id);
+					}
 					#[cfg(windows)]
 					self.run_prepare_child(
 						attempt,
@@ -1819,6 +1834,8 @@ macro_rules! Wrap {
 					self.run_wrap_child(
 						&mut child,
 						&mut pending,
+						#[cfg(all(unix, feature = "process-group"))]
+						attempt.spawned_id(),
 						#[cfg(windows)]
 						&mut prepared,
 					)?;
@@ -1983,6 +2000,16 @@ macro_rules! Wrap {
 				#[cfg(windows)]
 				let mut prepared = Vec::with_capacity(self.wrapper_registry().wrappers.len());
 				let before_commit: ::std::result::Result<(), SpawnFailure> = (|| {
+					#[cfg(all(unix, feature = "process-group"))]
+					{
+						let spawned_id = Self::capture_io(|| {
+							Ok(child
+								.as_deref()
+								.expect("the spawn lifecycle retains child custody")
+								.try_spawned_id())
+						})?;
+						attempt.set_spawned_id(spawned_id);
+					}
 					#[cfg(windows)]
 					self.run_prepare_child(
 						attempt,
@@ -2000,6 +2027,8 @@ macro_rules! Wrap {
 					self.run_wrap_child(
 						&mut child,
 						&mut pending,
+						#[cfg(all(unix, feature = "process-group"))]
+						attempt.spawned_id(),
 						#[cfg(windows)]
 						&mut prepared,
 					)?;
@@ -2343,6 +2372,21 @@ macro_rules! Wrap {
 				_command: &Command,
 			) -> ::std::io::Result<Option<PendingChildWrapper>> {
 				Ok(None)
+			}
+
+			/// Describe a child layer with the historical transport identity captured before post-spawn hooks.
+			///
+			/// The identity is for process-group/session installation only. It is not evidence of current
+			/// liveness and must never become a post-return signal or kill target.
+			#[doc(hidden)]
+			#[cfg(all(unix, feature = "process-group"))]
+			fn wrap_child_with_spawned_id(
+				&mut self,
+				child: &mut dyn $childer,
+				_spawned_id: Option<u32>,
+				command: &Command,
+			) -> ::std::io::Result<Option<PendingChildWrapper>> {
+				self.wrap_child(child, command)
 			}
 
 			/// Describe a child layer for state returned by `prepare_child`.

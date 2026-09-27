@@ -588,13 +588,27 @@ impl ChildWrapper for PtyChild {
 	}
 
 	#[cfg(unix)]
-	fn signal(&self, sig: i32) -> io::Result<()> {
-		ChildWrapper::signal(&*self.lock_child(), sig)
+	fn signal(&mut self, sig: i32) -> io::Result<()> {
+		ChildWrapper::signal(&mut *self.lock_child(), sig)
 	}
 
-	#[cfg(any(feature = "process-group", feature = "process-session"))]
+	#[cfg(feature = "process-group")]
 	fn spawned_id_layer(&self) -> Option<u32> {
 		Some(self.pid)
+	}
+
+	#[cfg(feature = "process-group")]
+	fn has_process_group_signal_layer(&self) -> bool {
+		true
+	}
+
+	#[cfg(feature = "process-group")]
+	fn signal_process_group_layer(
+		&mut self,
+		process_group: i32,
+		signal: i32,
+	) -> Option<io::Result<Option<ExitStatus>>> {
+		ChildWrapper::signal_process_group_layer(&mut *self.lock_child(), process_group, signal)
 	}
 
 	fn take_pty_controller_layer(&mut self) -> Option<PtyController> {

@@ -1,6 +1,5 @@
-use std::io::{Error, ErrorKind, Result};
+use std::io::Result;
 
-use nix::unistd::Pid;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -36,22 +35,20 @@ impl CommandWrapper for ProcessSession {
 		inner: &mut dyn ChildWrapper,
 		_core: &CommandWrap,
 	) -> Result<Option<PendingChildWrapper>> {
-		let mut direct_id = inner.id();
-		#[cfg(feature = "pty")]
-		if direct_id.is_none() {
-			direct_id = inner.try_spawned_id();
-		}
-		let direct_id = direct_id.ok_or_else(|| {
-			Error::new(
-				ErrorKind::InvalidInput,
-				"the child exited before session supervision could retain its PID",
-			)
-		})?;
-		let direct_pid = Pid::from_raw(i32::try_from(direct_id).map_err(Error::other)?);
-		let exit_status = inner.try_wait()?;
+		let spawned_id = inner.try_spawned_id();
+		super::ProcessGroup::leader()
+			.detached_child(inner, spawned_id)
+			.map(Some)
+	}
 
-		Ok(Some(PendingChildWrapper::new(
-			super::ProcessGroupChild::detached(direct_pid, exit_status),
-		)))
+	fn wrap_child_with_spawned_id(
+		&mut self,
+		inner: &mut dyn ChildWrapper,
+		spawned_id: Option<u32>,
+		_core: &CommandWrap,
+	) -> Result<Option<PendingChildWrapper>> {
+		super::ProcessGroup::leader()
+			.detached_child(inner, spawned_id)
+			.map(Some)
 	}
 }

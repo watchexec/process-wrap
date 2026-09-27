@@ -128,6 +128,30 @@ macro_rules! unix_attempt_policy_tests {
 			}
 
 			#[derive(Debug)]
+			struct ReapBeforeWrapping;
+
+			impl CommandWrapper for ReapBeforeWrapping {
+				fn post_spawn(
+					&mut self,
+					_attempt: &mut SpawnAttempt,
+					child: &mut dyn ChildWrapper,
+					_command: &CommandWrap,
+				) -> io::Result<()> {
+					let deadline = Instant::now() + EXIT_TIMEOUT;
+					while child.try_wait()?.is_none() {
+						if Instant::now() >= deadline {
+							return Err(io::Error::new(
+								io::ErrorKind::TimedOut,
+								"the post-spawn hook could not reap the direct child",
+							));
+						}
+						sleep(Duration::from_millis(5));
+					}
+					Ok(())
+				}
+			}
+
+			#[derive(Debug)]
 			struct ReplaceNative;
 
 			impl CommandWrapper for ReplaceNative {
@@ -205,6 +229,92 @@ macro_rules! unix_attempt_policy_tests {
 						"child did not exit before timeout"
 					);
 					sleep(Duration::from_millis(10));
+				}
+			}
+
+			fn spawn_transport(
+				command: &mut CommandWrap,
+				transport: u8,
+			) -> io::Result<Box<dyn ChildWrapper>> {
+				match transport {
+					0 => command.spawn(),
+					1 => command.spawn_with(|native| native.spawn()),
+					2 => command.spawn_with_child(|native| {
+						Ok(Box::new(native.spawn()?) as Box<dyn ChildWrapper>)
+					}),
+					_ => unreachable!("the test enumerates every transport"),
+				}
+			}
+
+			#[test]
+			fn post_hook_reap_preserves_supervision_installation_identity() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for session in [false, true] {
+					for reaper_first in [false, true] {
+						for transport in 0..3 {
+							let mut command = command_with_exit(23);
+							if reaper_first {
+								command.wrap(ReapBeforeWrapping);
+								if session {
+									command.wrap(ProcessSession);
+								} else {
+									command.wrap(ProcessGroup::leader());
+								}
+							} else {
+								if session {
+									command.wrap(ProcessSession);
+								} else {
+									command.wrap(ProcessGroup::leader());
+								}
+								command.wrap(ReapBeforeWrapping);
+							}
+
+							let mut child = spawn_transport(&mut command, transport).unwrap();
+							let first = wait_for_exit(child.as_mut());
+							assert_eq!(first.code(), Some(23));
+							assert_eq!(wait_for_exit(child.as_mut()), first);
+							assert_eq!(child.try_wait().unwrap(), Some(first));
+						}
+					}
+				}
+			}
+
+			#[test]
+			fn direct_signal_and_start_kill_are_noops_after_reap() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let mut command = command_with_exit(0);
+				let mut child = command.spawn().unwrap();
+				let status = wait_for_exit(child.as_mut());
+
+				child.signal(Signal::SIGCONT as i32).unwrap();
+				child.start_kill().unwrap();
+				assert_eq!(wait_for_exit(child.as_mut()), status);
+				assert_eq!(child.try_wait().unwrap(), Some(status));
+			}
+
+			#[test]
+			fn lower_layer_reap_makes_group_signals_noops() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for session in [false, true] {
+					let mut command = command_with_exit(0);
+					if session {
+						command.wrap(ProcessSession);
+					} else {
+						command.wrap(ProcessGroup::leader());
+					}
+					let mut child = command.spawn().unwrap();
+					let status = {
+						let inner = child.inner_mut();
+						wait_for_exit(inner)
+					};
+
+					child.signal(Signal::SIGCONT as i32).unwrap();
+					child.start_kill().unwrap();
+					assert_eq!(wait_for_exit(child.as_mut()), status);
+					assert_eq!(child.try_wait().unwrap(), Some(status));
 				}
 			}
 

@@ -10,6 +10,8 @@ use std::{
 use std::os::windows::io::BorrowedHandle;
 
 use futures::future::try_join3;
+#[cfg(all(unix, feature = "process-group"))]
+use nix::sys::signal::killpg;
 #[cfg(unix)]
 use nix::{
 	sys::signal::{Signal, kill},
@@ -23,15 +25,6 @@ use tokio::{
 #[cfg(windows)]
 macro_rules! prepared_owner_child_contract {
 	() => {
-		#[cfg(all(
-			unix,
-			feature = "pty",
-			any(feature = "process-group", feature = "process-session")
-		))]
-		fn spawned_id_layer(&self) -> Option<u32> {
-			self.child_ref().spawned_id_layer()
-		}
-
 		#[cfg(feature = "pty")]
 		fn take_pty_controller_layer(&mut self) -> Option<super::pty::PtyController> {
 			self.child_mut().take_pty_controller_layer()
@@ -79,8 +72,8 @@ macro_rules! prepared_owner_child_contract {
 		}
 
 		#[cfg(unix)]
-		fn signal(&self, sig: i32) -> Result<()> {
-			self.child_ref().signal(sig)
+		fn signal(&mut self, sig: i32) -> Result<()> {
+			self.child_mut().signal(sig)
 		}
 	};
 }
@@ -229,18 +222,34 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 		None
 	}
 
-	/// Return the original PID retained by this exact provider-child layer.
+	/// Return the original PID retained by this exact child layer.
 	///
-	/// This internal capability lets a wrapper finish installation after an earlier post-spawn hook
-	/// observed and reaped a fast provider child. Ordinary child operations must continue to use
-	/// [`ChildWrapper::id`] so they never act on a recycled PID.
+	/// This historical identity is consumed only while installing process-group or session supervision.
+	/// Ordinary child operations and signalling must continue to use live child state.
 	#[doc(hidden)]
-	#[cfg(all(
-		unix,
-		feature = "pty",
-		any(feature = "process-group", feature = "process-session")
-	))]
+	#[cfg(all(unix, feature = "process-group"))]
 	fn spawned_id_layer(&self) -> Option<u32> {
+		None
+	}
+
+	/// Report whether this exact layer can linearize direct-child status refresh with group signalling.
+	#[doc(hidden)]
+	#[cfg(all(unix, feature = "process-group"))]
+	fn has_process_group_signal_layer(&self) -> bool {
+		false
+	}
+
+	/// Refresh direct-child status and signal `process_group` before releasing this layer's wait custody.
+	///
+	/// `Ok(Some(status))` means the direct child was already reaped and no signal was issued;
+	/// `Ok(None)` means the signal was issued while the child remained unreaped.
+	#[doc(hidden)]
+	#[cfg(all(unix, feature = "process-group"))]
+	fn signal_process_group_layer(
+		&mut self,
+		_process_group: i32,
+		_signal: i32,
+	) -> Option<Result<Option<ExitStatus>>> {
 		None
 	}
 
@@ -428,9 +437,26 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	/// was introduced by command-group to abstract over the signal behaviour between process groups
 	/// and unwrapped processes.
 	#[cfg(unix)]
-	fn signal(&self, sig: i32) -> Result<()> {
-		self.inner().signal(sig)
+	fn signal(&mut self, sig: i32) -> Result<()> {
+		self.inner_mut().signal(sig)
 	}
+}
+
+#[cfg(unix)]
+fn signal_child_if_running_with(
+	child: &mut Child,
+	signal: Signal,
+	send: impl FnOnce(Pid, Signal) -> std::result::Result<(), nix::errno::Errno>,
+) -> Result<Option<ExitStatus>> {
+	if let Some(status) = Child::try_wait(child)? {
+		return Ok(Some(status));
+	}
+	let id = Child::id(child).ok_or_else(|| {
+		std::io::Error::other("a running Tokio child did not retain its process ID")
+	})?;
+	let pid = Pid::from_raw(i32::try_from(id).map_err(std::io::Error::other)?);
+	send(pid, signal).map_err(std::io::Error::from)?;
+	Ok(None)
 }
 
 impl ChildWrapper for Child {
@@ -462,8 +488,37 @@ impl ChildWrapper for Child {
 	fn id(&self) -> Option<u32> {
 		Child::id(self)
 	}
+	#[cfg(all(unix, feature = "process-group"))]
+	fn spawned_id_layer(&self) -> Option<u32> {
+		Child::id(self)
+	}
+	#[cfg(all(unix, feature = "process-group"))]
+	fn has_process_group_signal_layer(&self) -> bool {
+		true
+	}
+	#[cfg(all(unix, feature = "process-group"))]
+	fn signal_process_group_layer(
+		&mut self,
+		process_group: i32,
+		signal: i32,
+	) -> Option<Result<Option<ExitStatus>>> {
+		let signal = match Signal::try_from(signal) {
+			Ok(signal) => signal,
+			Err(error) => return Some(Err(error.into())),
+		};
+		Some(signal_child_if_running_with(self, signal, |_, signal| {
+			killpg(Pid::from_raw(process_group), signal)
+		}))
+	}
 	fn start_kill(&mut self) -> Result<()> {
-		Child::start_kill(self)
+		#[cfg(unix)]
+		{
+			signal_child_if_running_with(self, Signal::SIGKILL, kill).map(drop)
+		}
+		#[cfg(not(unix))]
+		{
+			Child::start_kill(self)
+		}
 	}
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
 		Child::try_wait(self)
@@ -472,16 +527,8 @@ impl ChildWrapper for Child {
 		Box::pin(Child::wait(self))
 	}
 	#[cfg(unix)]
-	fn signal(&self, sig: i32) -> Result<()> {
-		if let Some(id) = self.id() {
-			kill(
-				Pid::from_raw(i32::try_from(id).map_err(std::io::Error::other)?),
-				Signal::try_from(sig)?,
-			)
-			.map_err(std::io::Error::from)
-		} else {
-			Ok(())
-		}
+	fn signal(&mut self, sig: i32) -> Result<()> {
+		signal_child_if_running_with(self, Signal::try_from(sig)?, kill).map(drop)
 	}
 }
 
@@ -512,11 +559,7 @@ impl dyn ChildWrapper + '_ {
 		self.downcast_ref::<Child>().is_some()
 	}
 
-	#[cfg(all(
-		unix,
-		feature = "pty",
-		any(feature = "process-group", feature = "process-session")
-	))]
+	#[cfg(all(unix, feature = "process-group"))]
 	pub(crate) fn try_spawned_id(&self) -> Option<u32> {
 		let mut inner = self;
 		loop {
@@ -526,6 +569,44 @@ impl dyn ChildWrapper + '_ {
 
 			let next = inner.inner();
 			if same_child(inner, next) {
+				return None;
+			}
+			inner = next;
+		}
+	}
+
+	#[cfg(all(unix, feature = "process-group"))]
+	pub(crate) fn has_process_group_signal_capability(&self) -> bool {
+		let mut inner = self;
+		loop {
+			if inner.has_process_group_signal_layer() {
+				return true;
+			}
+			let next = inner.inner();
+			if same_child(inner, next) {
+				return false;
+			}
+			inner = next;
+		}
+	}
+
+	#[cfg(all(unix, feature = "process-group"))]
+	pub(crate) fn try_signal_process_group(
+		&mut self,
+		process_group: i32,
+		signal: i32,
+	) -> Option<Result<Option<ExitStatus>>> {
+		let mut inner = self;
+		loop {
+			if inner.has_process_group_signal_layer() {
+				return inner.signal_process_group_layer(process_group, signal);
+			}
+			let inner_type = (&*inner as &dyn Any).type_id();
+			let inner_ptr = std::ptr::from_mut(inner);
+			let next = inner.inner_mut();
+			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
+				&& inner_type == (&*next as &dyn Any).type_id()
+			{
 				return None;
 			}
 			inner = next;
@@ -763,6 +844,46 @@ impl dyn ChildWrapper + '_ {
 			}
 			inner = inner.into_inner();
 		}
+	}
+}
+
+#[cfg(all(test, unix))]
+mod signal_tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	use super::*;
+
+	#[tokio::test]
+	async fn terminal_status_prevents_the_production_signal_seam() -> Result<()> {
+		let mut child = NativeCommand::new("true").spawn()?;
+		let status = child.wait().await?;
+		let calls = AtomicUsize::new(0);
+
+		let observed = signal_child_if_running_with(&mut child, Signal::SIGCONT, |_, _| {
+			calls.fetch_add(1, Ordering::SeqCst);
+			Ok(())
+		})?;
+
+		assert_eq!(observed, Some(status));
+		assert_eq!(calls.load(Ordering::SeqCst), 0);
+		assert_eq!(child.wait().await?, status);
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn live_status_reaches_the_production_signal_seam_once() -> Result<()> {
+		let mut child = NativeCommand::new("sh").args(["-c", "sleep 30"]).spawn()?;
+		let calls = AtomicUsize::new(0);
+
+		let observed = signal_child_if_running_with(&mut child, Signal::SIGCONT, |_, _| {
+			calls.fetch_add(1, Ordering::SeqCst);
+			Ok(())
+		})?;
+
+		assert_eq!(observed, None);
+		assert_eq!(calls.load(Ordering::SeqCst), 1);
+		child.kill().await?;
+		Ok(())
 	}
 }
 

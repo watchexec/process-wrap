@@ -3,10 +3,7 @@ use std::{
 	process::ExitStatus,
 };
 
-use nix::{
-	sys::signal::{Signal, killpg},
-	unistd::Pid,
-};
+use nix::{sys::signal::Signal, unistd::Pid};
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -46,6 +43,37 @@ impl ProcessGroup {
 		Self {
 			target: ProcessGroupTarget::AttachTo(leader),
 		}
+	}
+
+	pub(super) fn detached_child(
+		self,
+		inner: &mut dyn ChildWrapper,
+		spawned_id: Option<u32>,
+	) -> Result<PendingChildWrapper> {
+		if !inner.has_process_group_signal_capability() {
+			return Err(Error::new(
+				std::io::ErrorKind::Unsupported,
+				"the child does not expose liveness-gated process-group signalling",
+			));
+		}
+		let direct_id = spawned_id.ok_or_else(|| {
+			Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"the spawn transport did not retain its historical process ID",
+			)
+		})?;
+		let direct_pid = Pid::from_raw(i32::try_from(direct_id).map_err(Error::other)?);
+		let pgid = match self.target {
+			ProcessGroupTarget::Leader => direct_pid,
+			ProcessGroupTarget::AttachTo(pgid) => Pid::from_raw(
+				i32::try_from(pgid).expect("process group IDs are validated before spawning"),
+			),
+		};
+		let exit_status = inner.try_wait()?;
+		Ok(PendingChildWrapper::new(ProcessGroupChild::detached(
+			pgid,
+			exit_status,
+		)))
 	}
 }
 
@@ -102,29 +130,40 @@ impl CommandWrapper for ProcessGroup {
 		inner: &mut dyn ChildWrapper,
 		_core: &CommandWrap,
 	) -> Result<Option<PendingChildWrapper>> {
-		let direct_pid = Pid::from_raw(i32::try_from(inner.id()).map_err(Error::other)?);
-		let pgid = match self.target {
-			ProcessGroupTarget::Leader => direct_pid,
-			ProcessGroupTarget::AttachTo(pgid) => Pid::from_raw(
-				i32::try_from(pgid).expect("process group IDs are validated before spawning"),
-			),
-		};
-		let exit_status = inner.try_wait()?;
+		let spawned_id = inner.try_spawned_id();
+		self.detached_child(inner, spawned_id).map(Some)
+	}
 
-		Ok(Some(PendingChildWrapper::new(ProcessGroupChild::detached(
-			pgid,
-			exit_status,
-		))))
+	fn wrap_child_with_spawned_id(
+		&mut self,
+		inner: &mut dyn ChildWrapper,
+		spawned_id: Option<u32>,
+		_core: &CommandWrap,
+	) -> Result<Option<PendingChildWrapper>> {
+		self.detached_child(inner, spawned_id).map(Some)
 	}
 }
 
 impl ProcessGroupChild {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
-	fn signal_imp(&self, sig: Signal) -> Result<()> {
+	fn signal_imp(&mut self, sig: Signal) -> Result<()> {
 		if matches!(self.exit_status, ChildExitStatus::Exited(_)) {
 			return Ok(());
 		}
-		killpg(self.pgid, sig).map_err(Error::from)
+		let pgid = self.pgid.as_raw();
+		let outcome = self
+			.inner_mut_ref()
+			.try_signal_process_group(pgid, sig as i32)
+			.ok_or_else(|| {
+				Error::new(
+					std::io::ErrorKind::Unsupported,
+					"the child lost its liveness-gated process-group signalling capability",
+				)
+			})??;
+		if let Some(status) = outcome {
+			self.exit_status = ChildExitStatus::Exited(status);
+		}
+		Ok(())
 	}
 }
 
@@ -149,11 +188,6 @@ impl ChildWrapper for ProcessGroupChild {
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn start_kill(&mut self) -> Result<()> {
-		if matches!(self.exit_status, ChildExitStatus::Running)
-			&& let Some(status) = self.inner_mut_ref().try_wait()?
-		{
-			self.exit_status = ChildExitStatus::Exited(status);
-		}
 		self.signal_imp(Signal::SIGKILL)
 	}
 
@@ -183,7 +217,7 @@ impl ChildWrapper for ProcessGroupChild {
 		}
 	}
 
-	fn signal(&self, sig: i32) -> Result<()> {
+	fn signal(&mut self, sig: i32) -> Result<()> {
 		self.signal_imp(Signal::try_from(sig)?)
 	}
 }
