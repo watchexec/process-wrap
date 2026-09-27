@@ -75,11 +75,7 @@ macro_rules! prepared_owner_child_contract {
 			let child = self
 				.take_child()
 				.expect("a prepared-owner sidecar retains its child");
-			Box::new(async move {
-				let output = Box::into_pin(child.wait_with_output()).await;
-				drop(self);
-				output
-			})
+			prepared_owner_wait_with_output(child, self)
 		}
 
 		#[cfg(unix)]
@@ -98,6 +94,49 @@ crate::generic_wrap::Wrap!(
 	"tokio",
 	prepared_owner_child_contract
 );
+
+#[cfg(windows)]
+struct PreparedOwnerWaitWithOutput {
+	// Field order is intentional: cancellation drops the child future before prepared storage.
+	child: Option<Pin<Box<dyn Future<Output = Result<Output>> + Send>>>,
+	owner: Option<Box<PreparedOwnerChild>>,
+}
+
+#[cfg(windows)]
+impl Future for PreparedOwnerWaitWithOutput {
+	type Output = Result<Output>;
+
+	fn poll(
+		self: Pin<&mut Self>,
+		context: &mut std::task::Context<'_>,
+	) -> std::task::Poll<Self::Output> {
+		let this = self.get_mut();
+		let result = match this
+			.child
+			.as_mut()
+			.expect("a prepared wait retains its child future")
+			.as_mut()
+			.poll(context)
+		{
+			std::task::Poll::Pending => return std::task::Poll::Pending,
+			std::task::Poll::Ready(result) => result,
+		};
+		drop(this.child.take());
+		drop(this.owner.take());
+		std::task::Poll::Ready(result)
+	}
+}
+
+#[cfg(windows)]
+fn prepared_owner_wait_with_output(
+	child: Box<dyn ChildWrapper>,
+	owner: Box<PreparedOwnerChild>,
+) -> Box<dyn Future<Output = Result<Output>> + Send> {
+	Box::new(PreparedOwnerWaitWithOutput {
+		child: Some(Box::into_pin(child.wait_with_output())),
+		owner: Some(owner),
+	})
+}
 
 /// Wrapper for `tokio::process::Child`.
 ///
