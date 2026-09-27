@@ -643,12 +643,16 @@ fn closed() -> io::Error {
 mod tests {
 	use std::os::fd::RawFd;
 
+	#[cfg(not(target_os = "macos"))]
 	use nix::unistd::pipe2;
 
 	use super::*;
 
-	fn pipe_pair() -> (OwnedFd, OwnedFd) {
+	fn descriptor_pair() -> (OwnedFd, OwnedFd) {
+		#[cfg(not(target_os = "macos"))]
 		let (reader, writer) = pipe2(OFlag::O_CLOEXEC).unwrap();
+		#[cfg(target_os = "macos")]
+		let (reader, writer) = open_pty(PtySize::default()).unwrap();
 		set_nonblocking(&reader).unwrap();
 		(reader, writer)
 	}
@@ -671,30 +675,27 @@ mod tests {
 				break;
 			}
 			if ready == 0 {
-				panic!("pipe reader timed out waiting for writer closure");
+				panic!("descriptor reader timed out waiting for writer closure");
 			}
 			let error = io::Error::last_os_error();
 			if error.kind() != io::ErrorKind::Interrupted {
-				panic!("pipe reader failed while waiting for writer closure: {error}");
+				panic!("descriptor reader failed while waiting for writer closure: {error}");
 			}
 		}
 
-		let mut byte = 0_u8;
-		// SAFETY: reader is a live nonblocking pipe descriptor and byte is writable for one byte.
-		let read =
-			unsafe { libc::read(reader.as_raw_fd(), std::ptr::from_mut(&mut byte).cast(), 1) };
-		if read != 0 {
-			panic!(
-				"pipe reader did not observe writer closure: {}",
-				io::Error::last_os_error()
-			);
+		let mut byte = [0_u8];
+		match read(reader, &mut byte) {
+			Ok(0) => {}
+			Ok(read) => panic!("descriptor reader observed {read} bytes instead of closure"),
+			Err(error) if is_eof(&error) => {}
+			Err(error) => panic!("descriptor reader failed while confirming closure: {error}"),
 		}
 	}
 
 	fn descriptors() -> (OwnedFd, OwnedFd, OwnedFd, [OwnedFd; 3], [RawFd; 3]) {
-		let (stdin_reader, stdin) = pipe_pair();
-		let (stdout_reader, stdout) = pipe_pair();
-		let (stderr_reader, stderr) = pipe_pair();
+		let (stdin_reader, stdin) = descriptor_pair();
+		let (stdout_reader, stdout) = descriptor_pair();
+		let (stderr_reader, stderr) = descriptor_pair();
 		let raw = [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()];
 		(
 			stdin,
@@ -747,11 +748,11 @@ mod tests {
 	}
 
 	#[test]
-	fn pipe_fixture_descriptors_are_close_on_exec() {
-		let (reader, writer) = pipe_pair();
+	fn descriptor_fixture_descriptors_are_close_on_exec() {
+		let (reader, writer) = descriptor_pair();
 		for descriptor in [&reader, &writer] {
 			let flags = FdFlag::from_bits_truncate(
-				fcntl(descriptor, FcntlArg::F_GETFD).expect("read pipe descriptor flags"),
+				fcntl(descriptor, FcntlArg::F_GETFD).expect("read fixture descriptor flags"),
 			);
 			assert!(flags.contains(FdFlag::FD_CLOEXEC));
 		}
