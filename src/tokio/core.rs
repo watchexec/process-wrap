@@ -1077,6 +1077,7 @@ mod prepared_output_wait_tests {
 			.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PreparedStateTestRendezvous {
 			reached: racing_reached_tx,
 			release: racing_release_rx,
+			publish_reached: true,
 		});
 		cleanup.releases.push(racing_release_tx.clone());
 		let (racing_tx, racing_rx) = mpsc::channel();
@@ -1102,6 +1103,7 @@ mod prepared_output_wait_tests {
 			.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PreparedStateTestRendezvous {
 			reached: closing_reached_tx,
 			release: closing_release_rx,
+			publish_reached: true,
 		});
 		cleanup.releases.push(closing_release_tx.clone());
 		racing_release_tx

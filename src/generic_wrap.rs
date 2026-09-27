@@ -106,12 +106,15 @@ macro_rules! Wrap {
 		struct PreparedStateTestRendezvous {
 			reached: ::std::sync::mpsc::Sender<()>,
 			release: ::std::sync::mpsc::Receiver<()>,
+			publish_reached: bool,
 		}
 
 		#[cfg(all(test, windows))]
 		impl PreparedStateTestRendezvous {
 			fn wait(self) {
-				let _ = self.reached.send(());
+				if self.publish_reached {
+					let _ = self.reached.send(());
+				}
 				let _ = self.release.recv();
 			}
 		}
@@ -593,6 +596,7 @@ macro_rules! Wrap {
 				Some(PreparedStateTestRendezvous {
 					reached: queued_reached_tx,
 					release: queued_release_rx,
+					publish_reached: true,
 				});
 			cleanup.releases.push(queued_release_tx.clone());
 			let (queued_result_tx, queued_result_rx) = ::std::sync::mpsc::channel();
@@ -620,6 +624,7 @@ macro_rules! Wrap {
 				Some(PreparedStateTestRendezvous {
 					reached: closing_reached_tx,
 					release: closing_release_rx,
+					publish_reached: true,
 				});
 			cleanup.releases.push(closing_release_tx.clone());
 			queued_release_tx
@@ -723,6 +728,7 @@ macro_rules! Wrap {
 				Some(PreparedStateTestRendezvous {
 					reached: closing_reached_tx,
 					release: closing_release_rx,
+					publish_reached: true,
 				});
 			cleanup.releases.push(closing_release_tx.clone());
 			let (finished_tx, finished_rx) = ::std::sync::mpsc::channel();
@@ -886,18 +892,202 @@ macro_rules! Wrap {
 		}
 
 		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+		enum PreparedPublicationSetupFailure {
+			ActiveEntered,
+			QueuedReached,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug, Default)]
+		struct PreparedPublicationSetupProbe {
+			started: ::std::sync::atomic::AtomicUsize,
+			active: ::std::sync::atomic::AtomicUsize,
+			joined: ::std::sync::atomic::AtomicUsize,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		struct PreparedPublicationWorkerActivity(
+			::std::sync::Arc<PreparedPublicationSetupProbe>,
+		);
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl PreparedPublicationWorkerActivity {
+			fn new(probe: ::std::sync::Arc<PreparedPublicationSetupProbe>) -> Self {
+				probe
+					.active
+					.fetch_add(1, ::std::sync::atomic::Ordering::SeqCst);
+				Self(probe)
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl Drop for PreparedPublicationWorkerActivity {
+			fn drop(&mut self) {
+				self.0
+					.active
+					.fetch_sub(1, ::std::sync::atomic::Ordering::SeqCst);
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug)]
+		struct PreparedPublicationReader {
+			release: Option<::std::sync::mpsc::Sender<()>>,
+			result: Option<::std::sync::mpsc::Receiver<bool>>,
+			worker: Option<::std::thread::JoinHandle<()>>,
+			probe: ::std::sync::Arc<PreparedPublicationSetupProbe>,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl PreparedPublicationReader {
+			fn new(
+				release: ::std::sync::mpsc::Sender<()>,
+				result: ::std::sync::mpsc::Receiver<bool>,
+				worker: ::std::thread::JoinHandle<()>,
+				probe: ::std::sync::Arc<PreparedPublicationSetupProbe>,
+			) -> Self {
+				probe
+					.started
+					.fetch_add(1, ::std::sync::atomic::Ordering::SeqCst);
+				Self {
+					release: Some(release),
+					result: Some(result),
+					worker: Some(worker),
+					probe,
+				}
+			}
+
+			fn release(&mut self) {
+				if let Some(release) = self.release.take() {
+					let _ = release.send(());
+				}
+			}
+
+			fn receive(
+				&mut self,
+			) -> ::std::result::Result<bool, ::std::sync::mpsc::RecvTimeoutError> {
+				self.result
+					.take()
+					.expect("an unfinished publication reader owns its result")
+					.recv_timeout(PreparedPublicationControl::TIMEOUT)
+			}
+
+			fn join(&mut self) -> Option<::std::thread::Result<()>> {
+				self.worker.take().map(|worker| {
+					let result = worker.join();
+					self.probe
+						.joined
+						.fetch_add(1, ::std::sync::atomic::Ordering::SeqCst);
+					result
+				})
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl Drop for PreparedPublicationReader {
+			fn drop(&mut self) {
+				self.release();
+				if let Some(Err(payload)) = self.join() {
+					::std::mem::forget(payload);
+				}
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		fn join_publication_readers(
+			readers: [&mut PreparedPublicationReader; 2],
+		) -> Option<Box<dyn ::std::any::Any + Send>> {
+			let mut first_payload = None;
+			for reader in readers {
+				if let Some(Err(payload)) = reader.join() {
+					if first_payload.is_none() {
+						first_payload = Some(payload);
+					} else {
+						::std::mem::forget(payload);
+					}
+				}
+			}
+			first_payload
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		struct PreparedPublicationReaderSetup {
+			active: Option<PreparedPublicationReader>,
+			queued: Option<PreparedPublicationReader>,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl PreparedPublicationReaderSetup {
+			fn new() -> Self {
+				Self {
+					active: None,
+					queued: None,
+				}
+			}
+
+			fn own_active(&mut self, reader: PreparedPublicationReader) {
+				self.active = Some(reader);
+			}
+
+			fn own_queued(&mut self, reader: PreparedPublicationReader) {
+				self.queued = Some(reader);
+			}
+
+			fn install(mut self, control: &PreparedPublicationControl) {
+				*control
+					.active_reader
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner) = self.active.take();
+				*control
+					.queued_reader
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner) = self.queued.take();
+			}
+
+			fn release_all(&mut self) {
+				if let Some(reader) = self.queued.as_mut() {
+					reader.release();
+				}
+				if let Some(reader) = self.active.as_mut() {
+					reader.release();
+				}
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl Drop for PreparedPublicationReaderSetup {
+			fn drop(&mut self) {
+				self.release_all();
+				match (self.active.as_mut(), self.queued.as_mut()) {
+					(Some(active), Some(queued)) => {
+						if let Some(payload) = join_publication_readers([active, queued]) {
+							::std::mem::forget(payload);
+						}
+					}
+					(Some(reader), None) | (None, Some(reader)) => {
+						if let Some(Err(payload)) = reader.join() {
+							::std::mem::forget(payload);
+						}
+					}
+					(None, None) => {}
+				}
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
 		#[derive(Debug)]
 		struct PreparedPublicationControl {
 			placed_tx: ::std::sync::mpsc::Sender<()>,
 			placed_rx: ::std::sync::Mutex<::std::sync::mpsc::Receiver<()>>,
+			setup_failure: Option<PreparedPublicationSetupFailure>,
+			setup_timeout: ::std::time::Duration,
+			setup_probe: ::std::sync::Arc<PreparedPublicationSetupProbe>,
 			closing_tx: ::std::sync::Mutex<Option<::std::sync::mpsc::Sender<()>>>,
 			closing_rx: ::std::sync::Mutex<::std::sync::mpsc::Receiver<()>>,
-			active_release: ::std::sync::Mutex<Option<::std::sync::mpsc::Sender<()>>>,
-			queued_release: ::std::sync::Mutex<Option<::std::sync::mpsc::Sender<()>>>,
+			active_reader: ::std::sync::Mutex<Option<PreparedPublicationReader>>,
+			queued_reader: ::std::sync::Mutex<Option<PreparedPublicationReader>>,
 			closing_release: ::std::sync::Mutex<Option<::std::sync::mpsc::Sender<()>>>,
-			active_result: ::std::sync::Mutex<Option<::std::sync::mpsc::Receiver<bool>>>,
-			queued_result: ::std::sync::Mutex<Option<::std::sync::mpsc::Receiver<bool>>>,
-			workers: ::std::sync::Mutex<Vec<::std::thread::JoinHandle<()>>>,
 			queued_callbacks: ::std::sync::Arc<::std::sync::atomic::AtomicUsize>,
 			retained_token: ::std::sync::Mutex<Option<::std::sync::Arc<PreparedChild>>>,
 		}
@@ -907,19 +1097,31 @@ macro_rules! Wrap {
 			const TIMEOUT: ::std::time::Duration = ::std::time::Duration::from_secs(5);
 
 			fn new() -> ::std::sync::Arc<Self> {
+				Self::with_setup_failure(None)
+			}
+
+			fn with_setup_failure(
+				setup_failure: Option<PreparedPublicationSetupFailure>,
+			) -> ::std::sync::Arc<Self> {
 				let (placed_tx, placed_rx) = ::std::sync::mpsc::channel();
 				let (closing_tx, closing_rx) = ::std::sync::mpsc::channel();
 				::std::sync::Arc::new(Self {
 					placed_tx,
 					placed_rx: ::std::sync::Mutex::new(placed_rx),
+					setup_failure,
+					setup_timeout: if setup_failure.is_some() {
+						::std::time::Duration::from_millis(100)
+					} else {
+						Self::TIMEOUT
+					},
+					setup_probe: ::std::sync::Arc::new(
+						PreparedPublicationSetupProbe::default(),
+					),
 					closing_tx: ::std::sync::Mutex::new(Some(closing_tx)),
 					closing_rx: ::std::sync::Mutex::new(closing_rx),
-					active_release: ::std::sync::Mutex::new(None),
-					queued_release: ::std::sync::Mutex::new(None),
+					active_reader: ::std::sync::Mutex::new(None),
+					queued_reader: ::std::sync::Mutex::new(None),
 					closing_release: ::std::sync::Mutex::new(None),
-					active_result: ::std::sync::Mutex::new(None),
-					queued_result: ::std::sync::Mutex::new(None),
-					workers: ::std::sync::Mutex::new(Vec::new()),
 					queued_callbacks: ::std::sync::Arc::new(
 						::std::sync::atomic::AtomicUsize::new(0),
 					),
@@ -933,19 +1135,31 @@ macro_rules! Wrap {
 					.upgrade()
 					.expect("the private owner remains live during wrapping");
 				let token = ::std::sync::Arc::new(token);
+				let mut setup = PreparedPublicationReaderSetup::new();
 				let (active_entered_tx, active_entered_rx) = ::std::sync::mpsc::channel();
 				let (active_release_tx, active_release_rx) = ::std::sync::mpsc::channel();
 				let (active_result_tx, active_result_rx) = ::std::sync::mpsc::channel();
 				let active_token = ::std::sync::Arc::clone(&token);
-				let active = ::std::thread::spawn(move || {
-					let result = active_token.with::<PreparedRaceDrop, _>(|_| {
-						let _ = active_entered_tx.send(());
-						active_release_rx.recv().is_ok()
-					}) == Some(true);
-					let _ = active_result_tx.send(result);
-				});
+				let suppress_active =
+					self.setup_failure == Some(PreparedPublicationSetupFailure::ActiveEntered);
+				let active_probe = ::std::sync::Arc::clone(&self.setup_probe);
+				setup.own_active(PreparedPublicationReader::new(
+					active_release_tx,
+					active_result_rx,
+					::std::thread::spawn(move || {
+						let _activity = PreparedPublicationWorkerActivity::new(active_probe);
+						let result = active_token.with::<PreparedRaceDrop, _>(|_| {
+							if !suppress_active {
+								let _ = active_entered_tx.send(());
+							}
+							active_release_rx.recv().is_ok()
+						}) == Some(true);
+						let _ = active_result_tx.send(result);
+					}),
+					::std::sync::Arc::clone(&self.setup_probe),
+				));
 				active_entered_rx
-					.recv_timeout(Self::TIMEOUT)
+					.recv_timeout(self.setup_timeout)
 					.expect("reader A owns the prepared value before wrapping returns");
 
 				let (queued_reached_tx, queued_reached_rx) = ::std::sync::mpsc::channel();
@@ -957,21 +1171,30 @@ macro_rules! Wrap {
 					Some(PreparedStateTestRendezvous {
 						reached: queued_reached_tx,
 						release: queued_release_rx,
+						publish_reached: self.setup_failure
+							!= Some(PreparedPublicationSetupFailure::QueuedReached),
 					});
 				let (queued_result_tx, queued_result_rx) = ::std::sync::mpsc::channel();
 				let queued_token = ::std::sync::Arc::clone(&token);
 				let queued_callbacks = ::std::sync::Arc::clone(&self.queued_callbacks);
-				let queued = ::std::thread::spawn(move || {
-					let accessed = queued_token
-						.with::<PreparedRaceDrop, _>(|_| {
-							queued_callbacks
-								.fetch_add(1, ::std::sync::atomic::Ordering::SeqCst);
-						})
-						.is_some();
-					let _ = queued_result_tx.send(accessed);
-				});
+				let queued_probe = ::std::sync::Arc::clone(&self.setup_probe);
+				setup.own_queued(PreparedPublicationReader::new(
+					queued_release_tx,
+					queued_result_rx,
+					::std::thread::spawn(move || {
+						let _activity = PreparedPublicationWorkerActivity::new(queued_probe);
+						let accessed = queued_token
+							.with::<PreparedRaceDrop, _>(|_| {
+								queued_callbacks
+									.fetch_add(1, ::std::sync::atomic::Ordering::SeqCst);
+							})
+							.is_some();
+						let _ = queued_result_tx.send(accessed);
+					}),
+					::std::sync::Arc::clone(&self.setup_probe),
+				));
 				queued_reached_rx
-					.recv_timeout(Self::TIMEOUT)
+					.recv_timeout(self.setup_timeout)
 					.expect("reader B upgraded and attempted value while A owned it");
 
 				let (closing_release_tx, closing_release_rx) = ::std::sync::mpsc::channel();
@@ -988,32 +1211,14 @@ macro_rules! Wrap {
 					Some(PreparedStateTestRendezvous {
 						reached: closing_tx,
 						release: closing_release_rx,
+						publish_reached: true,
 					});
 
-				*self
-					.active_release
-					.lock()
-					.unwrap_or_else(::std::sync::PoisonError::into_inner) = Some(active_release_tx);
-				*self
-					.queued_release
-					.lock()
-					.unwrap_or_else(::std::sync::PoisonError::into_inner) = Some(queued_release_tx);
+				setup.install(self);
 				*self
 					.closing_release
 					.lock()
 					.unwrap_or_else(::std::sync::PoisonError::into_inner) = Some(closing_release_tx);
-				*self
-					.active_result
-					.lock()
-					.unwrap_or_else(::std::sync::PoisonError::into_inner) = Some(active_result_rx);
-				*self
-					.queued_result
-					.lock()
-					.unwrap_or_else(::std::sync::PoisonError::into_inner) = Some(queued_result_rx);
-				self.workers
-					.lock()
-					.unwrap_or_else(::std::sync::PoisonError::into_inner)
-					.extend([active, queued]);
 				*self
 					.retained_token
 					.lock()
@@ -1021,6 +1226,30 @@ macro_rules! Wrap {
 				self.placed_tx
 					.send(())
 					.expect("the test observes both publication readers");
+			}
+
+			fn assert_setup_workers_joined(&self, expected: usize) {
+				assert_eq!(
+					self.setup_probe
+						.started
+						.load(::std::sync::atomic::Ordering::SeqCst),
+					expected,
+					"the setup seam starts the expected readers"
+				);
+				assert_eq!(
+					self.setup_probe
+						.joined
+						.load(::std::sync::atomic::Ordering::SeqCst),
+					expected,
+					"every started reader is joined before setup failure returns"
+				);
+				assert_eq!(
+					self.setup_probe
+						.active
+						.load(::std::sync::atomic::Ordering::SeqCst),
+					0,
+					"no prepared reader remains active after setup failure"
+				);
 			}
 
 			fn wait_placed(&self) {
@@ -1039,8 +1268,21 @@ macro_rules! Wrap {
 					.expect("the real lifecycle path published prepared closing");
 			}
 
-			fn release(slot: &::std::sync::Mutex<Option<::std::sync::mpsc::Sender<()>>>) {
-				if let Some(release) = slot
+			fn release_reader(
+				slot: &::std::sync::Mutex<Option<PreparedPublicationReader>>,
+			) {
+				if let Some(reader) = slot
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.as_mut()
+				{
+					reader.release();
+				}
+			}
+
+			fn release_closing(&self) {
+				if let Some(release) = self
+					.closing_release
 					.lock()
 					.unwrap_or_else(::std::sync::PoisonError::into_inner)
 					.take()
@@ -1050,15 +1292,11 @@ macro_rules! Wrap {
 			}
 
 			fn release_queued(&self) {
-				Self::release(&self.queued_release);
+				Self::release_reader(&self.queued_reader);
 			}
 
 			fn release_active(&self) {
-				Self::release(&self.active_release);
-			}
-
-			fn release_closing(&self) {
-				Self::release(&self.closing_release);
+				Self::release_reader(&self.active_reader);
 			}
 
 			fn release_all(&self) {
@@ -1068,30 +1306,25 @@ macro_rules! Wrap {
 			}
 
 			fn collect_readers(&self) -> (bool, bool) {
-				let active = self
-					.active_result
+				let mut active = self
+					.active_reader
 					.lock()
 					.unwrap_or_else(::std::sync::PoisonError::into_inner)
 					.take()
-					.expect("reader A retains its result")
-					.recv_timeout(Self::TIMEOUT)
-					.expect("reader A completes after release");
-				let queued = self
-					.queued_result
+					.expect("reader A remains owned until collection");
+				let mut queued = self
+					.queued_reader
 					.lock()
 					.unwrap_or_else(::std::sync::PoisonError::into_inner)
 					.take()
-					.expect("reader B retains its result")
-					.recv_timeout(Self::TIMEOUT)
-					.expect("reader B completes after closing");
-				for worker in ::std::mem::take(
-					&mut *self
-						.workers
-						.lock()
-						.unwrap_or_else(::std::sync::PoisonError::into_inner),
-				) {
-					worker.join().expect("prepared publication reader does not panic");
+					.expect("reader B remains owned until collection");
+				let active_result = active.receive();
+				let queued_result = queued.receive();
+				if let Some(payload) = join_publication_readers([&mut active, &mut queued]) {
+					::std::panic::resume_unwind(payload);
 				}
+				let active = active_result.expect("reader A completes after release");
+				let queued = queued_result.expect("reader B completes after closing");
 				(active, queued)
 			}
 
@@ -1125,21 +1358,21 @@ macro_rules! Wrap {
 		#[cfg(all(test, windows, feature = "job-object"))]
 		impl Drop for PreparedPublicationControl {
 			fn drop(&mut self) {
-				if let Some(release) = self
-					.queued_release
+				let mut active = self
+					.active_reader
 					.get_mut()
 					.unwrap_or_else(::std::sync::PoisonError::into_inner)
-					.take()
-				{
-					let _ = release.send(());
+					.take();
+				let mut queued = self
+					.queued_reader
+					.get_mut()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.take();
+				if let Some(reader) = queued.as_mut() {
+					reader.release();
 				}
-				if let Some(release) = self
-					.active_release
-					.get_mut()
-					.unwrap_or_else(::std::sync::PoisonError::into_inner)
-					.take()
-				{
-					let _ = release.send(());
+				if let Some(reader) = active.as_mut() {
+					reader.release();
 				}
 				if let Some(release) = self
 					.closing_release
@@ -1149,14 +1382,18 @@ macro_rules! Wrap {
 				{
 					let _ = release.send(());
 				}
-				for worker in ::std::mem::take(
-					self.workers
-						.get_mut()
-						.unwrap_or_else(::std::sync::PoisonError::into_inner),
-				) {
-					if let Err(payload) = worker.join() {
-						::std::mem::forget(payload);
+				match (active.as_mut(), queued.as_mut()) {
+					(Some(active), Some(queued)) => {
+						if let Some(payload) = join_publication_readers([active, queued]) {
+							::std::mem::forget(payload);
+						}
 					}
+					(Some(reader), None) | (None, Some(reader)) => {
+						if let Some(Err(payload)) = reader.join() {
+							::std::mem::forget(payload);
+						}
+					}
+					(None, None) => {}
 				}
 			}
 		}
@@ -1582,6 +1819,43 @@ macro_rules! Wrap {
 			}
 			drop(command);
 			cleanup.finish();
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		fn assert_publication_reader_setup_failure_cleanup(
+			failure: PreparedPublicationSetupFailure,
+			expected_workers: usize,
+		) {
+			let drops = ::std::sync::Arc::new(::std::sync::atomic::AtomicUsize::new(0));
+			let owner = PreparedChildOwner::new(Box::new(PreparedRaceDrop(
+				::std::sync::Arc::clone(&drops),
+			)));
+			let control = PreparedPublicationControl::with_setup_failure(Some(failure));
+			let outcome = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+				control.start(owner.installed_token());
+			}));
+			assert!(outcome.is_err(), "the suppressed setup event must fail");
+			control.assert_setup_workers_joined(expected_workers);
+			drop(owner);
+			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 1);
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn missing_active_reader_setup_event_releases_and_joins_started_worker() {
+			assert_publication_reader_setup_failure_cleanup(
+				PreparedPublicationSetupFailure::ActiveEntered,
+				1,
+			);
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn missing_queued_reader_setup_event_releases_and_joins_started_workers() {
+			assert_publication_reader_setup_failure_cleanup(
+				PreparedPublicationSetupFailure::QueuedReached,
+				2,
+			);
 		}
 
 		#[cfg(all(test, windows, feature = "job-object"))]

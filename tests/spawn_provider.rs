@@ -837,22 +837,114 @@ macro_rules! spawn_provider_tests {
 
 
 			#[cfg(windows)]
+			#[derive(Debug, Default)]
+			struct ActivePreparedReaderSetupProbe {
+				started: AtomicUsize,
+				active: AtomicUsize,
+				joined: AtomicUsize,
+			}
+
+			#[cfg(windows)]
+			struct ActivePreparedReaderActivity(Arc<ActivePreparedReaderSetupProbe>);
+
+			#[cfg(windows)]
+			impl ActivePreparedReaderActivity {
+				fn new(probe: Arc<ActivePreparedReaderSetupProbe>) -> Self {
+					probe.active.fetch_add(1, Ordering::SeqCst);
+					Self(probe)
+				}
+			}
+
+			#[cfg(windows)]
+			impl Drop for ActivePreparedReaderActivity {
+				fn drop(&mut self) {
+					self.0.active.fetch_sub(1, Ordering::SeqCst);
+				}
+			}
+
+			#[cfg(windows)]
+			struct ActivePreparedReaderSetup {
+				release: Option<mpsc::Sender<()>>,
+				worker: Option<thread::JoinHandle<bool>>,
+				probe: Arc<ActivePreparedReaderSetupProbe>,
+			}
+
+			#[cfg(windows)]
+			impl ActivePreparedReaderSetup {
+				fn new(
+					release: mpsc::Sender<()>,
+					worker: thread::JoinHandle<bool>,
+					probe: Arc<ActivePreparedReaderSetupProbe>,
+				) -> Self {
+					probe.started.fetch_add(1, Ordering::SeqCst);
+					Self {
+						release: Some(release),
+						worker: Some(worker),
+						probe,
+					}
+				}
+
+				fn install(mut self, reader: &ActivePreparedReader) {
+					*reader
+						.release
+						.lock()
+						.unwrap_or_else(std::sync::PoisonError::into_inner) = self.release.take();
+					*reader
+						.worker
+						.lock()
+						.unwrap_or_else(std::sync::PoisonError::into_inner) = self.worker.take();
+				}
+			}
+
+			#[cfg(windows)]
+			impl Drop for ActivePreparedReaderSetup {
+				fn drop(&mut self) {
+					if let Some(release) = self.release.take() {
+						let _ = release.send(());
+					}
+					if let Some(worker) = self.worker.take() {
+						let result = worker.join();
+						self.probe.joined.fetch_add(1, Ordering::SeqCst);
+						if let Err(payload) = result {
+							std::mem::forget(payload);
+						}
+					}
+				}
+			}
+
+			#[cfg(windows)]
 			#[derive(Debug)]
 			struct ActivePreparedReader {
 				entered: mpsc::Sender<()>,
 				release: Mutex<Option<mpsc::Sender<()>>>,
 				worker: Mutex<Option<thread::JoinHandle<bool>>>,
+				suppress_entered: bool,
+				setup_timeout: Duration,
+				setup_probe: Arc<ActivePreparedReaderSetupProbe>,
 			}
 
 			#[cfg(windows)]
 			impl ActivePreparedReader {
 				fn new() -> (Arc<Self>, mpsc::Receiver<()>) {
+					Self::with_setup_failure(false)
+				}
+
+				fn with_setup_failure(
+					suppress_entered: bool,
+				) -> (Arc<Self>, mpsc::Receiver<()>) {
 					let (entered, observe_entered) = mpsc::channel();
 					(
 						Arc::new(Self {
 							entered,
 							release: Mutex::new(None),
 							worker: Mutex::new(None),
+							suppress_entered,
+							setup_timeout: if suppress_entered {
+								Duration::from_millis(100)
+							} else {
+								EXIT_TIMEOUT
+							},
+							setup_probe: Arc::new(ActivePreparedReaderSetupProbe::default()),
 						}),
 						observe_entered,
 					)
@@ -861,26 +953,28 @@ macro_rules! spawn_provider_tests {
 				fn start(&self, token: PreparedChild) {
 					let (active_tx, active_rx) = mpsc::channel();
 					let (release_tx, release_rx) = mpsc::channel();
-					let worker = thread::spawn(move || {
-						token.with::<Option<PreparedGuard>, _>(|prepared| {
-							assert!(prepared.is_some());
-							active_tx
-								.send(())
-								.expect("the wrapping callback observes active prepared access");
-							release_rx.recv_timeout(EXIT_TIMEOUT).is_ok()
-						}) == Some(true)
-					});
+					let suppress_entered = self.suppress_entered;
+					let setup_probe = Arc::clone(&self.setup_probe);
+					let setup = ActivePreparedReaderSetup::new(
+						release_tx,
+						thread::spawn(move || {
+							let _activity = ActivePreparedReaderActivity::new(setup_probe);
+							token.with::<Option<PreparedGuard>, _>(|prepared| {
+								assert!(prepared.is_some());
+								if !suppress_entered {
+									active_tx.send(()).expect(
+										"the wrapping callback observes active prepared access",
+									);
+								}
+								release_rx.recv_timeout(EXIT_TIMEOUT).is_ok()
+							}) == Some(true)
+						}),
+						Arc::clone(&self.setup_probe),
+					);
 					active_rx
-						.recv_timeout(EXIT_TIMEOUT)
+						.recv_timeout(self.setup_timeout)
 						.expect("the prepared reader enters before wrapping returns");
-					*self
-						.release
-						.lock()
-						.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release_tx);
-					*self
-						.worker
-						.lock()
-						.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
+					setup.install(self);
 					let _ = self.entered.send(());
 				}
 
@@ -893,11 +987,36 @@ macro_rules! spawn_provider_tests {
 					{
 						let _ = release.send(());
 					}
-					self.worker
+					let worker = self
+						.worker
 						.lock()
 						.unwrap_or_else(std::sync::PoisonError::into_inner)
-						.take()
-						.is_none_or(|worker| worker.join().unwrap_or(false))
+						.take();
+					match worker {
+						Some(worker) => {
+							let result = worker.join();
+							self.setup_probe.joined.fetch_add(1, Ordering::SeqCst);
+							match result {
+								Ok(completed) => completed,
+								Err(payload) => std::panic::resume_unwind(payload),
+							}
+						}
+						None => true,
+					}
+				}
+
+				fn assert_setup_worker_joined(&self) {
+					assert_eq!(self.setup_probe.started.load(Ordering::SeqCst), 1);
+					assert_eq!(
+						self.setup_probe.joined.load(Ordering::SeqCst),
+						1,
+						"the started active reader is joined before setup failure returns"
+					);
+					assert_eq!(
+						self.setup_probe.active.load(Ordering::SeqCst),
+						0,
+						"no active prepared reader survives setup failure"
+					);
 				}
 			}
 
@@ -917,9 +1036,12 @@ macro_rules! spawn_provider_tests {
 						.get_mut()
 						.unwrap_or_else(std::sync::PoisonError::into_inner)
 						.take()
-						&& let Err(payload) = worker.join()
 					{
-						std::mem::forget(payload);
+						let result = worker.join();
+						self.setup_probe.joined.fetch_add(1, Ordering::SeqCst);
+						if let Err(payload) = result {
+							std::mem::forget(payload);
+						}
 					}
 				}
 			}
@@ -3090,6 +3212,28 @@ macro_rules! spawn_provider_tests {
 						assert_eq!(shared.events(), successful_events("provider"));
 					}
 				}
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn active_reader_setup_failure_releases_and_joins_started_worker() {
+				let shared = Arc::new(Shared::default());
+				let drops = Arc::new(AtomicUsize::new(0));
+				let (reader, _entered) = ActivePreparedReader::with_setup_failure(true);
+				let mut command = provider_command(Arc::clone(&shared), "provider");
+				command
+					.wrap(OptionPrepared {
+						drops: Arc::clone(&drops),
+					})
+					.wrap(AccessInstalledPrepared {
+						start_once: true,
+						reader: Arc::clone(&reader),
+					});
+
+				let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
+				let _payload = outcome.expect_err("the suppressed entered event must fail setup");
+				reader.assert_setup_worker_joined();
+				assert_eq!(drops.load(Ordering::SeqCst), 1);
 			}
 
 			#[cfg(windows)]
