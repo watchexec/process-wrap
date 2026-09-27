@@ -33,6 +33,9 @@ macro_rules! spawn_provider_tests {
 				time::{Duration, Instant},
 			};
 
+			#[cfg(windows)]
+			use std::{sync::mpsc, thread};
+
 			use super::bounded_process;
 			use process_wrap::{CommandArg, SpawnTransaction};
 			use $child_wrapper as ChildWrapper;
@@ -661,7 +664,7 @@ macro_rules! spawn_provider_tests {
 			#[derive(Debug)]
 			struct RetainInstalledPrepared {
 				steal_once: bool,
-				escaped: Option<PreparedChild>,
+				escaped: Mutex<Option<PreparedChild>>,
 			}
 
 			#[cfg(windows)]
@@ -678,8 +681,12 @@ macro_rules! spawn_provider_tests {
 						let layer = (child as &mut dyn std::any::Any)
 							.downcast_mut::<OptionPreparedLayer>()
 							.expect("the prepared layer is immediately inside this wrapper");
-						self.escaped = layer.prepared.take();
-						assert!(self.escaped.is_some());
+						let escaped = layer.prepared.take();
+						assert!(escaped.is_some());
+						*self
+							.escaped
+							.get_mut()
+							.unwrap_or_else(std::sync::PoisonError::into_inner) = escaped;
 					}
 					Ok(None)
 				}
@@ -1455,6 +1462,98 @@ macro_rules! spawn_provider_tests {
 						expect_custom_child: true,
 					});
 				command
+			}
+
+			#[cfg(windows)]
+			fn take_retained_prepared(command: &CommandWrap) -> PreparedChild {
+				command
+					.get_wrap::<RetainInstalledPrepared>()
+					.expect("the retaining wrapper remains registered")
+					.escaped
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner)
+					.take()
+					.expect("the retaining wrapper captured the installed token")
+			}
+
+			#[cfg(windows)]
+			fn assert_active_prepared_access_blocks_destruction(
+				token: PreparedChild,
+				drops: Arc<AtomicUsize>,
+				destroy: impl FnOnce() + Send + 'static,
+			) {
+				let (entered_tx, entered_rx) = mpsc::channel();
+				let (release_tx, release_rx) = mpsc::channel();
+				let (retry_tx, retry_rx) = mpsc::channel();
+				let (inspection_tx, inspection_rx) = mpsc::channel();
+				let worker = thread::spawn(move || {
+					let completed = token
+						.with::<Option<PreparedGuard>, _>(|prepared| {
+							assert!(prepared.is_some());
+							entered_tx
+								.send(())
+								.expect("the test receives the active-access rendezvous");
+							release_rx.recv_timeout(EXIT_TIMEOUT).is_ok()
+						})
+						== Some(true);
+					let retry_requested = retry_rx.recv_timeout(EXIT_TIMEOUT).is_ok();
+					let accessible_after_destruction = retry_requested
+						&& token
+							.with::<Option<PreparedGuard>, _>(|prepared| prepared.is_some())
+							.is_some();
+					let _ = inspection_tx.send((completed, accessible_after_destruction));
+				});
+
+				entered_rx
+					.recv_timeout(EXIT_TIMEOUT)
+					.expect("prepared inspection entered after upgrading and locking state");
+				let (started_tx, started_rx) = mpsc::channel();
+				let (destroyed_tx, destroyed_rx) = mpsc::channel();
+				let destroyer = thread::spawn(move || {
+					started_tx
+						.send(())
+						.expect("the test observes destruction starting");
+					destroy();
+					let _ = destroyed_tx.send(());
+				});
+				started_rx
+					.recv_timeout(EXIT_TIMEOUT)
+					.expect("destruction thread started");
+				assert_eq!(
+					destroyed_rx.recv_timeout(Duration::from_millis(250)),
+					Err(mpsc::RecvTimeoutError::Timeout),
+					"authoritative destruction returned during immutable prepared access"
+				);
+				assert_eq!(
+					drops.load(Ordering::SeqCst),
+					0,
+					"prepared state dropped while immutably borrowed"
+				);
+
+				release_tx
+					.send(())
+					.expect("release the finite prepared inspection");
+				destroyed_rx
+					.recv_timeout(EXIT_TIMEOUT)
+					.expect("destruction completes after prepared inspection release");
+				assert_eq!(drops.load(Ordering::SeqCst), 1);
+				retry_tx
+					.send(())
+					.expect("request a post-destruction token access");
+				let (completed, accessible_after_destruction) = inspection_rx
+					.recv_timeout(EXIT_TIMEOUT)
+					.expect("prepared inspection worker completed");
+				assert!(completed, "the finite prepared inspection completed");
+				assert!(
+					!accessible_after_destruction,
+					"a retained token reacquired prepared state after owner destruction"
+				);
+				worker
+					.join()
+					.expect("prepared inspection worker did not panic");
+				destroyer
+					.join()
+					.expect("authoritative destruction did not panic");
 			}
 
 			fn provider_command_with_primary_failure(
@@ -2410,7 +2509,7 @@ macro_rules! spawn_provider_tests {
 						})
 						.wrap(RetainInstalledPrepared {
 							steal_once: true,
-							escaped: None,
+							escaped: Mutex::new(None),
 						});
 
 					let child = command
@@ -2429,6 +2528,149 @@ macro_rules! spawn_provider_tests {
 					assert_eq!(drops.load(Ordering::SeqCst), 2);
 					if provider {
 						assert_eq!(shared.events(), successful_events("provider"));
+					}
+				}
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn active_prepared_access_blocks_returned_child_destruction() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for provider in [false, true] {
+					let shared = Arc::new(Shared::default());
+					let drops = Arc::new(AtomicUsize::new(0));
+					let mut command = if provider {
+						provider_command(Arc::clone(&shared), "provider")
+					} else {
+						command()
+					};
+					command
+						.wrap(OptionPrepared {
+							drops: Arc::clone(&drops),
+						})
+						.wrap(RetainInstalledPrepared {
+							steal_once: true,
+							escaped: Mutex::new(None),
+						});
+
+					let child = command
+						.spawn()
+						.expect("spawn a child with externally inspected prepared state");
+					let token = take_retained_prepared(&command);
+					assert_active_prepared_access_blocks_destruction(
+						token,
+						Arc::clone(&drops),
+						move || drop(child),
+					);
+
+					let child = command.spawn().expect("the command remains reusable");
+					drop(child);
+					assert_eq!(drops.load(Ordering::SeqCst), 2);
+				}
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn active_prepared_access_blocks_consuming_extraction() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for provider in [false, true] {
+					let shared = Arc::new(Shared::default());
+					let drops = Arc::new(AtomicUsize::new(0));
+					let mut command = if provider {
+						provider_command(Arc::clone(&shared), "provider")
+					} else {
+						command()
+					};
+					command
+						.wrap(OptionPrepared {
+							drops: Arc::clone(&drops),
+						})
+						.wrap(RetainInstalledPrepared {
+							steal_once: true,
+							escaped: Mutex::new(None),
+						});
+
+					let child = command
+						.spawn()
+						.expect("spawn a child for consuming extraction");
+					let token = take_retained_prepared(&command);
+					assert_active_prepared_access_blocks_destruction(
+						token,
+						Arc::clone(&drops),
+						move || {
+							let child = child.into_inner();
+							if provider {
+								drop(child.into_inner());
+							} else {
+								drop(child);
+							}
+						},
+					);
+
+					let child = command.spawn().expect("the command remains reusable");
+					drop(child);
+					assert_eq!(drops.load(Ordering::SeqCst), 2);
+				}
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn poisoned_prepared_access_preserves_exact_cleanup_and_extraction() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for provider in [false, true] {
+					for extract in [false, true] {
+						let shared = Arc::new(Shared::default());
+						let drops = Arc::new(AtomicUsize::new(0));
+						let mut command = if provider {
+							provider_command(Arc::clone(&shared), "provider")
+						} else {
+							command()
+						};
+						command
+							.wrap(OptionPrepared {
+								drops: Arc::clone(&drops),
+							})
+							.wrap(RetainInstalledPrepared {
+								steal_once: true,
+								escaped: Mutex::new(None),
+							});
+
+						let child = command
+							.spawn()
+							.expect("spawn a child whose prepared mutex will be poisoned");
+						let token = take_retained_prepared(&command);
+						let payload = catch_unwind(AssertUnwindSafe(|| {
+							let _ = token.with::<Option<PreparedGuard>, ()>(|_| {
+								panic_any("poison prepared access")
+							});
+						}))
+						.expect_err("the prepared accessor poisons its private mutex");
+						std::mem::forget(payload);
+
+						if extract {
+							let child = child.into_inner();
+							if provider {
+								drop(child.into_inner());
+							} else {
+								drop(child);
+							}
+						} else {
+							drop(child);
+						}
+						assert_eq!(drops.load(Ordering::SeqCst), 1);
+						assert!(
+							token
+								.with::<Option<PreparedGuard>, _>(|prepared| prepared.is_some())
+								.is_none(),
+							"poison recovery must not leave the prepared value accessible"
+						);
+
+						let child = command.spawn().expect("the command remains reusable");
+						drop(child);
+						assert_eq!(drops.load(Ordering::SeqCst), 2);
 					}
 				}
 			}

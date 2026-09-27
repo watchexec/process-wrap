@@ -106,6 +106,7 @@ macro_rules! Wrap {
 		struct PreparedChildState {
 			value: ::std::sync::Mutex<Option<Box<dyn ::std::any::Any + Send>>>,
 			type_id: ::std::any::TypeId,
+			revoked: ::std::sync::atomic::AtomicBool,
 		}
 
 		#[cfg(windows)]
@@ -122,6 +123,7 @@ macro_rules! Wrap {
 					state: ::std::sync::Arc::new(PreparedChildState {
 						value: ::std::sync::Mutex::new(Some(value)),
 						type_id,
+						revoked: ::std::sync::atomic::AtomicBool::new(false),
 					}),
 					installed_layer: None,
 				}
@@ -159,6 +161,20 @@ macro_rules! Wrap {
 
 			fn installed_in(&self, layer: (::std::any::TypeId, usize)) -> bool {
 				self.installed_layer == Some(layer)
+			}
+		}
+
+		#[cfg(windows)]
+		impl Drop for PreparedChildOwner {
+			fn drop(&mut self) {
+				// Publish revocation before contending for the value lock. An inspection which already
+				// borrowed the value retains that lock, while every later locker observes revocation.
+				self.state
+					.revoked
+					.store(true, ::std::sync::atomic::Ordering::Release);
+				// `take` releases the lock before the value's destructor runs.
+				let value = self.take();
+				drop(value);
 			}
 		}
 
@@ -240,6 +256,9 @@ macro_rules! Wrap {
 					.value
 					.lock()
 					.unwrap_or_else(::std::sync::PoisonError::into_inner);
+				if state.revoked.load(::std::sync::atomic::Ordering::Acquire) {
+					return None;
+				}
 				value.as_deref()?.downcast_ref::<T>().map(inspect)
 			}
 
@@ -250,6 +269,9 @@ macro_rules! Wrap {
 					.value
 					.lock()
 					.unwrap_or_else(::std::sync::PoisonError::into_inner);
+				if state.revoked.load(::std::sync::atomic::Ordering::Acquire) {
+					return None;
+				}
 				let value = slot.take()?;
 				match value.downcast::<T>() {
 					Ok(value) => Some(*value),
