@@ -308,6 +308,7 @@ async fn sticky_custom_id_does_not_authorize_a_signal_after_wait() {
 struct SyntheticSharedState {
 	status: Mutex<Option<ExitStatus>>,
 	wait_acquired: Mutex<Option<mpsc::Sender<()>>>,
+	signal_acquisition: Mutex<Option<mpsc::Sender<()>>>,
 	completion: Mutex<Option<mpsc::Receiver<ExitStatus>>>,
 	group_signals: AtomicUsize,
 }
@@ -391,6 +392,27 @@ impl ChildWrapper for SyntheticSharedChild {
 		_process_group: i32,
 		_signal: i32,
 	) -> Option<io::Result<Option<ExitStatus>>> {
+		if let Some(acquisition) = self
+			.state
+			.signal_acquisition
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.take()
+		{
+			match self.state.status.try_lock() {
+				Err(std::sync::TryLockError::WouldBlock) => {
+					let _ = acquisition.send(());
+				}
+				Ok(status) => {
+					drop(status);
+					panic!("signal unexpectedly acquired the shared status mutex");
+				}
+				Err(std::sync::TryLockError::Poisoned(error)) => {
+					drop(error.into_inner());
+					panic!("the shared status mutex was poisoned before signal acquisition");
+				}
+			}
+		}
 		let status = self
 			.state
 			.status
@@ -418,23 +440,102 @@ impl ChildWrapper for SyntheticSharedChild {
 	}
 }
 
+type SharedSignalResult = (Box<dyn ChildWrapper>, io::Result<()>);
+
+struct SharedSignalWorker {
+	result: Option<mpsc::Receiver<SharedSignalResult>>,
+	handle: Option<std::thread::JoinHandle<()>>,
+}
+
 struct SharedSignalCleanup {
 	completion: Option<mpsc::Sender<ExitStatus>>,
 	status: ExitStatus,
-	workers: Vec<std::thread::JoinHandle<()>>,
+	waiter: Option<std::thread::JoinHandle<()>>,
+	signal: Option<SharedSignalWorker>,
 }
 
 impl SharedSignalCleanup {
+	fn new(
+		completion: mpsc::Sender<ExitStatus>,
+		status: ExitStatus,
+		waiter: std::thread::JoinHandle<()>,
+	) -> Self {
+		Self {
+			completion: Some(completion),
+			status,
+			waiter: Some(waiter),
+			signal: None,
+		}
+	}
+
+	fn start_signal(&mut self, mut child: Box<dyn ChildWrapper>) {
+		assert!(self.signal.is_none(), "the signal worker starts once");
+		let (result_tx, result_rx) = mpsc::channel();
+		let handle = std::thread::spawn(move || {
+			let result = child.signal(nix::libc::SIGCONT);
+			let _ = result_tx.send((child, result));
+		});
+		self.signal = Some(SharedSignalWorker {
+			result: Some(result_rx),
+			handle: Some(handle),
+		});
+	}
+
+	fn try_signal_result(&self) -> Result<SharedSignalResult, mpsc::TryRecvError> {
+		self.signal
+			.as_ref()
+			.expect("the signal worker is owned before inspection")
+			.result
+			.as_ref()
+			.expect("the signal result remains available")
+			.try_recv()
+	}
+
+	fn receive_signal_result(&mut self) -> SharedSignalResult {
+		self.signal
+			.as_mut()
+			.expect("the signal worker is owned before collection")
+			.result
+			.take()
+			.expect("the signal result is collected once")
+			.recv_timeout(EXIT_TIMEOUT)
+			.expect("signal completes after wait releases custody")
+	}
+
 	fn release(&mut self) {
 		if let Some(completion) = self.completion.take() {
 			let _ = completion.send(self.status);
 		}
 	}
 
+	fn record_join(
+		handle: &mut Option<std::thread::JoinHandle<()>>,
+		first_payload: &mut Option<Box<dyn std::any::Any + Send>>,
+	) {
+		if let Some(handle) = handle.take()
+			&& let Err(payload) = handle.join()
+		{
+			if first_payload.is_none() {
+				*first_payload = Some(payload);
+			} else {
+				std::mem::forget(payload);
+			}
+		}
+	}
+
+	fn join_all(&mut self) -> Option<Box<dyn std::any::Any + Send>> {
+		let mut first_payload = None;
+		Self::record_join(&mut self.waiter, &mut first_payload);
+		if let Some(signal) = self.signal.as_mut() {
+			Self::record_join(&mut signal.handle, &mut first_payload);
+		}
+		first_payload
+	}
+
 	fn finish(mut self) {
 		self.release();
-		for worker in std::mem::take(&mut self.workers) {
-			worker.join().expect("shared-child worker does not panic");
+		if let Some(payload) = self.join_all() {
+			std::panic::resume_unwind(payload);
 		}
 	}
 }
@@ -442,10 +543,8 @@ impl SharedSignalCleanup {
 impl Drop for SharedSignalCleanup {
 	fn drop(&mut self) {
 		self.release();
-		for worker in std::mem::take(&mut self.workers) {
-			if let Err(payload) = worker.join() {
-				std::mem::forget(payload);
-			}
+		if let Some(payload) = self.join_all() {
+			std::mem::forget(payload);
 		}
 	}
 }
@@ -454,16 +553,18 @@ impl Drop for SharedSignalCleanup {
 async fn shared_wait_and_group_signal_linearize_under_child_custody() {
 	let status = ExitStatus::from_raw(37 << 8);
 	let (wait_acquired_tx, wait_acquired_rx) = mpsc::channel();
+	let (signal_acquisition_tx, signal_acquisition_rx) = mpsc::channel();
 	let (completion_tx, completion_rx) = mpsc::channel();
 	let state = Arc::new(SyntheticSharedState {
 		status: Mutex::new(None),
 		wait_acquired: Mutex::new(Some(wait_acquired_tx)),
+		signal_acquisition: Mutex::new(Some(signal_acquisition_tx)),
 		completion: Mutex::new(Some(completion_rx)),
 		group_signals: AtomicUsize::new(0),
 	});
 	let mut command = Command::new("synthetic-child");
 	command.wrap(ProcessGroup::leader());
-	let mut child = command
+	let child = command
 		.spawn_with_child({
 			let state = Arc::clone(&state);
 			move |_| {
@@ -486,43 +587,26 @@ async fn shared_wait_and_group_signal_linearize_under_child_custody() {
 		let result = runtime.block_on(lower.wait());
 		let _ = waited_tx.send(result);
 	});
-	let mut cleanup = SharedSignalCleanup {
-		completion: Some(completion_tx),
-		status,
-		workers: vec![waiter],
-	};
+	let mut cleanup = SharedSignalCleanup::new(completion_tx, status, waiter);
 	wait_acquired_rx
 		.recv_timeout(EXIT_TIMEOUT)
 		.expect("wait owns lower-child custody before signal starts");
 
-	let (signaled_tx, signaled_rx) = mpsc::channel();
-	cleanup.workers.push(std::thread::spawn(move || {
-		let result = child.signal(nix::libc::SIGCONT);
-		let _ = signaled_tx.send((child, result));
-	}));
-	let early_signal = signaled_rx.recv_timeout(Duration::from_millis(100));
-	let signal_was_pending = matches!(&early_signal, Err(mpsc::RecvTimeoutError::Timeout));
+	cleanup.start_signal(child);
+	signal_acquisition_rx
+		.recv_timeout(EXIT_TIMEOUT)
+		.expect("signal did not report its authoritative blocked status-lock attempt");
+	assert!(
+		matches!(cleanup.try_signal_result(), Err(mpsc::TryRecvError::Empty)),
+		"signal returned after reporting blocked status acquisition"
+	);
 	cleanup.release();
 	let waited = waited_rx
 		.recv_timeout(EXIT_TIMEOUT)
 		.expect("wait completes after explicit terminal release")
 		.expect("synthetic wait succeeds");
-	let (mut child, signal_result) = match early_signal {
-		Ok(result) => result,
-		Err(mpsc::RecvTimeoutError::Timeout) => signaled_rx
-			.recv_timeout(EXIT_TIMEOUT)
-			.expect("signal completes after wait releases custody"),
-		Err(mpsc::RecvTimeoutError::Disconnected) => {
-			cleanup.finish();
-			panic!("signal worker disconnected without a result")
-		}
-	};
+	let (mut child, signal_result) = cleanup.receive_signal_result();
 	cleanup.finish();
-
-	assert!(
-		signal_was_pending,
-		"signal did not block behind wait custody"
-	);
 	signal_result.unwrap();
 	assert_eq!(waited, status);
 	assert_eq!(state.group_signals.load(Ordering::SeqCst), 0);
