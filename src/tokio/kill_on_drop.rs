@@ -10,7 +10,10 @@ use super::{CommandWrap, CommandWrapper, SpawnAttempt};
 ///
 /// On Unix, dropping a process-group or session child still applies Tokio's kill-on-drop behavior to
 /// the direct native child only. Use the group-aware child's explicit kill or signal methods when the
-/// entire process group must be targeted.
+/// entire process group must be targeted. On Windows, combining this wrapper with `JobObject` in either
+/// registration order enables kill-on-last-job-handle-close for every process still associated with
+/// that job while the JobObject layer remains installed. Consuming that layer relinquishes whole-job
+/// supervision and leaves only the lower direct-child policy.
 #[derive(Clone, Copy, Debug)]
 pub struct KillOnDrop;
 

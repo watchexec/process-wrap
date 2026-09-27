@@ -315,9 +315,11 @@ macro_rules! Wrap {
 			"This token is deliberately non-owning and not `Clone`, and arbitrary mutable access is ",
 			"not public. A layer may inspect its installed value immutably with ",
 			"[`PreparedChild::with`] while the returned child retains process-wrap's private owner. ",
-			"Moving or retaining this token cannot prolong the prepared value's lifetime. Resource ",
-			"types which themselves expose interior mutation or independently clonable native owners ",
-			"remain responsible for those capabilities.\n\n",
+			"Moving or retaining this token cannot prolong the prepared value's lifetime. Inspection holds ",
+			"exclusive value access for the callback, which must not synchronously reenter the same token ",
+			"or destroy an owner whose close waits for that access. Resource types which themselves expose ",
+			"interior mutation or independently clonable native owners remain responsible for those ",
+			"capabilities.\n\n",
 			"On native Windows success, a private outer sidecar retains the strong prepared storage and ",
 			"any disarmed spawn-cleanup handle until child disposal or consuming sidecar removal. It ",
 			"delegates the full child contract, exposes the immediate application layer through ",
@@ -1414,14 +1416,19 @@ macro_rules! Wrap {
 		///
 		/// Process-wrap invokes provider callbacks in this order: `check_available`, native-only base
 		/// rejection, `validate_command`, every `pre_spawn` hook in registration order, native-only
-		/// attempt rejection, `validate_attempt`, and `spawn`. After `spawn` returns a product, every
-		/// `post_spawn` and child-wrapping hook runs in registration order. Process-wrap then completes
-		/// the pre-commit child phase while provider rollback remains armed and preallocates the private
-		/// return sidecar. It commits the transaction, installs the committed residue in that sidecar, and,
-		/// on Windows, disarms the sole JobObject cleanup owner. Successful commit ends failed-spawn
-		/// rollback. After the final owner succeeds, only infallible private ownership moves remain before
-		/// return. Arbitrary residue destruction occurs outside the successful spawn lifecycle. `spawn_with`
-		/// and `spawn_with_child` reject a registered provider instead of bypassing it.
+		/// attempt rejection, `validate_attempt`, and `spawn`. `spawn` returns a child plus a fresh armed
+		/// transaction. On Windows, fallible prepared-state construction then runs before every public
+		/// `post_spawn` hook. Post hooks and child-layer descriptions run in registration order; detached
+		/// installation fills matching weak prepared tokens, validates private strong custody, and only
+		/// then publishes each layer. On Windows, ordinary finalization and cleanup disarm, cleanup-owner
+		/// validation, and non-owner disarm all run before the fallible return-custody allocation and
+		/// transaction commit while rollback remains armed. Process-wrap commits, transfers committed
+		/// residue into the ready return custody, and then disarms the sole final owner. Any earlier error
+		/// or unwinding panic rolls back first and independently disposes remaining lifecycle values while
+		/// quarantining secondary panic payloads. Successful commit ends failed-spawn rollback. After the
+		/// final owner succeeds, only infallible private ownership moves remain before return. Arbitrary
+		/// residue destruction occurs outside the successful spawn lifecycle. `spawn_with` and
+		/// `spawn_with_child` reject a registered provider instead of bypassing it.
 		///
 		/// A committed transaction residue must retain no armed cleanup or independent process,
 		/// terminal, controller, handle, pseudoconsole, or other liveness resource.
@@ -2137,10 +2144,18 @@ macro_rules! Wrap {
 			/// Spawn the command, returning a child that can be interacted with.
 			///
 			/// With no alternate provider, this runs all `pre_spawn` hooks, spawns through the native
-			/// frontend, runs all capability-level `post_spawn` hooks, then stacks all
-			/// `wrap_child`s. A registered provider replaces only the native transport, commits its cleanup
-			/// transaction after the same complete hook chain succeeds, and returns the child with the
-			/// committed transaction residue in a private transparent layer.
+			/// frontend, runs Windows prepared-state construction before every public `post_spawn` hook,
+			/// then describes and installs child layers in registration order with install-time custody
+			/// validation. Windows ordinary finalization, cleanup disarm, and owner selection finish before
+			/// the sole final owner disarms and the child returns.
+			///
+			/// A registered provider replaces only transport creation and returns a child plus fresh armed
+			/// transaction. The same prepared/post/wrap lifecycle and Windows pre-commit finalization run
+			/// while rollback remains armed. Process-wrap allocates return custody, commits, transfers residue,
+			/// and only then disarms the sole final owner. Any earlier error or unwinding panic rolls back
+			/// first, independently disposes remaining values, quarantines secondary payloads, and preserves
+			/// the exact primary failure. After successful final-owner disarm only infallible private moves
+			/// remain before return.
 			pub fn spawn(&mut self) -> ::std::io::Result<Box<dyn $childer>> {
 				if let Some(provider_index) = self.select_spawn_provider()? {
 					return self.spawn_with_provider(provider_index);
@@ -2315,8 +2330,9 @@ macro_rules! Wrap {
 			/// The complete safe installation pattern is: return `T` here; have the detached layer store
 			/// an empty `Option<PreparedChild>`; confirm `PreparedChildRef::is::<T>()` while wrapping;
 			/// return that layer through `PendingChildWrapper::new`; and expose its slot with
-			/// `ChildWrapperSlots::with_prepared::<T>`. Process-wrap validates the type and exact owner
-			/// topology before filling the slot. Once installed, the layer may use
+			/// `ChildWrapperSlots::with_prepared::<T>`. Process-wrap validates the type, fills the weak token,
+			/// validates exclusive strong custody while the layer remains detached, then transfers the child
+			/// and publishes the installed layer. Once installed, the layer may use
 			/// `PreparedChild::with::<T, _>` for immutable access.
 			///
 			/// A prepared type which itself exposes interior ownership transfer or independently clonable

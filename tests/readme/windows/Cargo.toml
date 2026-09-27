@@ -1,0 +1,12 @@
+[package]
+name = "process-wrap-readme-windows"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88.0"
+
+[dependencies]
+process-wrap = { path = "../../..", version = "10.0.0", features = ["std", "creation-flags", "job-object"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_System_Threading"] }

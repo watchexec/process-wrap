@@ -16,9 +16,12 @@ use crate::{
 	ChildExitStatus,
 	windows::{
 		JOB_POLL_INTERVAL, JobPort, job_creation_flags, make_job_object, poll_job_drain,
-		release_extracted_job_port, resume_threads, terminate_job,
+		resume_threads, terminate_job,
 	},
 };
+
+#[cfg(feature = "kill-on-drop")]
+use crate::windows::release_extracted_job_port;
 
 #[cfg(not(test))]
 use crate::windows::set_job_kill_on_drop;
@@ -46,6 +49,14 @@ use super::{
 ///
 /// [`CreationFlags`] may be registered before or after `JobObject`; process-wrap preserves its flags
 /// and distinguishes explicit suspension from the temporary suspension needed for assignment.
+/// `KillOnDrop` may likewise be registered before or after `JobObject`. With both wrappers installed,
+/// successful spawn enables `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so ordinary drop while the
+/// `JobObject` layer remains installed terminates every process still associated with the job. Without
+/// `JobObject`, the lower Tokio child's kill-on-drop policy targets only that direct child.
+///
+/// Consuming the `JobObject` layer through [`ChildWrapper::into_inner`] relinquishes whole-job waiting,
+/// explicit whole-job killing, and kill-on-close supervision. The returned lower child remains usable
+/// and retains only its direct-child kill-on-drop policy.
 #[derive(Clone, Copy, Debug)]
 pub struct JobObject;
 
@@ -162,6 +173,11 @@ impl CommandWrapper for JobObject {
 }
 
 /// Wrapper for `Child` which waits on all processes within the job.
+///
+/// When `KillOnDrop` is also registered, ordinary drop while this layer remains installed closes the
+/// final job handle and terminates every process still associated with the job. Consuming this layer
+/// relinquishes whole-job wait, kill, and kill-on-close supervision; the returned lower child retains
+/// only direct-child policy.
 #[derive(Debug)]
 pub struct JobObjectChild {
 	inner: Option<Box<dyn ChildWrapper>>,
@@ -227,6 +243,7 @@ impl JobObjectChild {
 		)
 	}
 
+	#[cfg(feature = "kill-on-drop")]
 	fn take_prepared(&mut self) -> PreparedJobObject {
 		if let Some(prepared) = self.extracted.take() {
 			return prepared;
@@ -285,6 +302,7 @@ impl ChildWrapper for JobObjectChild {
 			.inner
 			.take()
 			.expect("an installed JobObject layer owns its child");
+		#[cfg(feature = "kill-on-drop")]
 		if self.spawn_finalized && self.final_kill_on_drop {
 			let job_drained = self.job_drained;
 			let mut prepared = self.take_prepared();

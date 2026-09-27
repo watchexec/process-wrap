@@ -1,0 +1,10 @@
+[package]
+name = "process-wrap-readme-pty"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88.0"
+
+[dependencies]
+process-wrap = { path = "../../..", version = "10.0.0", features = ["pty"] }
+tokio = { version = "1.38.2", features = ["io-util", "rt"] }

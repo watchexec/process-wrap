@@ -155,20 +155,33 @@
 //! use ordinary `.spawn()` and its ordinary boxed-child result. Call `take_pty_controller()` once on
 //! that returned child to obtain terminal I/O and resize control.
 //!
+//! On Windows, the ConPTY provider rejects direct `.bat` and `.cmd` programs case-insensitively.
+//! Invoke `cmd.exe` explicitly with arguments such as `/d /s /c ...` for shell or batch semantics.
+//! The provider resolves executable entries itself and reports unresolved bare programs as `NotFound`;
+//! it does not perform implicit shell or `PATHEXT` dispatch.
+//!
 //! A terminal has one ordered output stream, so PTY standard output and standard error are merged.
-//! Input and output each strongly own the bidirectional master; resize handles are weak. Dropping one
-//! I/O side is not a half-close, and the terminal hangs up only after both are gone. Send VEOF when
-//! terminal input policy calls for end-of-file. Waiting for the direct child and draining terminal
-//! output are separate lifecycles because descendants may retain the slave. On macOS they should run
-//! concurrently while the kernel drains and revokes the terminal during session-leader teardown.
+//! Input and output each strongly own the logical bidirectional controller; resize handles are weak.
+//! Dropping one I/O side is not a half-close. After both are gone, a valid resize request returns
+//! `BrokenPipe`. On Windows, final strong-owner loss schedules `ClosePseudoConsole` on a detached
+//! worker. If worker creation fails, process-wrap intentionally retains the HPCON rather than
+//! potentially blocking the dropping thread, so logical closure does not guarantee OS pseudoconsole
+//! teardown. Send VEOF when terminal input policy calls for end-of-file. Waiting for the direct child
+//! and draining terminal output are separate lifecycles because descendants may retain the slave. On
+//! macOS they should run concurrently while the kernel drains and revokes the terminal during
+//! session-leader teardown.
 //!
 //! The transport owns terminal bytes and resize, not parent-terminal raw mode, relaying, key handling,
 //! VT parsing, scrollback, or pager policy. A bare PTY creates its required session.
 //! `ProcessGroup::leader()` or `ProcessSession` may independently add group-wide signalling while the
 //! direct child is live; waiting continues to follow that child. Attaching to an existing group or
-//! explicitly registering both is invalid. `ResetSigmask` composes, while Tokio `KillOnDrop` continues
-//! to target only the direct child. The returned boxed child keeps arbitrary outer wrappers, and
-//! `take_pty_controller()` traverses them and yields the controller once.
+//! explicitly registering both is invalid. `ResetSigmask` composes. Without `JobObject`, Tokio
+//! `KillOnDrop` targets only the direct child. On Windows, combining `KillOnDrop` with `JobObject`
+//! enables kill-on-last-job-handle-close for every process still associated with the job; either
+//! registration order works and the Windows PTY provider preserves that policy. Consuming the
+//! `JobObject` layer relinquishes whole-job supervision, leaving only the lower direct-child policy.
+//! The returned boxed child keeps arbitrary outer wrappers, and `take_pty_controller()` traverses them
+//! and yields the controller once.
 //!
 //! # KillOnDrop and CreationFlags
 //!
@@ -196,10 +209,17 @@
 //!
 //! ## Instead of `.creation_flags(CREATE_NO_WINDOW)` (Windows-only):
 //!
-//! ```rust,ignore
-//! use process_wrap::std::*;
+//! ```rust,no_run
+//! # #[cfg(all(windows, feature = "std", feature = "creation-flags"))]
+//! # fn run() -> std::io::Result<()> {
+//! use process_wrap::std::{Command, CreationFlags};
+//! use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+//!
 //! let mut command = Command::with_new("ls", |command| { command.arg("-l"); });
 //! command.wrap(CreationFlags(CREATE_NO_WINDOW));
+//! # let _child = command.spawn()?;
+//! # Ok(()) }
+//! # fn main() {}
 //! ```
 //!
 //! Internally the `JobObject` wrapper always sets the `CREATE_SUSPENDED` flag, but as it is able to
@@ -243,6 +263,11 @@
 //!   retain native mutations. Calling `attempt.native_mut()` or `stdin`/`stdout`/`stderr` makes a
 //!   tracked attempt incompatible with a portable provider. By default does nothing.
 //!
+//! - **On Windows, `prepare_child`** runs in registration order after transport creation and before
+//!   public post-spawn hooks. It constructs fallible per-wrapper prepared state while cleanup remains
+//!   armed; the matching weak token is installed into a detached layer during wrapping before that
+//!   layer is published to later callbacks.
+//!
 //! - **`fn post_spawn(&mut self, attempt: &mut SpawnAttempt, child: &mut dyn ChildWrapper, command: &Command)`**
 //!   is called after any transport creates its child. The child may be a terminal custom/provider
 //!   child with no native value. Changing command settings on `attempt` here cannot configure the
@@ -274,27 +299,35 @@
 //! 4. every `pre_spawn` hook
 //! 5. native-only attempt rejection
 //! 6. `validate_attempt`
-//! 7. provider `spawn`
-//! 8. every `post_spawn` hook
-//! 9. every child wrapper
-//! 10. private return-sidecar allocation
-//! 11. transaction `commit`
-//! 12. committed transaction-residue installation
-//! 13. on Windows, the sole JobObject cleanup owner
+//! 7. provider `spawn`, returning a child and fresh armed transaction
+//! 8. on Windows, every fallible prepared-child construction hook
+//! 9. every `post_spawn` hook
+//! 10. every child-layer description and detached installation, including matching prepared state and
+//!     install-time custody validation
+//! 11. on Windows, ordinary finalization and cleanup disarm, cleanup-owner validation, and non-owner
+//!     disarm while the sole final owner remains armed
+//! 12. fallible private return-custody allocation
+//! 13. transaction `commit`
+//! 14. committed transaction-residue installation
+//! 15. on Windows, the sole final cleanup owner disarms
+//! 16. infallible private ownership moves and child return
 //!
 //! Validation rejects unsupported portable policy before operating-system allocation. `spawn`
 //! returns a child satisfying the frontend's complete `ChildWrapper` contract and a fresh, armed
-//! `SpawnTransaction` which owns cleanup independently of the child chain. A later public hook,
-//! wrapper, pre-commit child step, or commit error or unwinding panic causes best-effort rollback
-//! while preserving the original failure. After capturing that failure, process-wrap first resolves
-//! transaction cleanup, then disposes any detached child layer, the child chain, and each Windows
-//! prepared value independently. Secondary cleanup panic payloads are quarantined without inspection
-//! or destruction. Before commit, process-wrap preallocates the private return sidecar. Successful
-//! commit ends failed-spawn rollback, and its residue is installed in that sidecar. On Windows, the
-//! sole JobObject owner remains authoritative until it disarms after commit; no caller callback or
-//! allocation-dependent work follows that transition. On a successful spawn, arbitrary residue
-//! destruction occurs outside the spawn lifecycle. Committed residue must retain no armed cleanup or
-//! independent process, terminal, controller, handle, pseudoconsole, or other liveness resource.
+//! `SpawnTransaction` which owns cleanup independently of the child chain. On Windows, prepared-state
+//! construction occurs before public post hooks. After wrapping and install-time custody validation,
+//! ordinary finalization, ordinary cleanup disarm, owner selection, and non-owner disarm all complete
+//! before return-custody allocation and commit; every step is fallible while the transaction remains
+//! armed. A later error or unwinding panic causes best-effort rollback while preserving the original
+//! failure. After capturing that failure, process-wrap first resolves transaction cleanup, then
+//! disposes any detached child layer, the child chain, and each Windows prepared value independently.
+//! Secondary cleanup panic payloads are quarantined without inspection or destruction. Successful
+//! commit ends failed-spawn rollback, and its residue is installed in the already-allocated return
+//! custody. On Windows, the sole final owner remains armed until it disarms after commit; no caller
+//! callback, allocation-dependent work, or native handle close follows that successful transition
+//! before the infallible return move. On a successful spawn, arbitrary residue destruction occurs
+//! outside the spawn lifecycle. Committed residue must retain no armed cleanup or independent process,
+//! terminal, controller, handle, pseudoconsole, or other liveness resource.
 //!
 //! Rollback, wrapper restoration, original panic-payload preservation, and cleanup-diagnostic panic
 //! containment apply only to unwinding panics. With `panic=abort`, the process terminates before
@@ -352,11 +385,10 @@
 //! # fn main() {}
 //! ```
 //!
-//! That's a great start, but it's actually introduced a resource leak: if the main thread of your
-//! program exits before that background one does, then the background thread won't get a chance to
-//! call `logfile`'s `Drop` implementation which closes the file. The file handle will be left open!
-//! To fix this, we'll need to keep track of the background thread's `ThreadHandle` and `.join()` it
-//! when calling `.wait()` on the `ChildWrapper`.
+//! That is a useful start, but returning from `main` can terminate the process before the detached
+//! worker finishes copying and flushing terminal bytes, leaving incomplete log output. Retain the
+//! background thread's `JoinHandle` and join it from the child wrapper's `wait` method so copying
+//! completes before the caller proceeds.
 //!
 //! ```rust
 //! # #[cfg(feature = "std")]

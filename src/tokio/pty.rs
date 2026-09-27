@@ -144,6 +144,11 @@ use windows as imp;
 /// # }
 /// # fn main() {}
 /// ```
+///
+/// On Windows, direct `.bat` and `.cmd` programs are rejected case-insensitively. Invoke `cmd.exe`
+/// explicitly with arguments such as `/d /s /c ...` for shell or batch semantics. The provider
+/// resolves executable entries itself, returns `NotFound` for unresolved bare programs, and does not
+/// perform implicit shell or `PATHEXT` dispatch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Pty {
 	size: PtySize,
@@ -348,7 +353,8 @@ pub struct PtyResize {
 impl PtyResize {
 	/// Change the terminal size.
 	///
-	/// Returns [`io::ErrorKind::BrokenPipe`] after both strong I/O owners have been dropped.
+	/// Generic nonzero character-size validation runs first. After both strong I/O owners have been
+	/// dropped, a valid request returns [`io::ErrorKind::BrokenPipe`].
 	pub fn resize(&self, size: PtySize) -> io::Result<()> {
 		size.validate()?;
 		self.inner.resize(size)
@@ -357,11 +363,14 @@ impl PtyResize {
 
 /// The I/O and resize controls for a spawned pseudo-terminal.
 ///
-/// [`PtyInput`] and [`PtyOutput`] each strongly own one shared bidirectional master. The terminal
-/// hangs up only after both owners are gone; dropping either one alone is not a half-close. A
-/// [`PtyResize`] is weak and never keeps the terminal alive. There is deliberately no clonable
-/// force-close handle, parent-terminal raw mode, byte relay, key handling, VT parsing, scrollback,
-/// or pager policy in this transport.
+/// [`PtyInput`] and [`PtyOutput`] each strongly own one shared logical bidirectional controller.
+/// Dropping both releases that master ownership, and valid requests through weak [`PtyResize`] handles
+/// then return `BrokenPipe`; dropping either one alone is not a half-close. On Windows, final
+/// strong-owner loss schedules `ClosePseudoConsole` on a detached worker. If worker creation fails,
+/// process-wrap intentionally retains the HPCON rather than potentially blocking the dropping thread,
+/// so logical controller closure does not guarantee OS pseudoconsole teardown. There is deliberately
+/// no clonable force-close handle, parent-terminal raw mode, byte relay, key handling, VT parsing,
+/// scrollback, or pager policy in this transport.
 ///
 /// Process supervision and PTY draining are separate lifecycles. Waiting for the direct child does
 /// not imply output EOF on most supported Unix systems, because descendants can retain slave

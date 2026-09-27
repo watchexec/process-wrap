@@ -58,6 +58,10 @@ jobs:
         if: matrix.toolchain == 'stable'
         run: cargo test --locked --no-default-features --features ${{ matrix.features }} --all-targets
 
+      - name: Compile Windows README example as a downstream crate
+        if: matrix.platform == 'windows' && matrix.toolchain == 'stable' && matrix.features == 'pty'
+        run: cargo check --manifest-path tests/readme/windows/Cargo.toml
+
       - run: cargo clippy --locked --features ${{ matrix.features }} --all-targets
 
   no-default-features:
@@ -243,6 +247,9 @@ jobs:
 
       - name: Test documentation examples
         run: cargo test --locked --all-features --doc
+
+      - name: Compile PTY README example as a downstream crate
+        run: cargo check --manifest-path tests/readme/pty/Cargo.toml
 
   package:
     name: Package contents

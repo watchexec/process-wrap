@@ -4,9 +4,11 @@ use std::{
 	io::{Error, Result},
 	ops::ControlFlow,
 	os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle as StdOwnedHandle},
-	sync::{Mutex, OnceLock, mpsc},
 	time::Duration,
 };
+
+#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
+use std::sync::{Mutex, OnceLock, mpsc};
 
 #[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
@@ -720,17 +722,18 @@ fn set_job_kill_on_drop_inner(
 	kill_on_drop: bool,
 	#[cfg(test)] probe: Option<&crate::test_allocator::PostTransitionProbe>,
 ) -> Result<()> {
-	let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-	if kill_on_drop {
-		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-	}
-
 	#[cfg(feature = "tracing")]
-	debug!(
-		kill_on_drop,
-		?info,
-		"setting SetInformationJobObject(limit)"
-	);
+	{
+		let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+		if kill_on_drop {
+			info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+		}
+		debug!(
+			kill_on_drop,
+			?info,
+			"setting SetInformationJobObject(limit)"
+		);
+	}
 	set_job_kill_on_drop_native(
 		job,
 		kill_on_drop,
@@ -921,6 +924,7 @@ fn job_is_drained(job: JobHandle) -> Result<bool> {
 	Ok(accounting.ActiveProcesses == 0)
 }
 
+#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
 fn extracted_job_is_drained(job: JobHandle) -> Result<bool> {
 	#[cfg(test)]
 	if test_support::take_job_extraction_query_failure() {
@@ -931,6 +935,7 @@ fn extracted_job_is_drained(job: JobHandle) -> Result<bool> {
 	job_is_drained(job)
 }
 
+#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
 fn disarm_extracted_job(job: JobHandle) -> Result<()> {
 	#[cfg(test)]
 	if test_support::take_job_extraction_disarm_failure() {
@@ -944,6 +949,7 @@ fn disarm_extracted_job(job: JobHandle) -> Result<()> {
 	)
 }
 
+#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
 fn extracted_job_can_close(job_port: &JobPort) -> bool {
 	if disarm_extracted_job(job_port.job).is_ok() {
 		return true;
@@ -951,16 +957,18 @@ fn extracted_job_can_close(job_port: &JobPort) -> bool {
 	matches!(extracted_job_is_drained(job_port.job), Ok(true))
 }
 
+#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
 struct JobPortCustodian {
 	sender: Option<mpsc::Sender<JobPort>>,
 }
 
+#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
 fn job_port_custodian() -> &'static Mutex<JobPortCustodian> {
 	static CUSTODIAN: OnceLock<Mutex<JobPortCustodian>> = OnceLock::new();
 	CUSTODIAN.get_or_init(|| Mutex::new(JobPortCustodian { sender: None }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio1", feature = "kill-on-drop"))]
 pub(crate) fn reset_job_port_custodian_for_test() {
 	job_port_custodian()
 		.lock()
@@ -968,6 +976,7 @@ pub(crate) fn reset_job_port_custodian_for_test() {
 		.sender = None;
 }
 
+#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
 fn start_job_port_custodian(receiver: mpsc::Receiver<JobPort>) -> Result<()> {
 	#[cfg(test)]
 	if test_support::take_job_custodian_start_failure() {
@@ -1002,6 +1011,7 @@ fn start_job_port_custodian(receiver: mpsc::Receiver<JobPort>) -> Result<()> {
 		.map(drop)
 }
 
+#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
 fn retain_extracted_job_port(mut job_port: JobPort) -> std::result::Result<(), JobPort> {
 	let mut custodian = job_port_custodian()
 		.lock()
@@ -1025,6 +1035,7 @@ fn retain_extracted_job_port(mut job_port: JobPort) -> std::result::Result<(), J
 	}
 }
 
+#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
 fn retain_extracted_job_port_last_resort(job_port: JobPort) {
 	#[cfg(test)]
 	test_support::observe_job_port_last_resort_retention();
@@ -1034,6 +1045,7 @@ fn retain_extracted_job_port_last_resort(job_port: JobPort) {
 }
 
 /// Relinquish an extracted finalized Tokio JobObject without terminating its returned lower child.
+#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
 pub(crate) fn release_extracted_job_port(job_port: JobPort, known_drained: bool) {
 	if known_drained || matches!(extracted_job_is_drained(job_port.job), Ok(true)) {
 		drop(job_port);

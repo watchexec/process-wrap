@@ -144,6 +144,39 @@ fn expected_support_rejects_injected_unsupported_capability() {
 	assert_eq!(error.kind(), io::ErrorKind::Unsupported);
 }
 
+#[tokio::test]
+async fn direct_batch_is_rejected_and_explicit_cmd_executes_it() -> io::Result<()> {
+	require_conpty!();
+	let directory = tempfile::tempdir()?;
+	let script = directory.path().join("explicit-batch.CmD");
+	std::fs::write(&script, b"@echo off\r\necho PW-BATCH-OK\r\n")?;
+
+	let mut direct = Command::new(&script);
+	direct.wrap(Pty::default());
+	let error = direct
+		.spawn()
+		.expect_err("the Windows PTY provider rejects direct batch execution");
+	assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+	assert_eq!(
+		error.to_string(),
+		"Windows PTY spawning does not execute batch scripts directly"
+	);
+
+	let mut explicit = Command::with_new("cmd.exe", |command| {
+		command.args(["/d", "/s", "/c"]).arg(&script);
+	});
+	explicit.wrap(Pty::default());
+	let mut child = explicit.spawn()?;
+	let controller = take_controller(child.as_mut());
+	let (input, mut output, _resize) = controller.into_parts();
+	drop(input);
+	let mut bytes = Vec::new();
+	timeout(TIMEOUT, output.read_to_end(&mut bytes)).await??;
+	assert!(child.wait().await?.success());
+	assert!(String::from_utf8_lossy(&bytes).contains("PW-BATCH-OK"));
+	Ok(())
+}
+
 #[test]
 fn capability_queries_ignore_invalid_configuration_on_windows() {
 	let invalid = Pty::new(PtySize {
@@ -328,7 +361,8 @@ fn process_exit_guard_drop_is_bounded_when_termination_fails() {
 	// exactly once here.
 	let controller = unsafe { OwnedHandle::from_raw_handle(event.0) };
 	// try_clone creates a separately owned handle to the same waitable event object. The controller
-	// remains independent so the old infinite drop can always be released before the worker joins.
+	// remains independent so timeout recovery can signal the event and release a blocked guard drop
+	// before the worker joins.
 	let wait_handle = controller.try_clone().unwrap();
 	let (started, observe_start) = mpsc::channel();
 	let (completed, observe_completion) = mpsc::channel();
@@ -845,6 +879,16 @@ async fn shutting_down_input_releases_its_owner_without_early_hangup() -> io::Re
 	resize.resize(PtySize::default())?;
 	drop(output);
 	assert_eq!(
+		resize
+			.resize(PtySize {
+				rows: 0,
+				..PtySize::default()
+			})
+			.unwrap_err()
+			.kind(),
+		io::ErrorKind::InvalidInput
+	);
+	assert_eq!(
 		resize.resize(PtySize::default()).unwrap_err().kind(),
 		io::ErrorKind::BrokenPipe
 	);
@@ -863,6 +907,16 @@ async fn dropping_output_keeps_the_terminal_live_while_input_exists() -> io::Res
 	assert!(child.try_wait()?.is_none());
 	resize.resize(PtySize::default())?;
 	drop(input);
+	assert_eq!(
+		resize
+			.resize(PtySize {
+				columns: 0,
+				..PtySize::default()
+			})
+			.unwrap_err()
+			.kind(),
+		io::ErrorKind::InvalidInput
+	);
 	assert_eq!(
 		resize.resize(PtySize::default()).unwrap_err().kind(),
 		io::ErrorKind::BrokenPipe

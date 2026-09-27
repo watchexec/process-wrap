@@ -97,6 +97,7 @@ selecting the Tokio frontend and its terminal dependencies explicitly.
 ```toml
 [dependencies]
 process-wrap = { version = "10.0.0", features = ["pty"] }
+tokio = { version = "1.38.2", features = ["io-util", "rt"] }
 ```
 
 ```rust
@@ -143,12 +144,20 @@ that `Pty` as the spawn provider with `.wrap(Pty::default())` (or `.wrap(configu
 ordinary `.spawn()` and its ordinary boxed-child result. Call `take_pty_controller()` once on that
 returned child to obtain terminal I/O and resize control.
 
+On Windows, the ConPTY provider rejects direct `.bat` and `.cmd` programs case-insensitively. Invoke
+`cmd.exe` explicitly with arguments such as `/d /s /c ...` when shell or batch semantics are required.
+The provider resolves executable entries itself and reports an unresolved bare program as `NotFound`;
+it does not perform implicit shell or `PATHEXT` dispatch.
+
 A PTY has one ordered terminal stream, so standard output and standard error are merged.
-`PtyInput` and `PtyOutput` are strong owners of one bidirectional master descriptor, so dropping
-either one alone does not half-close the terminal. The terminal hangs up after both are gone;
-`PtyResize` is weak and cannot keep it alive. Send the terminal's VEOF character when that is the
-desired terminal policy instead of expecting a separate input half-close or clonable force-close
-handle.
+`PtyInput` and `PtyOutput` are strong owners of one logical bidirectional controller, so dropping
+either one alone does not release its master ownership. After both are gone, a valid request through
+the weak `PtyResize` handle returns `BrokenPipe`. On Windows, final strong-owner loss schedules
+`ClosePseudoConsole` on a detached worker. If that worker cannot be created, process-wrap
+intentionally retains the HPCON rather than potentially blocking the dropping thread, so logical
+controller closure does not guarantee OS pseudoconsole teardown. Send the terminal's VEOF character
+when that is the desired terminal policy instead of expecting a separate input half-close or clonable
+force-close handle.
 
 Child waiting and PTY draining are independent. On most supported Unix systems, descendants can
 retain the slave after the direct child exits. On macOS, drain output concurrently with waiting: the
@@ -159,8 +168,12 @@ mode, relays, key handling, VT parsing, scrollback, or pager policy.
 A bare PTY creates the required session. `ProcessGroup::leader()` and `ProcessSession` each preserve
 group-wide signalling while the direct child is live; waiting still follows that direct child.
 `ProcessGroup::attach_to(...)` and explicitly registering both wrappers return `InvalidInput`.
-`ResetSigmask` composes normally. `KillOnDrop` remains Tokio's direct-child behavior—it does not
-promise to kill an entire group or session. Spawning returns the ordinary boxed Tokio child, and
+`ResetSigmask` composes normally. Without `JobObject`, Tokio `KillOnDrop` terminates only the direct
+child; it does not promise to terminate a process group, session, or descendants. On Windows,
+combining `KillOnDrop` with `JobObject` enables `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. While the
+`JobObject` child layer remains installed, dropping the returned child terminates every process still
+associated with that job. `JobObject` and `KillOnDrop` may be registered in either order, and the
+Windows PTY provider preserves the same policy. Spawning returns the ordinary boxed Tokio child, and
 `take_pty_controller()` traverses any outer child wrappers and yields the controller once.
 
 ### or with std
@@ -222,6 +235,13 @@ Command::with_new("watch", |command| { command.arg("ls"); })
 `CreationFlags` and `JobObject` may be registered in either order. `JobObject` preserves every
 requested flag, temporarily adds `CREATE_SUSPENDED` while assigning the process, and resumes it
 after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
+
+`KillOnDrop` may likewise be registered before or after `JobObject`. On a successful Tokio spawn with
+both wrappers, process-wrap enables `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; ordinary drop while the
+`JobObject` child layer remains installed terminates every process still associated with the job.
+Without `JobObject`, the lower Tokio child's policy targets only that direct child. Consuming the
+`JobObject` layer with `ChildWrapper::into_inner` relinquishes whole-job waiting, explicit whole-job
+killing, and kill-on-close supervision. The returned lower child retains only its direct-child policy.
 
 ### Process group
 
@@ -285,10 +305,20 @@ This wrapper records Windows creation flags as portable per-attempt policy. Call
 `Command::creation_flags` method instead makes the command native-only because wrappers and alternate
 transports cannot query or reconstruct those flags.
 
+```toml
+[dependencies]
+process-wrap = { version = "10.0.0", features = ["std", "creation-flags", "job-object"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
+```
+
 ```rust
-use windows::Win32::System::Threading::*;
+use process_wrap::std::{Command, CreationFlags, JobObject};
+use windows::Win32::System::Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS};
+
 Command::with_new("watch", |command| { command.arg("ls"); })
-  .wrap(CreationFlags(CREATE_NO_WINDOW | CREATE_DETACHED))
+  .wrap(CreationFlags(CREATE_NO_WINDOW | DETACHED_PROCESS))
   .wrap(JobObject)
   .spawn()?;
 ```
@@ -305,7 +335,10 @@ after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
 
 This wrapper records kill-on-drop as portable per-attempt policy so `JobObject` and alternate spawn
 providers can preserve it. Calling the native-shaped `Command::kill_on_drop` method instead makes the
-command native-only because the setting cannot be queried afterward.
+command native-only because the setting cannot be queried afterward. Without an installed
+`JobObject`, the policy terminates only the direct Tokio child. With an installed `JobObject`, it also
+enables kill-on-last-job-handle-close for every process still associated with that job; consuming the
+`JobObject` layer relinquishes that whole-job policy.
 
 ```rust
 let child = Command::with_new("watch", |command| { command.arg("ls"); })
@@ -348,6 +381,11 @@ The trait provides extension or hook points into the lifecycle of a `Command`:
   native API does not expose callback insertion or command ownership; prefer portable attempt methods
   for recurring configuration.
 
+- **On Windows, `prepare_child`** runs in registration order after transport creation and before any
+  public `post_spawn` hook. It constructs fallible per-wrapper prepared state while native/provider
+  cleanup remains armed. The matching weak token is installed into a detached child layer during
+  wrapping, before that layer is published to later callbacks.
+
 - **`fn post_spawn(&mut self, attempt: &mut SpawnAttempt, child: &mut dyn ChildWrapper, command: &Command) -> io::Result<()>`**
   is called after any transport has created its child. The child may be a terminal custom/provider
   child with no native child value. Changing command settings on `attempt` at this point cannot
@@ -379,27 +417,35 @@ Callbacks run in this order:
 4. every `pre_spawn` hook
 5. native-only attempt rejection
 6. `validate_attempt`
-7. provider `spawn`
-8. every `post_spawn` hook
-9. every child wrapper
-10. private return-sidecar allocation
-11. transaction `commit`
-12. committed transaction-residue installation
-13. on Windows, the sole JobObject cleanup owner
+7. provider `spawn`, returning a child and fresh armed transaction
+8. on Windows, every fallible prepared-child construction hook
+9. every `post_spawn` hook
+10. every child-layer description and detached installation, including matching prepared state and
+    install-time custody validation
+11. on Windows, ordinary child finalization and cleanup disarm, cleanup-owner validation, and
+    non-owner disarm while the sole final owner remains armed
+12. fallible private return-custody allocation
+13. transaction `commit`
+14. committed transaction-residue installation
+15. on Windows, the sole final cleanup owner disarms
+16. infallible private ownership moves and child return
 
 Validation must reject unsupported portable policy before allocating operating-system resources.
 `spawn` returns a child satisfying the frontend's complete `ChildWrapper` contract together with a
-fresh, armed `SpawnTransaction`. The transaction owns cleanup independently of the child chain. A
-later hook, wrapper, pre-commit child step, or commit error or unwinding panic causes best-effort
-rollback while preserving the original failure. After capturing that failure, process-wrap first
-resolves transaction cleanup, then disposes any detached child layer, the child chain, and each
-Windows prepared value independently. Secondary cleanup panic payloads are quarantined without
-inspection or destruction. Before commit, process-wrap preallocates the private return sidecar.
-Successful commit ends failed-spawn rollback, and its residue is installed in that sidecar. On Windows,
-the sole JobObject owner remains authoritative until it disarms after commit; no caller callback or
-allocation-dependent work follows that transition. On a successful spawn, arbitrary residue destruction
-occurs outside the spawn lifecycle. Committed residue must retain no armed cleanup or independent
-process, terminal, controller, handle, pseudoconsole, or other liveness resource.
+fresh, armed `SpawnTransaction`. The transaction owns cleanup independently of the child chain. On
+Windows, prepared-state construction occurs before public post hooks. After wrapping and install-time
+custody validation, ordinary finalization, ordinary cleanup disarm, owner selection, and non-owner
+disarm all complete before return-custody allocation and commit; every step is fallible while the
+transaction remains armed. A later error or unwinding panic causes best-effort rollback while
+preserving the original failure. After capturing that failure, process-wrap first resolves transaction
+cleanup, then disposes any detached child layer, the child chain, and each Windows prepared value
+independently. Secondary cleanup panic payloads are quarantined without inspection or destruction.
+Successful commit ends failed-spawn rollback, and its residue is installed in the already-allocated
+return custody. On Windows, the sole final owner remains armed until it disarms after commit; no caller
+callback, allocation-dependent work, or native handle close follows that successful transition before
+the infallible return move. On a successful spawn, arbitrary residue destruction occurs outside the
+spawn lifecycle. Committed residue must retain no armed cleanup or independent process, terminal,
+controller, handle, pseudoconsole, or other liveness resource.
 
 Rollback, wrapper restoration, original panic-payload preservation, and cleanup-diagnostic panic
 containment apply only to unwinding panics. With `panic=abort`, the process terminates before those

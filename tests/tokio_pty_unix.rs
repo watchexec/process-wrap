@@ -232,6 +232,16 @@ async fn shutting_down_input_does_not_hang_up_while_output_exists() -> io::Resul
 
 	drop(output);
 	assert_eq!(
+		resize
+			.resize(PtySize {
+				rows: 0,
+				..PtySize::default()
+			})
+			.unwrap_err()
+			.kind(),
+		io::ErrorKind::InvalidInput
+	);
+	assert_eq!(
 		resize.resize(PtySize::default()).unwrap_err().kind(),
 		io::ErrorKind::BrokenPipe
 	);
@@ -254,6 +264,16 @@ async fn dropping_output_does_not_hang_up_while_input_exists() -> io::Result<()>
 	assert!(child.try_wait()?.is_none());
 	resize.resize(PtySize::default())?;
 	drop(input);
+	assert_eq!(
+		resize
+			.resize(PtySize {
+				columns: 0,
+				..PtySize::default()
+			})
+			.unwrap_err()
+			.kind(),
+		io::ErrorKind::InvalidInput
+	);
 	assert_eq!(
 		resize.resize(PtySize::default()).unwrap_err().kind(),
 		io::ErrorKind::BrokenPipe
