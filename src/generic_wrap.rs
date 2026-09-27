@@ -1014,6 +1014,12 @@ macro_rules! Wrap {
 								::std::sync::Arc::clone(&prepared.state),
 							));
 						}
+						if !prepared.has_exclusive_custody() {
+							return Err(::std::io::Error::new(
+								::std::io::ErrorKind::InvalidInput,
+								"prepared child state has an unexpected custody topology",
+							));
+						}
 					}
 					(Some(_), _) => {
 						return Err(::std::io::Error::new(
@@ -1746,21 +1752,6 @@ macro_rules! Wrap {
 				Ok(())
 			}
 
-			#[cfg(windows)]
-			fn validate_prepared_custody(
-				prepared: &[Option<PreparedChildOwner>],
-			) -> ::std::io::Result<()> {
-				for prepared in prepared.iter().flatten() {
-					if !prepared.has_exclusive_custody() {
-						return Err(::std::io::Error::new(
-							::std::io::ErrorKind::InvalidInput,
-							"prepared child state has an unexpected custody topology",
-						));
-					}
-				}
-				Ok(())
-			}
-
 			fn finish_spawn(
 				&mut self,
 				attempt: &mut SpawnAttempt,
@@ -1831,8 +1822,6 @@ macro_rules! Wrap {
 						#[cfg(windows)]
 						&mut prepared,
 					)?;
-					#[cfg(windows)]
-					Self::capture_io(|| Self::validate_prepared_custody(&prepared))?;
 					Ok(())
 				})();
 
@@ -2014,8 +2003,6 @@ macro_rules! Wrap {
 						#[cfg(windows)]
 						&mut prepared,
 					)?;
-					#[cfg(windows)]
-					Self::capture_io(|| Self::validate_prepared_custody(&prepared))?;
 					Ok(())
 				})();
 

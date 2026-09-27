@@ -835,6 +835,147 @@ macro_rules! spawn_provider_tests {
 				}
 			}
 
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct ActivePreparedReader {
+				entered: mpsc::Sender<()>,
+				release: Mutex<Option<mpsc::Sender<()>>>,
+				worker: Mutex<Option<thread::JoinHandle<bool>>>,
+			}
+
+			#[cfg(windows)]
+			impl ActivePreparedReader {
+				fn new() -> (Arc<Self>, mpsc::Receiver<()>) {
+					let (entered, observe_entered) = mpsc::channel();
+					(
+						Arc::new(Self {
+							entered,
+							release: Mutex::new(None),
+							worker: Mutex::new(None),
+						}),
+						observe_entered,
+					)
+				}
+
+				fn start(&self, token: PreparedChild) {
+					let (active_tx, active_rx) = mpsc::channel();
+					let (release_tx, release_rx) = mpsc::channel();
+					let worker = thread::spawn(move || {
+						token.with::<Option<PreparedGuard>, _>(|prepared| {
+							assert!(prepared.is_some());
+							active_tx
+								.send(())
+								.expect("the wrapping callback observes active prepared access");
+							release_rx.recv_timeout(EXIT_TIMEOUT).is_ok()
+						}) == Some(true)
+					});
+					active_rx
+						.recv_timeout(EXIT_TIMEOUT)
+						.expect("the prepared reader enters before wrapping returns");
+					*self
+						.release
+						.lock()
+						.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release_tx);
+					*self
+						.worker
+						.lock()
+						.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
+					let _ = self.entered.send(());
+				}
+
+				fn finish(&self) -> bool {
+					if let Some(release) = self
+						.release
+						.lock()
+						.unwrap_or_else(std::sync::PoisonError::into_inner)
+						.take()
+					{
+						let _ = release.send(());
+					}
+					self.worker
+						.lock()
+						.unwrap_or_else(std::sync::PoisonError::into_inner)
+						.take()
+						.is_none_or(|worker| worker.join().unwrap_or(false))
+				}
+			}
+
+			#[cfg(windows)]
+			impl Drop for ActivePreparedReader {
+				fn drop(&mut self) {
+					if let Some(release) = self
+						.release
+						.get_mut()
+						.unwrap_or_else(std::sync::PoisonError::into_inner)
+						.take()
+					{
+						let _ = release.send(());
+					}
+					if let Some(worker) = self
+						.worker
+						.get_mut()
+						.unwrap_or_else(std::sync::PoisonError::into_inner)
+						.take()
+						&& let Err(payload) = worker.join()
+					{
+						std::mem::forget(payload);
+					}
+				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct AccessInstalledPrepared {
+				start_once: bool,
+				reader: Arc<ActivePreparedReader>,
+			}
+
+			#[cfg(windows)]
+			impl CommandWrapper for AccessInstalledPrepared {
+				fn wrap_prepared_child(
+					&mut self,
+					child: &mut dyn ChildWrapper,
+					prepared: Option<PreparedChildRef<'_>>,
+					_command: &CommandWrap,
+				) -> io::Result<Option<PendingChildWrapper>> {
+					assert!(prepared.is_none());
+					if self.start_once {
+						self.start_once = false;
+						let layer = (child as &mut dyn std::any::Any)
+							.downcast_mut::<OptionPreparedLayer>()
+							.expect("the prepared layer is immediately inside this wrapper");
+						let token = layer
+							.prepared
+							.take()
+							.expect("the earlier layer exposes its installed token");
+						self.reader.start(token);
+					}
+					Ok(None)
+				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct FailAfterPreparedAccess {
+				fail_once: bool,
+			}
+
+			#[cfg(windows)]
+			impl CommandWrapper for FailAfterPreparedAccess {
+				fn wrap_child(
+					&mut self,
+					_child: &mut dyn ChildWrapper,
+					_command: &CommandWrap,
+				) -> io::Result<Option<PendingChildWrapper>> {
+					if std::mem::take(&mut self.fail_once) {
+						Err(io::Error::other("later wrapping failed"))
+					} else {
+						Ok(None)
+					}
+				}
+			}
+
 			#[cfg(windows)]
 			#[derive(Debug)]
 			struct AlternatingPreparedLayer {
@@ -2915,6 +3056,134 @@ macro_rules! spawn_provider_tests {
 					if provider {
 						assert_eq!(shared.events(), successful_events("provider"));
 					}
+				}
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn active_reader_during_later_wrapping_is_not_an_escaped_owner() {
+				for provider in [false, true] {
+					let shared = Arc::new(Shared::default());
+					let drops = Arc::new(AtomicUsize::new(0));
+					let (reader, entered) = ActivePreparedReader::new();
+					let mut command = if provider {
+						provider_command(Arc::clone(&shared), "provider")
+					} else {
+						command()
+					};
+					command
+						.wrap(OptionPrepared {
+							drops: Arc::clone(&drops),
+						})
+						.wrap(AccessInstalledPrepared {
+							start_once: true,
+							reader: Arc::clone(&reader),
+						});
+					let (spawned, observe_spawn) = mpsc::channel();
+					let spawn_worker = thread::spawn(move || {
+						let runtime = runtime();
+						let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+						let result = command.spawn();
+						let _ = spawned.send((command, result));
+					});
+
+					entered
+						.recv_timeout(EXIT_TIMEOUT)
+						.expect("the later wrapper starts an admitted prepared reader");
+					let outcome = observe_spawn.recv_timeout(Duration::from_secs(2));
+					if outcome.is_err() {
+						let _ = reader.finish();
+					}
+					let (mut command, result) = outcome.unwrap_or_else(|_| {
+						observe_spawn
+							.recv_timeout(EXIT_TIMEOUT)
+							.expect("spawn returns after emergency reader release")
+					});
+					spawn_worker.join().expect("the spawn worker completes");
+					let child = result.expect(
+						"a sanctioned prepared reader may remain active across completed wrapping",
+					);
+					assert_eq!(drops.load(Ordering::SeqCst), 0);
+					assert!(reader.finish(), "the admitted prepared callback completes");
+					drop(child);
+					assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+					let runtime = runtime();
+					let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+					drop(command.spawn().expect("the command remains reusable"));
+					assert_eq!(drops.load(Ordering::SeqCst), 2);
+				}
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn later_failure_waits_for_active_reader_and_preserves_primary_error() {
+				for provider in [false, true] {
+					let shared = Arc::new(Shared::default());
+					let drops = Arc::new(AtomicUsize::new(0));
+					let (reader, entered) = ActivePreparedReader::new();
+					let mut command = if provider {
+						provider_command(Arc::clone(&shared), "provider")
+					} else {
+						command()
+					};
+					command
+						.wrap(OptionPrepared {
+							drops: Arc::clone(&drops),
+						})
+						.wrap(AccessInstalledPrepared {
+							start_once: true,
+							reader: Arc::clone(&reader),
+						})
+						.wrap(FailAfterPreparedAccess { fail_once: true });
+					let (finished, observe_finish) = mpsc::channel();
+					let spawn_worker = thread::spawn(move || {
+						let runtime = runtime();
+						let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+						let result = command.spawn();
+						let _ = finished.send((command, result));
+					});
+
+					entered
+						.recv_timeout(EXIT_TIMEOUT)
+						.expect("the later wrapper starts an admitted prepared reader");
+					let early = observe_finish.recv_timeout(Duration::from_millis(100));
+					let remained_pending = matches!(&early, Err(mpsc::RecvTimeoutError::Timeout));
+					assert_eq!(drops.load(Ordering::SeqCst), 0);
+					assert!(reader.finish(), "the admitted prepared callback completes");
+					assert!(
+						remained_pending,
+						"failure cleanup returned while prepared inspection remained active"
+					);
+					let (mut command, result) = match early {
+						Ok(outcome) => outcome,
+						Err(mpsc::RecvTimeoutError::Timeout) => observe_finish
+							.recv_timeout(EXIT_TIMEOUT)
+							.expect("failure cleanup completes after reader release"),
+						Err(mpsc::RecvTimeoutError::Disconnected) => {
+							panic!("the spawn worker disconnected before reporting its result")
+						}
+					};
+					spawn_worker.join().expect("the spawn worker completes");
+					let error = result.expect_err("the later wrapping callback fails");
+					assert_eq!(error.to_string(), "later wrapping failed");
+					assert_eq!(drops.load(Ordering::SeqCst), 1);
+					if provider {
+						assert_eq!(
+							shared
+								.events()
+								.iter()
+								.filter(|event| **event == Event::Rollback)
+								.count(),
+							1
+						);
+						shared.clear_events();
+					}
+
+					let runtime = runtime();
+					let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+					drop(command.spawn().expect("the command remains reusable"));
+					assert_eq!(drops.load(Ordering::SeqCst), 2);
 				}
 			}
 
