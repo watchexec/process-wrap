@@ -25,6 +25,7 @@ use windows::Win32::System::Threading::{
 };
 
 use super::{
+	bounded_process,
 	prelude::*,
 	windows_thread::{ProcessGuard, process_has_suspended_thread, resume_process_threads},
 };
@@ -33,6 +34,8 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const DESCENDANT_PID_FILE: &str = "PROCESS_WRAP_DESCENDANT_PID_FILE";
 #[cfg(feature = "tracing")]
 const FINAL_OWNER_TRACE_HELPER: &str = "PROCESS_WRAP_FINAL_OWNER_TRACE_HELPER";
+#[cfg(feature = "tracing")]
+const FINAL_OWNER_TRACE_STALL_HELPER: &str = "PROCESS_WRAP_FINAL_OWNER_TRACE_STALL_HELPER";
 static PID_FILE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
@@ -596,18 +599,57 @@ fn armed_job_kills_descendants_after_later_failures() -> Result<()> {
 }
 
 #[cfg(feature = "tracing")]
+fn run_final_owner_trace_helper(
+	environment: (&str, &str),
+	timeout: Duration,
+) -> Result<(std::process::Output, bool)> {
+	let mut command = StdCommand::new(std::env::current_exe()?);
+	command
+		.args([
+			"std_windows::creation_flags_job_object::final_owner_tracing_panic_leaves_job_cleanup_armed",
+			"--exact",
+			"--nocapture",
+		])
+		.env(environment.0, environment.1);
+	bounded_process::run(command, timeout, None)
+}
+
+#[cfg(feature = "tracing")]
+#[test]
+fn final_owner_tracing_watchdog_terminates_a_stalled_helper() -> Result<()> {
+	let (output, timed_out) =
+		run_final_owner_trace_helper((FINAL_OWNER_TRACE_STALL_HELPER, "1"), Duration::ZERO)?;
+	assert!(
+		timed_out,
+		"the zero-deadline watchdog must take its timeout path"
+	);
+	assert!(
+		!output.status.success(),
+		"the stalled helper must be terminated"
+	);
+	Ok(())
+}
+
+#[cfg(feature = "tracing")]
 #[test]
 fn final_owner_tracing_panic_leaves_job_cleanup_armed() -> Result<()> {
+	if std::env::var_os(FINAL_OWNER_TRACE_STALL_HELPER).is_some() {
+		std::thread::sleep(Duration::from_secs(30));
+		return Ok(());
+	}
 	if std::env::var_os(FINAL_OWNER_TRACE_HELPER).is_none() {
-		let status = StdCommand::new(std::env::current_exe()?)
-			.args([
-				"std_windows::creation_flags_job_object::final_owner_tracing_panic_leaves_job_cleanup_armed",
-				"--exact",
-				"--nocapture",
-			])
-			.env(FINAL_OWNER_TRACE_HELPER, "1")
-			.status()?;
-		assert!(status.success(), "the isolated tracing regression failed");
+		let (output, timed_out) =
+			run_final_owner_trace_helper((FINAL_OWNER_TRACE_HELPER, "1"), EXIT_TIMEOUT)?;
+		assert!(
+			!timed_out,
+			"the isolated tracing regression exceeded its deadline"
+		);
+		assert!(
+			output.status.success(),
+			"the isolated tracing regression failed:\nstdout:\n{}\nstderr:\n{}",
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr),
+		);
 		return Ok(());
 	}
 

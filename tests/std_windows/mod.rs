@@ -11,6 +11,9 @@ mod prelude {
 	pub const DIE_TIME: Duration = Duration::from_millis(1000);
 }
 
+#[path = "../support/bounded_process.rs"]
+mod bounded_process;
+
 #[cfg(all(feature = "creation-flags", feature = "job-object"))]
 mod creation_flags_job_object;
 mod id_same_as_inner;
