@@ -487,10 +487,40 @@ macro_rules! Wrap {
 		}
 
 		#[cfg(all(test, windows, feature = "job-object"))]
+		struct PreparedExtractionPhase<'a>(&'a ::std::sync::atomic::AtomicBool);
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl<'a> PreparedExtractionPhase<'a> {
+			fn enter(active: &'a ::std::sync::atomic::AtomicBool) -> Self {
+				assert!(
+					active
+						.compare_exchange(
+							false,
+							true,
+							::std::sync::atomic::Ordering::SeqCst,
+							::std::sync::atomic::Ordering::SeqCst,
+						)
+						.is_ok(),
+					"prepared extraction phase entered more than once"
+				);
+				Self(active)
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl Drop for PreparedExtractionPhase<'_> {
+			fn drop(&mut self) {
+				self.0
+					.store(false, ::std::sync::atomic::Ordering::SeqCst);
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
 		#[derive(Debug)]
 		struct PreparedLifecycleChild {
 			prepared: Option<PreparedChild>,
 			retained: Option<PreparedRaceDrop>,
+			extraction_phase: ::std::sync::Arc<::std::sync::atomic::AtomicBool>,
 		}
 
 		#[cfg(all(test, windows, feature = "job-object"))]
@@ -508,10 +538,17 @@ macro_rules! Wrap {
 			}
 
 			fn retain_prepared_after_sidecar_removal_layer(&mut self) {
-				self.retained = self
+				let prepared = self
 					.prepared
 					.as_ref()
-					.and_then(|prepared| prepared.take_prepared_value::<PreparedRaceDrop>());
+					.expect("the extraction fixture retains its prepared token");
+				let retained = {
+					let _phase = PreparedExtractionPhase::enter(&self.extraction_phase);
+					prepared
+						.take_prepared_value::<PreparedRaceDrop>()
+						.expect("consuming extraction transfers the prepared concrete value")
+				};
+				self.retained = Some(retained);
 			}
 		}
 
@@ -666,9 +703,12 @@ macro_rules! Wrap {
 				PreparedLifecyclePath::NativeExtraction
 					| PreparedLifecyclePath::ProviderExtraction
 			);
+			let extraction_phase =
+				::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
 			let child: Box<dyn $childer> = Box::new(PreparedLifecycleChild {
 				prepared: extracts.then(|| owner.installed_token()),
 				retained: None,
+				extraction_phase: ::std::sync::Arc::clone(&extraction_phase),
 			});
 			let mut cleanup = PreparedRaceCleanup::new();
 
@@ -718,6 +758,12 @@ macro_rules! Wrap {
 			closing_reached_rx
 				.recv_timeout(TIMEOUT)
 				.expect("the lifecycle path published prepared closing");
+			if extracts {
+				assert!(
+					extraction_phase.load(::std::sync::atomic::Ordering::SeqCst),
+					"consuming extraction must publish closing inside the prepared transfer"
+				);
+			}
 			assert!(
 				state
 					.admission
@@ -742,6 +788,12 @@ macro_rules! Wrap {
 			finished_rx
 				.recv_timeout(TIMEOUT)
 				.expect("the lifecycle path completed");
+			if extracts {
+				assert!(
+					!extraction_phase.load(::std::sync::atomic::Ordering::SeqCst),
+					"prepared extraction phase remained active after transfer"
+				);
+			}
 			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 1);
 			assert!(
 				token.with::<PreparedRaceDrop, _>(|_| ()).is_none(),
@@ -796,6 +848,20 @@ macro_rules! Wrap {
 		#[test]
 		fn failed_spawn_cleanup_publishes_prepared_closing() {
 			assert_prepared_lifecycle_path_closes(PreparedLifecyclePath::FailureCleanup);
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn prepared_extraction_phase_clears_during_unwind() {
+			let active = ::std::sync::atomic::AtomicBool::new(false);
+			let panic = ::std::panic::catch_unwind(|| {
+				let _phase = PreparedExtractionPhase::enter(&active);
+				assert!(active.load(::std::sync::atomic::Ordering::SeqCst));
+				panic!("injected prepared extraction failure");
+			});
+
+			assert!(panic.is_err());
+			assert!(!active.load(::std::sync::atomic::Ordering::SeqCst));
 		}
 
 		#[cfg(all(test, windows, feature = "job-object"))]
