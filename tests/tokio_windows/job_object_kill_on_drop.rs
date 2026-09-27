@@ -39,6 +39,16 @@ impl ProcessGuard {
 			.expect("only ProcessGuard::disarm clears the handle, and it consumes the guard")
 	}
 
+	fn has_exited(&self) -> Result<bool> {
+		// SAFETY: this guard owns the live process handle for the nonblocking wait.
+		let wait = unsafe { WaitForSingleObject(self.handle(), 0) };
+		if wait == WAIT_FAILED {
+			Err(std::io::Error::last_os_error())
+		} else {
+			Ok(wait == WAIT_OBJECT_0)
+		}
+	}
+
 	fn disarm(mut self) -> Result<()> {
 		if let Some(handle) = self.0.take() {
 			// SAFETY: taking the guard's owned handle removes the `Drop` close path.
@@ -137,6 +147,45 @@ fn descendant_parent() {
 	println!("{DESCENDANT_MARKER}{}", descendant.id());
 	std::io::stdout().flush().unwrap();
 	descendant.wait().unwrap();
+}
+
+#[tokio::test]
+async fn consuming_job_object_leaves_only_direct_child_kill_on_drop() -> Result<()> {
+	for order in [Order::KillOnDropFirst, Order::JobObjectFirst] {
+		let mut command = CommandWrap::with_new(std::env::current_exe()?, |command| {
+			command
+				.args(["descendant_parent", "--ignored", "--nocapture"])
+				.stdout(Stdio::piped())
+				.stderr(Stdio::piped());
+		});
+		match order {
+			Order::KillOnDropFirst => {
+				command.wrap(KillOnDrop).wrap(JobObject);
+			}
+			Order::JobObjectFirst => {
+				command.wrap(JobObject).wrap(KillOnDrop);
+			}
+		}
+
+		let mut child = command.spawn()?;
+		let direct = ProcessGuard::open(child.id().expect("the direct child has a PID"))?;
+		let descendant_pid = descendant_pid(child.as_mut()).await?;
+		let descendant = ProcessGuard::open(descendant_pid)?;
+		let mut lower = child.into_inner();
+		assert_eq!(lower.try_wait()?, None);
+		assert!(!direct.has_exited()?);
+		assert!(!descendant.has_exited()?);
+
+		drop(lower);
+		wait_for_process_exit(direct.handle()).await?;
+		direct.disarm()?;
+		assert!(
+			!descendant.has_exited()?,
+			"consuming JobObject must leave lower KillOnDrop scoped to the direct child"
+		);
+		drop(descendant);
+	}
+	Ok(())
 }
 
 #[tokio::test]

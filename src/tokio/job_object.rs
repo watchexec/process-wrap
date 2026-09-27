@@ -10,16 +10,13 @@ use std::{
 
 #[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
-use windows::Win32::{
-	Foundation::{CloseHandle, HANDLE},
-	System::Threading::PROCESS_CREATION_FLAGS,
-};
+use windows::Win32::{Foundation::HANDLE, System::Threading::PROCESS_CREATION_FLAGS};
 
 use crate::{
 	ChildExitStatus,
 	windows::{
 		JOB_POLL_INTERVAL, JobPort, job_creation_flags, make_job_object, poll_job_drain,
-		resume_threads, terminate_job,
+		release_extracted_job_port, resume_threads, terminate_job,
 	},
 };
 
@@ -289,16 +286,13 @@ impl ChildWrapper for JobObjectChild {
 			.take()
 			.expect("an installed JobObject layer owns its child");
 		if self.spawn_finalized && self.final_kill_on_drop {
+			let job_drained = self.job_drained;
 			let mut prepared = self.take_prepared();
 			let job_port = prepared
 				.job_port
 				.take()
 				.expect("the installed JobObject layer retains its job handles");
-			// Manually close the completion port while retaining the job handle. Closing a
-			// kill-on-close job here would make the extracted child unusable.
-			let job_port = std::mem::ManuallyDrop::new(job_port);
-			// SAFETY: `job_port` owns the completion-port handle and suppresses `JobPort::drop`.
-			unsafe { CloseHandle(HANDLE(job_port.completion_port.as_raw_handle())) }.ok();
+			release_extracted_job_port(job_port, job_drained);
 		}
 		// Before spawn finalization, dropping the still-armed prepared job instead guarantees that
 		// removing this layer cannot let descendants escape a later lifecycle failure.
@@ -428,13 +422,21 @@ mod tests {
 	use windows::Win32::System::Threading::CREATE_SUSPENDED;
 
 	use crate::tokio::{ProviderProduct, SpawnProvider};
-	use crate::windows::test_support::{
-		LifecycleState, OwnerError, OwnerFailure, OwnerPanic, PanickingCommittedTransaction,
-		ProcessGuard, TreePaths, arm_extra_prepared_owner, arm_owner_events, arm_owner_failure,
-		arm_owner_transition_probe, arm_spawn_cleanup_handle_probe, assert_tree_terminated,
-		clear_extra_prepared_owners, clear_owner_events, clear_owner_failure,
-		finish_owner_transition_probe, finish_spawn_cleanup_handle_probe, observe_descendant,
-		publish_process_guards, record_owner_event, spawn_cleanup_handle_close_count,
+	use crate::windows::{
+		reset_job_port_custodian_for_test,
+		test_support::{
+			LifecycleState, OwnerError, OwnerFailure, OwnerPanic, PanickingCommittedTransaction,
+			ProcessGuard, TreePaths, arm_extra_prepared_owner, arm_job_port_close_probe,
+			arm_owner_events, arm_owner_failure, arm_owner_transition_probe,
+			arm_spawn_cleanup_handle_probe, assert_tree_terminated, clear_extra_prepared_owners,
+			clear_job_port_close_probe, clear_owner_events, clear_owner_failure,
+			finish_owner_transition_probe, finish_spawn_cleanup_handle_probe,
+			job_custodian_worker_starts, job_port_last_resort_retentions, observe_descendant,
+			publish_process_guards, record_owner_event, reset_job_extraction_faults,
+			serial_job_extraction, set_job_custodian_start_failures,
+			set_job_extraction_disarm_failures, set_job_extraction_query_failures,
+			spawn_cleanup_handle_close_count,
+		},
 	};
 
 	use super::*;
@@ -658,6 +660,151 @@ mod tests {
 			command.wrap(ObserveNativeTree(observer));
 		}
 		Ok(command)
+	}
+
+	struct ExtractionFaultCleanup;
+
+	impl Drop for ExtractionFaultCleanup {
+		fn drop(&mut self) {
+			reset_job_extraction_faults();
+		}
+	}
+
+	fn extraction_command(exit_immediately: bool, job_first: bool) -> CommandWrap {
+		let mut command = if exit_immediately {
+			CommandWrap::with_new("cmd.exe", |command| {
+				command.args(["/D", "/S", "/C", "exit /b 0"]);
+			})
+		} else {
+			CommandWrap::with_new("cmd.exe", |command| {
+				command.args(["/D", "/S", "/C", "ping -n 30 127.0.0.1 >NUL"]);
+			})
+		};
+		if job_first {
+			command.wrap(JobObject).wrap(KillOnDrop);
+		} else {
+			command.wrap(KillOnDrop).wrap(JobObject);
+		}
+		command
+	}
+
+	fn wait_for_job_port_closes(
+		probe: &crate::windows::test_support::JobPortCloseProbe,
+		expected: (usize, usize),
+	) {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while probe.counts() != expected {
+			assert!(
+				Instant::now() < deadline,
+				"JobObject custodian did not close both handles: {:?}",
+				probe.counts()
+			);
+			std::thread::sleep(Duration::from_millis(10));
+		}
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn drained_kill_on_drop_extraction_closes_complete_job_ports_repeatedly() -> Result<()> {
+		let _serial = serial_job_extraction();
+		for job_first in [false, true] {
+			for _ in 0..8 {
+				let probe = arm_job_port_close_probe();
+				let mut command = extraction_command(true, job_first);
+				let mut child = command.spawn()?;
+				clear_job_port_close_probe();
+				let status = child.wait().await?;
+				let mut lower = child.into_inner();
+				assert_eq!(probe.counts(), (1, 1));
+				assert_eq!(lower.wait().await?, status);
+				assert_eq!(lower.try_wait()?, Some(status));
+			}
+		}
+		Ok(())
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn live_kill_on_drop_extraction_disarms_and_closes_before_returning() -> Result<()> {
+		let _serial = serial_job_extraction();
+		for job_first in [false, true] {
+			let probe = arm_job_port_close_probe();
+			let mut command = extraction_command(false, job_first);
+			let child = command.spawn()?;
+			clear_job_port_close_probe();
+			let mut lower = child.into_inner();
+			assert_eq!(probe.counts(), (1, 1));
+			assert_eq!(lower.try_wait()?, None);
+			lower.start_kill()?;
+			let status = lower.wait().await?;
+			assert_eq!(lower.wait().await?, status);
+		}
+		Ok(())
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn extraction_failures_use_one_shared_custodian_then_close_every_port() -> Result<()> {
+		let _serial = serial_job_extraction();
+		let _fault_cleanup = ExtractionFaultCleanup;
+		let worker_starts = job_custodian_worker_starts();
+		set_job_extraction_query_failures(usize::MAX);
+		set_job_extraction_disarm_failures(usize::MAX);
+		let mut lowers = Vec::new();
+		let mut probes = Vec::new();
+		for _ in 0..2 {
+			let probe = arm_job_port_close_probe();
+			let mut command = extraction_command(false, true);
+			let child = command.spawn()?;
+			clear_job_port_close_probe();
+			let mut lower = child.into_inner();
+			assert_eq!(probe.counts(), (0, 0));
+			assert_eq!(lower.try_wait()?, None);
+			lowers.push(lower);
+			probes.push(probe);
+		}
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while job_custodian_worker_starts() == worker_starts {
+			assert!(
+				Instant::now() < deadline,
+				"the shared custodian did not start"
+			);
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		assert_eq!(job_custodian_worker_starts(), worker_starts + 1);
+
+		reset_job_extraction_faults();
+		for lower in &mut lowers {
+			lower.start_kill()?;
+			let _ = lower.wait().await?;
+		}
+		for probe in &probes {
+			wait_for_job_port_closes(probe, (1, 1));
+		}
+		assert_eq!(job_custodian_worker_starts(), worker_starts + 1);
+		Ok(())
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn custodian_start_failure_uses_only_exact_last_resort_retention() -> Result<()> {
+		let _serial = serial_job_extraction();
+		let _fault_cleanup = ExtractionFaultCleanup;
+		reset_job_port_custodian_for_test();
+		let retained = job_port_last_resort_retentions();
+		set_job_extraction_query_failures(1);
+		set_job_extraction_disarm_failures(1);
+		set_job_custodian_start_failures(1);
+		let probe = arm_job_port_close_probe();
+		let mut command = extraction_command(false, true);
+		let child = command.spawn()?;
+		clear_job_port_close_probe();
+		let mut lower = child.into_inner();
+
+		assert_eq!(probe.counts(), (0, 0));
+		assert_eq!(job_port_last_resort_retentions(), retained + 1);
+		assert_eq!(lower.try_wait()?, None);
+		lower.start_kill()?;
+		let status = lower.wait().await?;
+		assert_eq!(lower.wait().await?, status);
+		assert_eq!(probe.counts(), (0, 0));
+		Ok(())
 	}
 
 	#[tokio::test(flavor = "current_thread")]

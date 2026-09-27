@@ -4,6 +4,7 @@ use std::{
 	io::{Error, Result},
 	ops::ControlFlow,
 	os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle as StdOwnedHandle},
+	sync::{Mutex, OnceLock, mpsc},
 	time::Duration,
 };
 
@@ -194,10 +195,32 @@ pub(crate) mod test_support {
 		Panic(Arc<()>),
 	}
 
+	#[derive(Debug, Default)]
+	pub struct JobPortCloseProbe {
+		pub job_closes: AtomicUsize,
+		pub completion_port_closes: AtomicUsize,
+	}
+
+	impl JobPortCloseProbe {
+		pub fn counts(&self) -> (usize, usize) {
+			(
+				self.job_closes.load(Ordering::SeqCst),
+				self.completion_port_closes.load(Ordering::SeqCst),
+			)
+		}
+	}
+
+	static JOB_EXTRACTION_QUERY_FAILURES: AtomicUsize = AtomicUsize::new(0);
+	static JOB_EXTRACTION_DISARM_FAILURES: AtomicUsize = AtomicUsize::new(0);
+	static JOB_CUSTODIAN_START_FAILURES: AtomicUsize = AtomicUsize::new(0);
+	static JOB_CUSTODIAN_WORKER_STARTS: AtomicUsize = AtomicUsize::new(0);
+	static JOB_PORT_LAST_RESORT_RETENTIONS: AtomicUsize = AtomicUsize::new(0);
+
 	thread_local! {
 		static OWNER_FAILURE: RefCell<Option<OwnerFailure>> = const { RefCell::new(None) };
 		static OWNER_EVENTS: RefCell<Option<Arc<Mutex<Vec<&'static str>>>>> = const { RefCell::new(None) };
 		static EXTRA_PREPARED_OWNER: RefCell<ExtraPreparedOwner> = RefCell::new(ExtraPreparedOwner::default());
+		static JOB_PORT_CLOSE_PROBE: RefCell<Option<Arc<JobPortCloseProbe>>> = const { RefCell::new(None) };
 	}
 
 	#[derive(Default)]
@@ -231,6 +254,85 @@ pub(crate) mod test_support {
 			state.owners.clear();
 			(inject, owner_count)
 		})
+	}
+
+	fn take_failure(counter: &AtomicUsize) -> bool {
+		counter
+			.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+				remaining.checked_sub(1)
+			})
+			.is_ok()
+	}
+
+	pub fn serial_job_extraction() -> std::sync::MutexGuard<'static, ()> {
+		static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+		LOCK.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	pub fn arm_job_port_close_probe() -> Arc<JobPortCloseProbe> {
+		let probe = Arc::new(JobPortCloseProbe::default());
+		JOB_PORT_CLOSE_PROBE.with(|slot| {
+			assert!(slot.borrow_mut().replace(Arc::clone(&probe)).is_none());
+		});
+		probe
+	}
+
+	pub fn current_job_port_close_probe() -> Option<Arc<JobPortCloseProbe>> {
+		JOB_PORT_CLOSE_PROBE.with(|slot| slot.borrow().clone())
+	}
+
+	pub fn clear_job_port_close_probe() {
+		JOB_PORT_CLOSE_PROBE.with(|slot| {
+			assert!(slot.borrow_mut().take().is_some());
+		});
+	}
+
+	pub fn set_job_extraction_query_failures(failures: usize) {
+		JOB_EXTRACTION_QUERY_FAILURES.store(failures, Ordering::SeqCst);
+	}
+
+	pub fn take_job_extraction_query_failure() -> bool {
+		take_failure(&JOB_EXTRACTION_QUERY_FAILURES)
+	}
+
+	pub fn set_job_extraction_disarm_failures(failures: usize) {
+		JOB_EXTRACTION_DISARM_FAILURES.store(failures, Ordering::SeqCst);
+	}
+
+	pub fn take_job_extraction_disarm_failure() -> bool {
+		take_failure(&JOB_EXTRACTION_DISARM_FAILURES)
+	}
+
+	pub fn set_job_custodian_start_failures(failures: usize) {
+		JOB_CUSTODIAN_START_FAILURES.store(failures, Ordering::SeqCst);
+	}
+
+	pub fn take_job_custodian_start_failure() -> bool {
+		take_failure(&JOB_CUSTODIAN_START_FAILURES)
+	}
+
+	pub fn observe_job_custodian_worker_start() {
+		JOB_CUSTODIAN_WORKER_STARTS.fetch_add(1, Ordering::SeqCst);
+	}
+
+	pub fn job_custodian_worker_starts() -> usize {
+		JOB_CUSTODIAN_WORKER_STARTS.load(Ordering::SeqCst)
+	}
+
+	pub fn observe_job_port_last_resort_retention() {
+		JOB_PORT_LAST_RESORT_RETENTIONS.fetch_add(1, Ordering::SeqCst);
+	}
+
+	pub fn job_port_last_resort_retentions() -> usize {
+		JOB_PORT_LAST_RESORT_RETENTIONS.load(Ordering::SeqCst)
+	}
+
+	pub fn reset_job_extraction_faults() {
+		JOB_EXTRACTION_QUERY_FAILURES.store(0, Ordering::SeqCst);
+		JOB_EXTRACTION_DISARM_FAILURES.store(0, Ordering::SeqCst);
+		JOB_CUSTODIAN_START_FAILURES.store(0, Ordering::SeqCst);
 	}
 
 	pub fn arm_owner_failure(failure: OwnerFailure) {
@@ -573,12 +675,24 @@ unsafe impl Sync for JobHandle {}
 pub(crate) struct JobPort {
 	pub job: JobHandle,
 	pub completion_port: StdOwnedHandle,
+	#[cfg(test)]
+	close_probe: Option<std::sync::Arc<test_support::JobPortCloseProbe>>,
 }
 
 impl Drop for JobPort {
 	fn drop(&mut self) {
 		// SAFETY: `JobPort` solely owns this job handle.
 		unsafe { CloseHandle(self.job.0) }.ok();
+		#[cfg(test)]
+		if let Some(probe) = self.close_probe.as_ref() {
+			probe
+				.job_closes
+				.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			// The completion-port OwnedHandle drops immediately after this Drop implementation returns.
+			probe
+				.completion_port_closes
+				.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		}
 	}
 }
 
@@ -617,8 +731,25 @@ fn set_job_kill_on_drop_inner(
 		?info,
 		"setting SetInformationJobObject(limit)"
 	);
-	// No tracing or other caller-controlled callback may run after the native transition: the sole
-	// final owner must either remain kill-on-close armed or complete disarming without unwinding.
+	set_job_kill_on_drop_native(
+		job,
+		kill_on_drop,
+		#[cfg(test)]
+		probe,
+	)
+}
+
+fn set_job_kill_on_drop_native(
+	job: JobHandle,
+	kill_on_drop: bool,
+	#[cfg(test)] probe: Option<&crate::test_allocator::PostTransitionProbe>,
+) -> Result<()> {
+	let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+	if kill_on_drop {
+		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+	}
+	// No caller-controlled callback runs in this helper. After a successful native transition it only
+	// records a test-only atomic observation and returns.
 	// SAFETY: `job` is live, and initialized `info` has the reported size and outlives the call.
 	let result = unsafe {
 		SetInformationJobObject(
@@ -692,6 +823,8 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 	Ok(JobPort {
 		job: JobHandle(job.into_raw()),
 		completion_port,
+		#[cfg(test)]
+		close_probe: test_support::current_job_port_close_probe(),
 	})
 }
 
@@ -786,6 +919,133 @@ fn job_is_drained(job: JobHandle) -> Result<bool> {
 	}
 	.map_err(Error::other)?;
 	Ok(accounting.ActiveProcesses == 0)
+}
+
+fn extracted_job_is_drained(job: JobHandle) -> Result<bool> {
+	#[cfg(test)]
+	if test_support::take_job_extraction_query_failure() {
+		return Err(Error::other(
+			"injected extracted JobObject accounting failure",
+		));
+	}
+	job_is_drained(job)
+}
+
+fn disarm_extracted_job(job: JobHandle) -> Result<()> {
+	#[cfg(test)]
+	if test_support::take_job_extraction_disarm_failure() {
+		return Err(Error::other("injected extracted JobObject disarm failure"));
+	}
+	set_job_kill_on_drop_native(
+		job,
+		false,
+		#[cfg(test)]
+		None,
+	)
+}
+
+fn extracted_job_can_close(job_port: &JobPort) -> bool {
+	if disarm_extracted_job(job_port.job).is_ok() {
+		return true;
+	}
+	matches!(extracted_job_is_drained(job_port.job), Ok(true))
+}
+
+struct JobPortCustodian {
+	sender: Option<mpsc::Sender<JobPort>>,
+}
+
+fn job_port_custodian() -> &'static Mutex<JobPortCustodian> {
+	static CUSTODIAN: OnceLock<Mutex<JobPortCustodian>> = OnceLock::new();
+	CUSTODIAN.get_or_init(|| Mutex::new(JobPortCustodian { sender: None }))
+}
+
+#[cfg(test)]
+pub(crate) fn reset_job_port_custodian_for_test() {
+	job_port_custodian()
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.sender = None;
+}
+
+fn start_job_port_custodian(receiver: mpsc::Receiver<JobPort>) -> Result<()> {
+	#[cfg(test)]
+	if test_support::take_job_custodian_start_failure() {
+		return Err(Error::other("injected JobObject custodian start failure"));
+	}
+	std::thread::Builder::new()
+		.name("process-wrap-job-custodian".into())
+		.spawn(move || {
+			#[cfg(test)]
+			test_support::observe_job_custodian_worker_start();
+			let mut retained = Vec::new();
+			loop {
+				match receiver.recv_timeout(JOB_POLL_INTERVAL) {
+					Ok(job_port) => {
+						retained.push(job_port);
+						retained.extend(receiver.try_iter());
+					}
+					Err(mpsc::RecvTimeoutError::Timeout) => {}
+					Err(mpsc::RecvTimeoutError::Disconnected) if retained.is_empty() => return,
+					Err(mpsc::RecvTimeoutError::Disconnected) => {}
+				}
+				let mut index = 0;
+				while index < retained.len() {
+					if extracted_job_can_close(&retained[index]) {
+						retained.swap_remove(index);
+					} else {
+						index += 1;
+					}
+				}
+			}
+		})
+		.map(drop)
+}
+
+fn retain_extracted_job_port(mut job_port: JobPort) -> std::result::Result<(), JobPort> {
+	let mut custodian = job_port_custodian()
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner);
+	loop {
+		if let Some(sender) = custodian.sender.as_ref() {
+			match sender.send(job_port) {
+				Ok(()) => return Ok(()),
+				Err(error) => {
+					job_port = error.0;
+					custodian.sender = None;
+				}
+			}
+		}
+
+		let (sender, receiver) = mpsc::channel();
+		if start_job_port_custodian(receiver).is_err() {
+			return Err(job_port);
+		}
+		custodian.sender = Some(sender);
+	}
+}
+
+fn retain_extracted_job_port_last_resort(job_port: JobPort) {
+	#[cfg(test)]
+	test_support::observe_job_port_last_resort_retention();
+	// The infallible extraction API cannot report failure to establish shared custody. Forgetting this
+	// exact complete port keeps the possibly armed final job handle open and preserves the lower child.
+	std::mem::forget(job_port);
+}
+
+/// Relinquish an extracted finalized Tokio JobObject without terminating its returned lower child.
+pub(crate) fn release_extracted_job_port(job_port: JobPort, known_drained: bool) {
+	if known_drained || matches!(extracted_job_is_drained(job_port.job), Ok(true)) {
+		drop(job_port);
+		return;
+	}
+	if disarm_extracted_job(job_port.job).is_ok() {
+		drop(job_port);
+		return;
+	}
+	if let Err(job_port) = retain_extracted_job_port(job_port) {
+		retain_extracted_job_port_last_resort(job_port);
+	}
 }
 
 fn finite_timeout_millis(timeout: Duration) -> u32 {
