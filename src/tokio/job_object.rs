@@ -429,15 +429,20 @@ impl ChildWrapper for JobObjectChild {
 #[cfg(test)]
 mod tests {
 	use std::{
+		fs,
 		os::windows::{io::BorrowedHandle, process::CommandExt},
 		panic::{AssertUnwindSafe, catch_unwind, panic_any},
+		path::{Path, PathBuf},
+		process::{Command as StdCommand, Stdio},
 		sync::{
 			Arc,
 			atomic::{AtomicUsize, Ordering},
 		},
 	};
 
-	use windows::Win32::System::Threading::CREATE_SUSPENDED;
+	use windows::Win32::System::Threading::{
+		CREATE_SUSPENDED, GetCurrentProcess, GetProcessHandleCount,
+	};
 
 	use crate::tokio::{ProviderProduct, SpawnProvider};
 	use crate::windows::{
@@ -449,11 +454,11 @@ mod tests {
 			arm_spawn_cleanup_handle_probe, assert_tree_terminated, clear_extra_prepared_owners,
 			clear_job_port_close_probe, clear_owner_events, clear_owner_failure,
 			finish_owner_transition_probe, finish_spawn_cleanup_handle_probe,
-			job_custodian_worker_starts, job_port_last_resort_retentions, observe_descendant,
-			publish_process_guards, record_owner_event, reset_job_extraction_faults,
-			serial_job_extraction, set_job_custodian_start_failures,
-			set_job_extraction_disarm_failures, set_job_extraction_query_failures,
-			spawn_cleanup_handle_close_count,
+			job_custodian_worker_starts, job_extraction_branch_counts,
+			job_port_last_resort_retentions, observe_descendant, publish_process_guards,
+			record_owner_event, reset_job_extraction_faults, serial_job_extraction,
+			set_job_custodian_start_failures, set_job_extraction_disarm_failures,
+			set_job_extraction_query_failures, spawn_cleanup_handle_close_count,
 		},
 	};
 
@@ -721,12 +726,165 @@ mod tests {
 		}
 	}
 
+	const EXTRACTION_HANDLE_COUNT_CHILD: &str = "PROCESS_WRAP_EXTRACTION_HANDLE_COUNT_CHILD";
+	const EXTRACTION_DESCENDANT_PID: &str = "PROCESS_WRAP_EXTRACTION_DESCENDANT_PID";
+	const EXTRACTION_DESCENDANT_RELEASE: &str = "PROCESS_WRAP_EXTRACTION_DESCENDANT_RELEASE";
+
+	struct BoundedTestChild(Option<std::process::Child>);
+
+	impl BoundedTestChild {
+		fn wait(mut self, timeout: Duration) -> Result<std::process::ExitStatus> {
+			let deadline = Instant::now() + timeout;
+			loop {
+				if let Some(status) = self
+					.0
+					.as_mut()
+					.expect("an armed test subprocess guard owns its child")
+					.try_wait()?
+				{
+					self.0.take();
+					return Ok(status);
+				}
+				if Instant::now() >= deadline {
+					return Err(Error::new(
+						ErrorKind::TimedOut,
+						"isolated handle-count regression exceeded its deadline",
+					));
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+		}
+	}
+
+	impl Drop for BoundedTestChild {
+		fn drop(&mut self) {
+			if let Some(child) = self.0.as_mut() {
+				let _ = child.kill();
+				let _ = child.wait();
+			}
+		}
+	}
+
+	fn current_process_handle_count() -> Result<u32> {
+		let mut count = 0;
+		// SAFETY: GetCurrentProcess returns the current-process pseudo-handle, and `count` is writable
+		// storage for the duration of GetProcessHandleCount.
+		unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) }.map_err(Error::other)?;
+		Ok(count)
+	}
+
+	fn wait_for_pid_file(path: &Path) -> Result<u32> {
+		let deadline = Instant::now() + Duration::from_secs(5);
+		loop {
+			if let Ok(pid) =
+				fs::read_to_string(path).and_then(|pid| pid.trim().parse().map_err(Error::other))
+			{
+				return Ok(pid);
+			}
+			if Instant::now() >= deadline {
+				return Err(Error::new(
+					ErrorKind::TimedOut,
+					"extraction descendant did not report its PID",
+				));
+			}
+			std::thread::sleep(Duration::from_millis(10));
+		}
+	}
+
+	#[test]
+	#[ignore = "subprocess helper"]
+	fn extraction_custody_descendant_helper() -> Result<()> {
+		let release = PathBuf::from(
+			std::env::var_os(EXTRACTION_DESCENDANT_RELEASE)
+				.ok_or_else(|| Error::other("extraction release path is missing"))?,
+		);
+		let deadline = Instant::now() + Duration::from_secs(30);
+		while !release.exists() {
+			if Instant::now() >= deadline {
+				return Err(Error::new(
+					ErrorKind::TimedOut,
+					"extraction descendant was not released",
+				));
+			}
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		Ok(())
+	}
+
+	#[test]
+	#[ignore = "subprocess helper"]
+	fn extraction_custody_direct_helper() -> Result<()> {
+		let pid_file = PathBuf::from(
+			std::env::var_os(EXTRACTION_DESCENDANT_PID)
+				.ok_or_else(|| Error::other("extraction descendant PID path is missing"))?,
+		);
+		let release = std::env::var_os(EXTRACTION_DESCENDANT_RELEASE)
+			.ok_or_else(|| Error::other("extraction release path is missing"))?;
+		let mut descendant = StdCommand::new(std::env::current_exe()?)
+			.args([
+				"--exact",
+				"tokio::job_object::tests::extraction_custody_descendant_helper",
+				"--ignored",
+				"--nocapture",
+			])
+			.env(EXTRACTION_DESCENDANT_RELEASE, release)
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.spawn()?;
+		fs::write(pid_file, descendant.id().to_string())?;
+		let _ = descendant.wait()?;
+		Ok(())
+	}
+
+	fn extraction_tree_command(pid_file: &Path, release: &Path) -> Result<CommandWrap> {
+		Ok(CommandWrap::with_new(std::env::current_exe()?, |command| {
+			command
+				.args([
+					"--exact",
+					"tokio::job_object::tests::extraction_custody_direct_helper",
+					"--ignored",
+					"--nocapture",
+				])
+				.env(EXTRACTION_DESCENDANT_PID, pid_file)
+				.env(EXTRACTION_DESCENDANT_RELEASE, release)
+				.stdin(Stdio::null())
+				.stdout(Stdio::null())
+				.stderr(Stdio::null());
+		}))
+	}
+
+	fn run_handle_count_regression_in_subprocess() -> Result<()> {
+		let mut command = StdCommand::new(std::env::current_exe()?);
+		command
+			.args([
+				"--exact",
+				"tokio::job_object::tests::drained_kill_on_drop_extraction_closes_complete_job_ports_repeatedly",
+				"--nocapture",
+			])
+			.env(EXTRACTION_HANDLE_COUNT_CHILD, "1")
+			.stdin(Stdio::null());
+		let child = command.spawn()?;
+		let status = BoundedTestChild(Some(child)).wait(Duration::from_secs(60))?;
+		if status.success() {
+			Ok(())
+		} else {
+			Err(Error::other(format!(
+				"isolated handle-count regression exited with {status}"
+			)))
+		}
+	}
+
 	#[tokio::test(flavor = "current_thread")]
 	#[allow(clippy::await_holding_lock)] // Serializes process-global native fault injection.
 	async fn drained_kill_on_drop_extraction_closes_complete_job_ports_repeatedly() -> Result<()> {
+		if std::env::var_os(EXTRACTION_HANDLE_COUNT_CHILD).is_none() {
+			return run_handle_count_regression_in_subprocess();
+		}
 		let _serial = serial_job_extraction();
+		let before = current_process_handle_count()?;
 		for job_first in [false, true] {
-			for _ in 0..8 {
+			for _ in 0..32 {
 				let probe = arm_job_port_close_probe();
 				let mut command = extraction_command(true, job_first);
 				let mut child = command.spawn()?;
@@ -738,6 +896,11 @@ mod tests {
 				assert_eq!(lower.try_wait()?, Some(status));
 			}
 		}
+		let after = current_process_handle_count()?;
+		assert!(
+			after <= before.saturating_add(8),
+			"repeated drained extraction grew process handles from {before} to {after}"
+		);
 		Ok(())
 	}
 
@@ -800,6 +963,76 @@ mod tests {
 			wait_for_job_port_closes(probe, (1, 1));
 		}
 		assert_eq!(job_custodian_worker_starts(), worker_starts + 1);
+		Ok(())
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	#[allow(clippy::await_holding_lock)] // Serializes process-global native fault injection.
+	async fn persistent_disarm_failure_closes_only_after_authoritative_tree_drain() -> Result<()> {
+		let _serial = serial_job_extraction();
+		let _fault_cleanup = ExtractionFaultCleanup;
+		let directory = tempfile::tempdir()?;
+		let pid_file = directory.path().join("descendant.pid");
+		let release = directory.path().join("release-descendant");
+		let baseline = job_extraction_branch_counts();
+		let worker_starts = job_custodian_worker_starts();
+		set_job_extraction_query_failures(usize::MAX);
+		set_job_extraction_disarm_failures(usize::MAX);
+		let probe = arm_job_port_close_probe();
+		let mut command = extraction_tree_command(&pid_file, &release)?;
+		command.wrap(JobObject).wrap(KillOnDrop);
+		let child = command.spawn()?;
+		clear_job_port_close_probe();
+		let direct_pid = child.id().expect("the direct child retains its PID");
+		let mut direct = ProcessGuard::open(direct_pid)?;
+		let mut descendant = ProcessGuard::open(wait_for_pid_file(&pid_file)?)?;
+		let mut lower = child.into_inner();
+		assert_eq!(probe.counts(), (0, 0));
+		assert!(
+			!direct.has_exited()?,
+			"retained custody preserves the direct child"
+		);
+		assert!(
+			!descendant.has_exited()?,
+			"retained custody preserves the descendant"
+		);
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while job_custodian_worker_starts() == worker_starts {
+			assert!(
+				Instant::now() < deadline,
+				"the shared custodian did not start"
+			);
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		let unresolved = job_extraction_branch_counts();
+		assert!(unresolved.2 > baseline.2, "custody retried native disarm");
+		assert_eq!(
+			unresolved.3, baseline.3,
+			"no extracted-job disarm may succeed in this branch"
+		);
+		assert_eq!(unresolved.1, baseline.1, "the live tree has not drained");
+
+		set_job_extraction_query_failures(0);
+		fs::File::create(&release)?;
+		let status = lower.wait().await?;
+		assert_eq!(lower.wait().await?, status);
+		direct.wait_for_exit("the extracted direct child")?;
+		descendant.wait_for_exit("the extracted descendant")?;
+		wait_for_job_port_closes(&probe, (1, 1));
+		let drained = job_extraction_branch_counts();
+		assert!(
+			drained.0 > baseline.0,
+			"authoritative accounting was queried"
+		);
+		assert!(
+			drained.1 > baseline.1,
+			"authoritative accounting observed drain"
+		);
+		assert!(drained.2 > baseline.2, "native disarm remained attempted");
+		assert_eq!(
+			drained.3, baseline.3,
+			"complete closure must not be attributed to disarm success"
+		);
 		Ok(())
 	}
 

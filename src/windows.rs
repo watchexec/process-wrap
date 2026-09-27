@@ -221,6 +221,10 @@ pub(crate) mod test_support {
 		static JOB_CUSTODIAN_START_FAILURES: AtomicUsize = AtomicUsize::new(0);
 		static JOB_CUSTODIAN_WORKER_STARTS: AtomicUsize = AtomicUsize::new(0);
 		static JOB_PORT_LAST_RESORT_RETENTIONS: AtomicUsize = AtomicUsize::new(0);
+		static JOB_EXTRACTION_QUERY_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+		static JOB_EXTRACTION_DRAIN_OBSERVATIONS: AtomicUsize = AtomicUsize::new(0);
+		static JOB_EXTRACTION_DISARM_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+		static JOB_EXTRACTION_DISARM_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
 
 		thread_local! {
 			static JOB_PORT_CLOSE_PROBE: RefCell<Option<Arc<JobPortCloseProbe>>> = const { RefCell::new(None) };
@@ -257,6 +261,29 @@ pub(crate) mod test_support {
 			JOB_PORT_CLOSE_PROBE.with(|slot| {
 				assert!(slot.borrow_mut().take().is_some());
 			});
+		}
+
+		pub fn observe_job_extraction_query(drained: bool) {
+			JOB_EXTRACTION_QUERY_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+			if drained {
+				JOB_EXTRACTION_DRAIN_OBSERVATIONS.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+
+		pub fn observe_job_extraction_disarm(success: bool) {
+			JOB_EXTRACTION_DISARM_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+			if success {
+				JOB_EXTRACTION_DISARM_SUCCESSES.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+
+		pub fn job_extraction_branch_counts() -> (usize, usize, usize, usize) {
+			(
+				JOB_EXTRACTION_QUERY_ATTEMPTS.load(Ordering::SeqCst),
+				JOB_EXTRACTION_DRAIN_OBSERVATIONS.load(Ordering::SeqCst),
+				JOB_EXTRACTION_DISARM_ATTEMPTS.load(Ordering::SeqCst),
+				JOB_EXTRACTION_DISARM_SUCCESSES.load(Ordering::SeqCst),
+			)
 		}
 
 		pub fn set_job_extraction_query_failures(failures: usize) {
@@ -442,6 +469,15 @@ pub(crate) mod test_support {
 
 		pub fn disarm(&mut self) {
 			self.armed = false;
+		}
+
+		pub fn has_exited(&self) -> Result<bool> {
+			// SAFETY: `self.handle` remains live and is used only for this nonblocking wait.
+			match unsafe { WaitForSingleObject(HANDLE(self.handle.as_raw_handle()), 0) } {
+				WAIT_OBJECT_0 => Ok(true),
+				WAIT_TIMEOUT => Ok(false),
+				_ => Err(Error::last_os_error()),
+			}
 		}
 
 		pub fn wait_for_exit(&mut self, label: &str) -> Result<()> {
@@ -939,25 +975,33 @@ fn job_is_drained(job: JobHandle) -> Result<bool> {
 fn extracted_job_is_drained(job: JobHandle) -> Result<bool> {
 	#[cfg(test)]
 	if test_support::take_job_extraction_query_failure() {
+		test_support::observe_job_extraction_query(false);
 		return Err(Error::other(
 			"injected extracted JobObject accounting failure",
 		));
 	}
-	job_is_drained(job)
+	let result = job_is_drained(job);
+	#[cfg(test)]
+	test_support::observe_job_extraction_query(matches!(result, Ok(true)));
+	result
 }
 
 #[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
 fn disarm_extracted_job(job: JobHandle) -> Result<()> {
 	#[cfg(test)]
 	if test_support::take_job_extraction_disarm_failure() {
+		test_support::observe_job_extraction_disarm(false);
 		return Err(Error::other("injected extracted JobObject disarm failure"));
 	}
-	set_job_kill_on_drop_native(
+	let result = set_job_kill_on_drop_native(
 		job,
 		false,
 		#[cfg(test)]
 		None,
-	)
+	);
+	#[cfg(test)]
+	test_support::observe_job_extraction_disarm(result.is_ok());
+	result
 }
 
 #[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
