@@ -130,7 +130,7 @@ macro_rules! Wrap {
 			admission: ::std::sync::Mutex<PreparedChildAdmission>,
 			type_id: ::std::any::TypeId,
 			#[cfg(test)]
-			before_value_lock: ::std::sync::Mutex<Option<PreparedStateTestRendezvous>>,
+			value_lock_attempt: ::std::sync::Mutex<Option<PreparedStateTestRendezvous>>,
 			#[cfg(test)]
 			after_closing: ::std::sync::Mutex<Option<PreparedStateTestRendezvous>>,
 		}
@@ -143,7 +143,7 @@ macro_rules! Wrap {
 				::std::sync::MutexGuard<'_, Option<Box<dyn ::std::any::Any + Send>>>,
 			> {
 				#[cfg(test)]
-				self.wait_before_value_lock();
+				self.wait_for_value_lock_attempt();
 				let value = self
 					.value
 					.lock()
@@ -181,13 +181,20 @@ macro_rules! Wrap {
 			}
 
 			#[cfg(test)]
-			fn wait_before_value_lock(&self) {
+			fn wait_for_value_lock_attempt(&self) {
 				let rendezvous = self
-					.before_value_lock
+					.value_lock_attempt
 					.lock()
 					.unwrap_or_else(::std::sync::PoisonError::into_inner)
 					.take();
 				if let Some(rendezvous) = rendezvous {
+					assert!(
+						matches!(
+							self.value.try_lock(),
+							Err(::std::sync::TryLockError::WouldBlock)
+						),
+						"the acquisition-attempt probe requires an active value owner"
+					);
 					rendezvous.wait();
 				}
 			}
@@ -221,7 +228,7 @@ macro_rules! Wrap {
 						admission: ::std::sync::Mutex::new(PreparedChildAdmission::default()),
 						type_id,
 						#[cfg(test)]
-						before_value_lock: ::std::sync::Mutex::new(None),
+						value_lock_attempt: ::std::sync::Mutex::new(None),
 						#[cfg(test)]
 						after_closing: ::std::sync::Mutex::new(None),
 					}),
@@ -470,6 +477,45 @@ macro_rules! Wrap {
 		}
 
 		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Clone, Copy)]
+		enum PreparedLifecyclePath {
+			NativeDrop,
+			ProviderDrop,
+			NativeExtraction,
+			ProviderExtraction,
+			FailureCleanup,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug)]
+		struct PreparedLifecycleChild {
+			prepared: Option<PreparedChild>,
+			retained: Option<PreparedRaceDrop>,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl $childer for PreparedLifecycleChild {
+			fn inner(&self) -> &dyn $childer {
+				self
+			}
+
+			fn inner_mut(&mut self) -> &mut dyn $childer {
+				self
+			}
+
+			fn into_inner(self: Box<Self>) -> Box<dyn $childer> {
+				self
+			}
+
+			fn retain_prepared_after_sidecar_removal_layer(&mut self) {
+				self.retained = self
+					.prepared
+					.as_ref()
+					.and_then(|prepared| prepared.take_prepared_value::<PreparedRaceDrop>());
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
 		fn assert_queued_prepared_access_is_rejected(closer: PreparedRaceCloser) {
 			const TIMEOUT: ::std::time::Duration = ::std::time::Duration::from_secs(5);
 
@@ -502,7 +548,7 @@ macro_rules! Wrap {
 			let (queued_reached_tx, queued_reached_rx) = ::std::sync::mpsc::channel();
 			let (queued_release_tx, queued_release_rx) = ::std::sync::mpsc::channel();
 			*state
-				.before_value_lock
+				.value_lock_attempt
 				.lock()
 				.unwrap_or_else(::std::sync::PoisonError::into_inner) =
 				Some(PreparedStateTestRendezvous {
@@ -606,6 +652,105 @@ macro_rules! Wrap {
 		}
 
 		#[cfg(all(test, windows, feature = "job-object"))]
+		fn assert_prepared_lifecycle_path_closes(path: PreparedLifecyclePath) {
+			const TIMEOUT: ::std::time::Duration = ::std::time::Duration::from_secs(5);
+
+			let drops = ::std::sync::Arc::new(::std::sync::atomic::AtomicUsize::new(0));
+			let owner = PreparedChildOwner::new(Box::new(PreparedRaceDrop(
+				::std::sync::Arc::clone(&drops),
+			)));
+			let state = ::std::sync::Arc::clone(&owner.state);
+			let token = owner.installed_token();
+			let extracts = matches!(
+				path,
+				PreparedLifecyclePath::NativeExtraction
+					| PreparedLifecyclePath::ProviderExtraction
+			);
+			let child: Box<dyn $childer> = Box::new(PreparedLifecycleChild {
+				prepared: extracts.then(|| owner.installed_token()),
+				retained: None,
+			});
+			let mut cleanup = PreparedRaceCleanup::new();
+
+			let (closing_reached_tx, closing_reached_rx) = ::std::sync::mpsc::channel();
+			let (closing_release_tx, closing_release_rx) = ::std::sync::mpsc::channel();
+			*state
+				.after_closing
+				.lock()
+				.unwrap_or_else(::std::sync::PoisonError::into_inner) =
+				Some(PreparedStateTestRendezvous {
+					reached: closing_reached_tx,
+					release: closing_release_rx,
+				});
+			cleanup.releases.push(closing_release_tx.clone());
+			let (finished_tx, finished_rx) = ::std::sync::mpsc::channel();
+			cleanup.workers.push(::std::thread::spawn(move || {
+				match path {
+					PreparedLifecyclePath::NativeDrop => {
+						let returned: Box<dyn $childer> =
+							PreparedOwnerChild::new(child, vec![Some(owner)]);
+						drop(returned);
+					}
+					PreparedLifecyclePath::ProviderDrop => {
+						let returned: Box<dyn $childer> =
+							CommittedProviderChild::new(child, vec![Some(owner)]);
+						drop(returned);
+					}
+					PreparedLifecyclePath::NativeExtraction => {
+						let returned: Box<dyn $childer> =
+							PreparedOwnerChild::new(child, vec![Some(owner)]);
+						drop(returned.into_inner());
+					}
+					PreparedLifecyclePath::ProviderExtraction => {
+						let returned: Box<dyn $childer> =
+							CommittedProviderChild::new(child, vec![Some(owner)]);
+						drop(returned.into_inner());
+					}
+					PreparedLifecyclePath::FailureCleanup => {
+						drop(child);
+						let mut prepared = [Some(owner)];
+						crate::command::Command::<$backend>::cleanup_prepared(&mut prepared);
+					}
+				}
+				let _ = finished_tx.send(());
+			}));
+
+			closing_reached_rx
+				.recv_timeout(TIMEOUT)
+				.expect("the lifecycle path published prepared closing");
+			assert!(
+				state
+					.admission
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.closing,
+				"the lifecycle probe observes the actual closed state"
+			);
+			assert_eq!(
+				finished_rx.try_recv(),
+				Err(::std::sync::mpsc::TryRecvError::Empty),
+				"the lifecycle path passed its paused close transition"
+			);
+			assert_eq!(
+				drops.load(::std::sync::atomic::Ordering::SeqCst),
+				0,
+				"the prepared value was disposed before the close transition resumed"
+			);
+			closing_release_tx
+				.send(())
+				.expect("release the lifecycle close transition");
+			finished_rx
+				.recv_timeout(TIMEOUT)
+				.expect("the lifecycle path completed");
+			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 1);
+			assert!(
+				token.with::<PreparedRaceDrop, _>(|_| ()).is_none(),
+				"the lifecycle path left prepared state accessible after closing"
+			);
+			cleanup.finish();
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
 		#[test]
 		fn queued_prepared_access_is_rejected_by_owner_drop() {
 			assert_queued_prepared_access_is_rejected(PreparedRaceCloser::OwnerDrop);
@@ -621,6 +766,36 @@ macro_rules! Wrap {
 		#[test]
 		fn queued_prepared_access_is_rejected_by_failure_cleanup() {
 			assert_queued_prepared_access_is_rejected(PreparedRaceCloser::FailureCleanup);
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn native_returned_child_drop_publishes_prepared_closing() {
+			assert_prepared_lifecycle_path_closes(PreparedLifecyclePath::NativeDrop);
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn provider_returned_child_drop_publishes_prepared_closing() {
+			assert_prepared_lifecycle_path_closes(PreparedLifecyclePath::ProviderDrop);
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn native_consuming_extraction_publishes_prepared_closing() {
+			assert_prepared_lifecycle_path_closes(PreparedLifecyclePath::NativeExtraction);
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn provider_consuming_extraction_publishes_prepared_closing() {
+			assert_prepared_lifecycle_path_closes(PreparedLifecyclePath::ProviderExtraction);
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn failed_spawn_cleanup_publishes_prepared_closing() {
+			assert_prepared_lifecycle_path_closes(PreparedLifecyclePath::FailureCleanup);
 		}
 
 		#[cfg(all(test, windows, feature = "job-object"))]

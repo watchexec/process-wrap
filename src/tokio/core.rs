@@ -896,7 +896,7 @@ mod prepared_output_wait_tests {
 		let (racing_reached_tx, racing_reached_rx) = mpsc::channel();
 		let (racing_release_tx, racing_release_rx) = mpsc::channel();
 		*state
-			.before_value_lock
+			.value_lock_attempt
 			.lock()
 			.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PreparedStateTestRendezvous {
 			reached: racing_reached_tx,
