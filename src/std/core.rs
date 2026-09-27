@@ -860,6 +860,7 @@ mod signal_tests {
 	use super::*;
 
 	#[test]
+	#[cfg_attr(miri, ignore = "requires a native child process")]
 	fn terminal_status_prevents_the_production_signal_seam() -> Result<()> {
 		let mut child = Command::new("true").spawn()?;
 		let status = child.wait()?;
@@ -877,6 +878,7 @@ mod signal_tests {
 	}
 
 	#[test]
+	#[cfg_attr(miri, ignore = "requires a native child process")]
 	fn live_status_reaches_the_production_signal_seam_once() -> Result<()> {
 		let mut child = Command::new("sh").args(["-c", "sleep 30"]).spawn()?;
 		let calls = AtomicUsize::new(0);

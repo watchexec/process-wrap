@@ -854,6 +854,7 @@ mod signal_tests {
 	use super::*;
 
 	#[tokio::test]
+	#[cfg_attr(miri, ignore = "requires a native child process")]
 	async fn terminal_status_prevents_the_production_signal_seam() -> Result<()> {
 		let mut child = NativeCommand::new("true").spawn()?;
 		let status = child.wait().await?;
@@ -871,6 +872,7 @@ mod signal_tests {
 	}
 
 	#[tokio::test]
+	#[cfg_attr(miri, ignore = "requires a native child process")]
 	async fn live_status_reaches_the_production_signal_seam_once() -> Result<()> {
 		let mut child = NativeCommand::new("sh").args(["-c", "sleep 30"]).spawn()?;
 		let calls = AtomicUsize::new(0);
