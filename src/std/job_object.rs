@@ -18,9 +18,14 @@ use crate::{
 	ChildExitStatus,
 	windows::{
 		JOB_POLL_INTERVAL, JobPort, job_creation_flags, make_job_object, poll_job_drain,
-		resume_threads, set_job_kill_on_drop, terminate_job,
+		resume_threads, terminate_job,
 	},
 };
+
+#[cfg(not(test))]
+use crate::windows::set_job_kill_on_drop;
+#[cfg(test)]
+use crate::windows::set_job_kill_on_drop_observed;
 
 #[cfg(feature = "creation-flags")]
 use super::CreationFlags;
@@ -206,16 +211,16 @@ impl JobObjectChild {
 					.expect("the extracted JobObject layer retains its job handles"),
 			);
 		}
-		self.prepared()
-			.with::<PreparedJobObject, _>(|prepared| {
-				inspect(
-					prepared
-						.job_port
-						.as_ref()
-						.expect("the installed JobObject layer retains its job handles"),
-				)
-			})
-			.expect("JobObject prepared state retains its concrete type")
+		self.prepared().with_required::<PreparedJobObject, _>(
+			|| panic!("JobObject prepared state retains its concrete type"),
+			|prepared| {
+				let job_port = prepared
+					.job_port
+					.as_ref()
+					.expect("the installed JobObject layer retains its job handles");
+				inspect(job_port)
+			},
+		)
 	}
 
 	fn take_prepared(&mut self) -> PreparedJobObject {
@@ -317,10 +322,16 @@ impl ChildWrapper for JobObjectChild {
 		#[cfg(test)]
 		crate::windows::test_support::fail_final_owner()?;
 		let final_kill_on_drop = self.final_kill_on_drop;
+		#[cfg(test)]
+		let transition_probe = crate::windows::test_support::owner_transition_probe();
+		#[cfg(test)]
+		self.with_job_port(|job_port| {
+			crate::windows::test_support::record_owner_event("before-owner-transition");
+			set_job_kill_on_drop_observed(job_port.job, final_kill_on_drop, transition_probe)
+		})?;
+		#[cfg(not(test))]
 		self.with_job_port(|job_port| set_job_kill_on_drop(job_port.job, final_kill_on_drop))?;
 		self.spawn_finalized = true;
-		#[cfg(test)]
-		crate::windows::test_support::record_owner_event("owner-disarmed");
 		Ok(())
 	}
 
@@ -427,8 +438,9 @@ mod tests {
 	use crate::windows::test_support::{
 		LifecycleState, OwnerError, OwnerFailure, OwnerPanic, PanickingCommittedTransaction,
 		ProcessGuard, TreePaths, arm_extra_prepared_owner, arm_owner_events, arm_owner_failure,
-		assert_tree_terminated, clear_extra_prepared_owners, clear_owner_events,
-		clear_owner_failure, observe_descendant, publish_process_guards, record_owner_event,
+		arm_owner_transition_probe, assert_tree_terminated, clear_extra_prepared_owners,
+		clear_owner_events, clear_owner_failure, finish_owner_transition_probe, observe_descendant,
+		publish_process_guards, record_owner_event,
 	};
 
 	use super::*;
@@ -701,7 +713,7 @@ mod tests {
 	}
 
 	#[test]
-	fn no_slot_accessor_runs_after_final_owner_disarm() -> Result<()> {
+	fn final_owner_transition_has_no_later_test_or_caller_operation() -> Result<()> {
 		for provider in [false, true] {
 			let directory = tempfile::tempdir()?;
 			let paths = TreePaths::new(directory.path());
@@ -719,8 +731,11 @@ mod tests {
 					.lock()
 					.unwrap_or_else(std::sync::PoisonError::into_inner)
 					.clear();
+				arm_owner_transition_probe();
 				arm_owner_events(Arc::clone(&events));
 				let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
+				let (transitioned, allocator_callback, later_operation) =
+					finish_owner_transition_probe();
 				let mut succeeded = false;
 				match outcome {
 					Ok(Ok(mut child)) => {
@@ -743,6 +758,15 @@ mod tests {
 					clear_owner_events(),
 					"the owner event barrier remained armed"
 				);
+				assert!(transitioned, "the native final-owner transition completed");
+				assert!(
+					!allocator_callback,
+					"an allocator callback ran after the native final-owner transition"
+				);
+				assert!(
+					!later_operation,
+					"a caller or test operation ran after the native final-owner transition"
+				);
 				let tree_result = assert_tree_terminated(&paths, &state);
 				assert!(
 					succeeded,
@@ -753,8 +777,8 @@ mod tests {
 					*events
 						.lock()
 						.unwrap_or_else(std::sync::PoisonError::into_inner),
-					["slot-accessor", "owner-disarmed"],
-					"the final owner transition follows the last caller-defined accessor"
+					["slot-accessor", "before-owner-transition"],
+					"the final native transition follows the last caller-defined accessor"
 				);
 				tree_result?;
 				if attempt == 0 {

@@ -251,6 +251,8 @@ macro_rules! Wrap {
 			/// Inspect installed prepared state immutably while its private owner remains live.
 			#[doc(hidden)]
 			pub fn with<T: ::std::any::Any, R>(&self, inspect: impl FnOnce(&T) -> R) -> Option<R> {
+				#[cfg(test)]
+				crate::test_allocator::current_probe().observe_operation();
 				let state = self.state.upgrade()?;
 				let value = state
 					.value
@@ -260,6 +262,30 @@ macro_rules! Wrap {
 					return None;
 				}
 				value.as_deref()?.downcast_ref::<T>().map(inspect)
+			}
+
+			#[cfg(feature = "job-object")]
+			pub(crate) fn with_required<T: ::std::any::Any, R>(
+				&self,
+				unavailable: impl FnOnce() -> R,
+				inspect: impl FnOnce(&T) -> R,
+			) -> R {
+				#[cfg(test)]
+				crate::test_allocator::current_probe().observe_operation();
+				let Some(state) = self.state.upgrade() else {
+					return unavailable();
+				};
+				let value = state
+					.value
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner);
+				if state.revoked.load(::std::sync::atomic::Ordering::Acquire) {
+					return unavailable();
+				}
+				let Some(value) = value.as_deref().and_then(|value| value.downcast_ref::<T>()) else {
+					return unavailable();
+				};
+				inspect(value)
 			}
 
 			#[cfg(feature = "job-object")]
@@ -1230,6 +1256,7 @@ macro_rules! Wrap {
 							return failure.finish::<Box<dyn $childer>>();
 						}
 					};
+					attempt.prepare_for_final_owner();
 					let final_result = Self::capture_io(|| {
 						success
 							.child_mut()
@@ -1415,6 +1442,7 @@ macro_rules! Wrap {
 
 				#[cfg(windows)]
 				{
+					attempt.prepare_for_final_owner();
 					let final_result = Self::capture_io(|| {
 						sidecar
 							.child_mut()

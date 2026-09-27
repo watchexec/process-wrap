@@ -632,6 +632,107 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
+#[cfg(all(test, windows))]
+pub(crate) mod test_allocator {
+	use std::{
+		alloc::{GlobalAlloc, Layout, System},
+		cell::Cell,
+		sync::atomic::{AtomicBool, Ordering},
+	};
+
+	#[derive(Default)]
+	pub(crate) struct PostTransitionProbe {
+		pub(crate) active: AtomicBool,
+		pub(crate) transitioned: AtomicBool,
+		allocator_callback: AtomicBool,
+		operation: AtomicBool,
+	}
+
+	impl PostTransitionProbe {
+		pub(crate) fn arm(&self) {
+			assert!(!self.active.swap(true, Ordering::SeqCst));
+			self.transitioned.store(false, Ordering::SeqCst);
+			self.allocator_callback.store(false, Ordering::SeqCst);
+			self.operation.store(false, Ordering::SeqCst);
+		}
+
+		pub(crate) fn observe_operation(&self) {
+			if self.active.load(Ordering::SeqCst) && self.transitioned.load(Ordering::SeqCst) {
+				self.operation.store(true, Ordering::SeqCst);
+			}
+		}
+
+		fn observe_allocator_callback(&self) {
+			if self.active.load(Ordering::SeqCst) && self.transitioned.load(Ordering::SeqCst) {
+				self.allocator_callback.store(true, Ordering::SeqCst);
+			}
+		}
+
+		pub(crate) fn finish(&self) -> (bool, bool, bool) {
+			self.active.store(false, Ordering::SeqCst);
+			(
+				self.transitioned.load(Ordering::SeqCst),
+				self.allocator_callback.load(Ordering::SeqCst),
+				self.operation.load(Ordering::SeqCst),
+			)
+		}
+	}
+
+	thread_local! {
+		static POST_TRANSITION_PROBE: Cell<Option<&'static PostTransitionProbe>> = const { Cell::new(None) };
+	}
+
+	pub(crate) fn current_probe() -> &'static PostTransitionProbe {
+		if let Some(probe) = POST_TRANSITION_PROBE.get() {
+			return probe;
+		}
+		let probe = Box::leak(Box::new(PostTransitionProbe::default()));
+		POST_TRANSITION_PROBE.set(Some(probe));
+		probe
+	}
+
+	fn observe_allocator_callback() {
+		let _ = POST_TRANSITION_PROBE.try_with(|slot| {
+			if let Some(probe) = slot.get() {
+				probe.observe_allocator_callback();
+			}
+		});
+	}
+
+	struct TrackingAllocator;
+
+	// SAFETY: every operation preserves `System`'s arguments and return value exactly. The probe uses
+	// only already-initialized thread-local and atomic state and does not alter allocator ownership.
+	unsafe impl GlobalAlloc for TrackingAllocator {
+		unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+			observe_allocator_callback();
+			// SAFETY: `layout` is passed through unchanged under `GlobalAlloc::alloc`'s contract.
+			unsafe { System.alloc(layout) }
+		}
+
+		unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+			observe_allocator_callback();
+			// SAFETY: `layout` is passed through unchanged under `GlobalAlloc::alloc_zeroed`'s contract.
+			unsafe { System.alloc_zeroed(layout) }
+		}
+
+		unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+			observe_allocator_callback();
+			// SAFETY: both arguments are passed through unchanged under `GlobalAlloc::dealloc`'s contract.
+			unsafe { System.dealloc(pointer, layout) }
+		}
+
+		unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+			observe_allocator_callback();
+			// SAFETY: all arguments are passed through unchanged under `GlobalAlloc::realloc`'s contract.
+			unsafe { System.realloc(pointer, layout, size) }
+		}
+	}
+
+	#[global_allocator]
+	static GLOBAL_ALLOCATOR: TrackingAllocator = TrackingAllocator;
+}
+
 mod command;
 pub(crate) mod generic_wrap;
 #[cfg(all(unix, any(feature = "std", feature = "tokio1")))]

@@ -257,7 +257,20 @@ pub(crate) mod test_support {
 		});
 	}
 
+	pub fn arm_owner_transition_probe() {
+		crate::test_allocator::current_probe().arm();
+	}
+
+	pub fn owner_transition_probe() -> &'static crate::test_allocator::PostTransitionProbe {
+		crate::test_allocator::current_probe()
+	}
+
+	pub fn finish_owner_transition_probe() -> (bool, bool, bool) {
+		crate::test_allocator::current_probe().finish()
+	}
+
 	pub fn record_owner_event(event: &'static str) {
+		crate::test_allocator::current_probe().observe_operation();
 		OWNER_EVENTS.with(|slot| {
 			if let Some(events) = slot.borrow().as_ref() {
 				events
@@ -559,6 +572,28 @@ impl Drop for JobPort {
 
 /// Set whether closing a job's final handle terminates every process in the job.
 pub(crate) fn set_job_kill_on_drop(job: JobHandle, kill_on_drop: bool) -> Result<()> {
+	set_job_kill_on_drop_inner(
+		job,
+		kill_on_drop,
+		#[cfg(test)]
+		None,
+	)
+}
+
+#[cfg(test)]
+pub(crate) fn set_job_kill_on_drop_observed(
+	job: JobHandle,
+	kill_on_drop: bool,
+	probe: &'static crate::test_allocator::PostTransitionProbe,
+) -> Result<()> {
+	set_job_kill_on_drop_inner(job, kill_on_drop, Some(probe))
+}
+
+fn set_job_kill_on_drop_inner(
+	job: JobHandle,
+	kill_on_drop: bool,
+	#[cfg(test)] probe: Option<&crate::test_allocator::PostTransitionProbe>,
+) -> Result<()> {
 	let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
 	if kill_on_drop {
 		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -573,7 +608,7 @@ pub(crate) fn set_job_kill_on_drop(job: JobHandle, kill_on_drop: bool) -> Result
 	// No tracing or other caller-controlled callback may run after the native transition: the sole
 	// final owner must either remain kill-on-close armed or complete disarming without unwinding.
 	// SAFETY: `job` is live, and initialized `info` has the reported size and outlives the call.
-	unsafe {
+	let result = unsafe {
 		SetInformationJobObject(
 			job.0,
 			JobObjectExtendedLimitInformation,
@@ -582,8 +617,16 @@ pub(crate) fn set_job_kill_on_drop(job: JobHandle, kill_on_drop: bool) -> Result
 				.try_into()
 				.expect("cannot safely cast to DWORD"),
 		)
-	}?;
-	Ok(())
+	};
+	#[cfg(test)]
+	if result.is_ok()
+		&& let Some(probe) = probe
+	{
+		probe
+			.transitioned
+			.store(true, std::sync::atomic::Ordering::SeqCst);
+	}
+	result.map_err(Error::other)
 }
 
 /// Create a JobObject and an associated completion port.

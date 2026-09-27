@@ -468,60 +468,36 @@ impl NativeCommandView {
 	}
 }
 
-struct NativeOnlyCommand<N> {
-	command: Option<N>,
+struct NativeOnlyCommand {
 	view: NativeCommandView,
 }
 
-impl<N: NativeCommand> NativeOnlyCommand<N> {
-	fn new(command: N) -> Self {
+impl NativeOnlyCommand {
+	fn new<N: NativeCommand>(command: &N) -> Self {
 		Self {
-			view: NativeCommandView::capture(&command),
-			command: Some(command),
+			view: NativeCommandView::capture(command),
 		}
 	}
 
-	fn command_mut(&mut self) -> &mut N {
-		self.command
-			.as_mut()
-			.expect("native command access cannot occur while a spawn lifecycle is active")
-	}
-
-	fn take(&mut self) -> N {
-		let command = self
-			.command
-			.take()
-			.expect("a native-only command is present when its spawn lifecycle begins");
-		self.view = NativeCommandView::capture(&command);
-		command
-	}
-
-	fn restore(&mut self, command: N) {
-		debug_assert!(self.command.is_none());
-		self.command = Some(command);
-	}
-
-	fn into_command(self) -> N {
-		self.command
-			.expect("a command cannot be consumed while its spawn lifecycle is active")
+	fn refresh<N: NativeCommand>(&mut self, command: &N) {
+		self.view = NativeCommandView::capture(command);
 	}
 }
 
-impl<N: fmt::Debug> fmt::Debug for NativeOnlyCommand<N> {
+impl fmt::Debug for NativeOnlyCommand {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.debug_struct("NativeOnly")
-			.field("command", &self.command)
 			.field("view", &self.view)
 			.finish()
 	}
 }
 
-enum CommandState<N> {
+enum CommandState {
 	Tracked(CommandIntent),
-	NativeOnly(NativeOnlyCommand<N>),
+	NativeOnly(NativeOnlyCommand),
 }
 
-impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
+impl fmt::Debug for CommandState {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Tracked(intent) => f.debug_tuple("Tracked").field(intent).finish(),
@@ -730,23 +706,16 @@ impl Drop for WindowsSpawnCleanup {
 	}
 }
 
-enum AttemptState<N> {
-	Tracked {
-		intent: CommandIntent,
-		native: Option<N>,
-	},
-	NativeOnly(N),
+enum AttemptState {
+	Tracked(CommandIntent),
+	NativeOnly,
 }
 
-impl<N: fmt::Debug> fmt::Debug for AttemptState<N> {
+impl fmt::Debug for AttemptState {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
-			Self::Tracked { intent, native } => f
-				.debug_struct("Tracked")
-				.field("intent", intent)
-				.field("native", native)
-				.finish(),
-			Self::NativeOnly(command) => f.debug_tuple("NativeOnly").field(command).finish(),
+			Self::Tracked(intent) => f.debug_tuple("Tracked").field(intent).finish(),
+			Self::NativeOnly => f.write_str("NativeOnly"),
 		}
 	}
 }
@@ -765,7 +734,8 @@ struct PlatformCommandState {
 /// Explicit native mutation makes a tracked attempt native-only, which alternate portable spawn
 /// providers reject rather than reconstructing or partially applying.
 pub struct SpawnAttempt<B: Backend> {
-	state: AttemptState<B::NativeCommand>,
+	state: AttemptState,
+	native: Option<B::NativeCommand>,
 	#[cfg_attr(not(unix), allow(dead_code))]
 	platform: PlatformCommandState,
 	#[cfg_attr(not(unix), allow(dead_code))]
@@ -792,7 +762,8 @@ impl<B: Backend> fmt::Debug for SpawnAttempt<B> {
 /// `process_wrap::tokio::Command`. Command construction and configuration are shared; spawning and
 /// child behavior remain specific to the selected frontend.
 pub struct Command<B: Backend> {
-	state: CommandState<B::NativeCommand>,
+	state: CommandState,
+	native: Option<B::NativeCommand>,
 	wrappers: Box<dyn Any + Send + Sync>,
 	platform: PlatformCommandState,
 	backend: PhantomData<fn() -> B>,
@@ -811,6 +782,7 @@ impl<B: Backend> Command<B> {
 	pub fn new(program: impl AsRef<OsStr>) -> Self {
 		Self {
 			state: CommandState::Tracked(CommandIntent::new(program)),
+			native: None,
 			wrappers: B::new_registry(),
 			platform: PlatformCommandState::default(),
 			backend: PhantomData,
@@ -845,7 +817,11 @@ impl<B: Backend> Command<B> {
 		let arg = arg.as_ref();
 		match &mut self.state {
 			CommandState::Tracked(intent) => intent.args.push(CommandArg::Regular(arg.to_owned())),
-			CommandState::NativeOnly(command) => command.command_mut().arg(arg),
+			CommandState::NativeOnly(_) => self
+				.native
+				.as_mut()
+				.expect("native command access cannot occur while a spawn lifecycle is active")
+				.arg(arg),
 		}
 		self
 	}
@@ -870,7 +846,11 @@ impl<B: Backend> Command<B> {
 		let arg = arg.as_ref();
 		match &mut self.state {
 			CommandState::Tracked(intent) => intent.args.push(CommandArg::Raw(arg.to_owned())),
-			CommandState::NativeOnly(command) => command.command_mut().raw_arg(arg),
+			CommandState::NativeOnly(_) => self
+				.native
+				.as_mut()
+				.expect("native command access cannot occur while a spawn lifecycle is active")
+				.raw_arg(arg),
 		}
 		self
 	}
@@ -883,7 +863,11 @@ impl<B: Backend> Command<B> {
 			CommandState::Tracked(intent) => intent
 				.env
 				.push(EnvChange::Set(key.to_owned(), value.to_owned())),
-			CommandState::NativeOnly(command) => command.command_mut().env(key, value),
+			CommandState::NativeOnly(_) => self
+				.native
+				.as_mut()
+				.expect("native command access cannot occur while a spawn lifecycle is active")
+				.env(key, value),
 		}
 		self
 	}
@@ -906,7 +890,11 @@ impl<B: Backend> Command<B> {
 		let key = key.as_ref();
 		match &mut self.state {
 			CommandState::Tracked(intent) => intent.env_remove(key),
-			CommandState::NativeOnly(command) => command.command_mut().env_remove(key),
+			CommandState::NativeOnly(_) => self
+				.native
+				.as_mut()
+				.expect("native command access cannot occur while a spawn lifecycle is active")
+				.env_remove(key),
 		}
 		self
 	}
@@ -918,7 +906,11 @@ impl<B: Backend> Command<B> {
 				intent.env_clear = true;
 				intent.env.clear();
 			}
-			CommandState::NativeOnly(command) => command.command_mut().env_clear(),
+			CommandState::NativeOnly(_) => self
+				.native
+				.as_mut()
+				.expect("native command access cannot occur while a spawn lifecycle is active")
+				.env_clear(),
 		}
 		self
 	}
@@ -928,7 +920,11 @@ impl<B: Backend> Command<B> {
 		let dir = dir.as_ref();
 		match &mut self.state {
 			CommandState::Tracked(intent) => intent.current_dir = Some(dir.to_owned()),
-			CommandState::NativeOnly(command) => command.command_mut().current_dir(dir),
+			CommandState::NativeOnly(_) => self
+				.native
+				.as_mut()
+				.expect("native command access cannot occur while a spawn lifecycle is active")
+				.current_dir(dir),
 		}
 		self
 	}
@@ -955,8 +951,8 @@ impl<B: Backend> Command<B> {
 	pub fn get_program(&self) -> &OsStr {
 		match &self.state {
 			CommandState::Tracked(intent) => &intent.program,
-			CommandState::NativeOnly(command) => match &command.command {
-				Some(command) => command.get_program(),
+			CommandState::NativeOnly(command) => match &self.native {
+				Some(native) => native.get_program(),
 				None => &command.view.program,
 			},
 		}
@@ -966,8 +962,8 @@ impl<B: Backend> Command<B> {
 	pub fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
 		match &self.state {
 			CommandState::Tracked(intent) => Box::new(intent.args.iter().map(CommandArg::value)),
-			CommandState::NativeOnly(command) => match &command.command {
-				Some(command) => command.get_args(),
+			CommandState::NativeOnly(command) => match &self.native {
+				Some(native) => native.get_args(),
 				None => command.view.get_args(),
 			},
 		}
@@ -988,8 +984,8 @@ impl<B: Backend> Command<B> {
 	pub fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
 		match &self.state {
 			CommandState::Tracked(intent) => Box::new(intent.get_envs()),
-			CommandState::NativeOnly(command) => match &command.command {
-				Some(command) => command.get_envs(),
+			CommandState::NativeOnly(command) => match &self.native {
+				Some(native) => native.get_envs(),
 				None => command.view.get_envs(),
 			},
 		}
@@ -1010,8 +1006,8 @@ impl<B: Backend> Command<B> {
 	pub fn get_current_dir(&self) -> Option<&Path> {
 		match &self.state {
 			CommandState::Tracked(intent) => intent.current_dir.as_deref(),
-			CommandState::NativeOnly(command) => match &command.command {
-				Some(command) => command.get_current_dir(),
+			CommandState::NativeOnly(command) => match &self.native {
+				Some(native) => native.get_current_dir(),
 				None => command.view.current_dir.as_deref(),
 			},
 		}
@@ -1030,30 +1026,34 @@ impl<B: Backend> Command<B> {
 	/// inactive callbacks; use the tracked facade methods and wrappers for reusable configuration.
 	pub fn native_mut(&mut self) -> &mut B::NativeCommand {
 		if let CommandState::Tracked(intent) = &self.state {
-			let command = intent.materialize::<B::NativeCommand>();
-			self.state = CommandState::NativeOnly(NativeOnlyCommand::new(command));
+			let native = intent.materialize::<B::NativeCommand>();
+			let state = NativeOnlyCommand::new(&native);
+			self.native = Some(native);
+			self.state = CommandState::NativeOnly(state);
 		}
 
 		#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
 		self.platform.unix.invalidate();
 
-		match &mut self.state {
-			CommandState::NativeOnly(command) => command.command_mut(),
-			CommandState::Tracked(_) => unreachable!("tracked command was materialized above"),
-		}
+		self.native
+			.as_mut()
+			.expect("native command access cannot occur while a spawn lifecycle is active")
 	}
 
 	/// Consume this command and return the frontend's native command.
 	pub fn into_native(self) -> B::NativeCommand {
 		match self.state {
 			CommandState::Tracked(intent) => intent.materialize::<B::NativeCommand>(),
-			CommandState::NativeOnly(command) => command.into_command(),
+			CommandState::NativeOnly(_) => self
+				.native
+				.expect("a command cannot be consumed while its spawn lifecycle is active"),
 		}
 	}
 
-	pub(crate) fn from_native(command: B::NativeCommand) -> Self {
+	pub(crate) fn from_native(native: B::NativeCommand) -> Self {
 		Self {
-			state: CommandState::NativeOnly(NativeOnlyCommand::new(command)),
+			state: CommandState::NativeOnly(NativeOnlyCommand::new(&native)),
+			native: Some(native),
 			wrappers: B::new_registry(),
 			platform: PlatformCommandState::default(),
 			backend: PhantomData,
@@ -1082,65 +1082,41 @@ impl<B: Backend> Command<B> {
 		invoke: impl FnOnce(&mut Self, &mut SpawnAttempt<B>) -> std::io::Result<T>,
 	) -> std::io::Result<T> {
 		let platform = self.platform.clone();
-		match &mut self.state {
+		let (state, native, native_only_base) = match &mut self.state {
 			CommandState::Tracked(intent) => {
-				let mut attempt = SpawnAttempt {
-					state: AttemptState::Tracked {
-						intent: intent.clone(),
-						native: None,
-					},
-					platform,
-					native_only_base: false,
-					kill_on_drop: None,
-					#[cfg(windows)]
-					windows_policy: WindowsSpawnPolicy::default(),
-					#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
-					unix_policy: crate::unix::SpawnPolicy::default(),
-					backend: PhantomData,
-				};
-				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-					invoke(self, &mut attempt)
-				}));
-				attempt.disarm_platform();
-				match result {
-					Ok(result) => result,
-					Err(payload) => std::panic::resume_unwind(payload),
-				}
+				drop(self.native.take());
+				(AttemptState::Tracked(intent.clone()), None, false)
 			}
 			CommandState::NativeOnly(command) => {
-				let native = command.take();
-				let mut attempt = SpawnAttempt {
-					state: AttemptState::NativeOnly(native),
-					platform,
-					native_only_base: true,
-					kill_on_drop: None,
-					#[cfg(windows)]
-					windows_policy: WindowsSpawnPolicy::default(),
-					#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
-					unix_policy: crate::unix::SpawnPolicy::default(),
-					backend: PhantomData,
-				};
-				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-					invoke(self, &mut attempt)
-				}));
-				attempt.disarm_platform();
-				let native = match attempt.state {
-					AttemptState::NativeOnly(native) => native,
-					AttemptState::Tracked { .. } => {
-						unreachable!("a native-only spawn attempt cannot become tracked")
-					}
-				};
-				match &mut self.state {
-					CommandState::NativeOnly(command) => command.restore(native),
-					CommandState::Tracked(_) => {
-						unreachable!("a spawn lifecycle cannot replace native-only command state")
-					}
-				}
-				match result {
-					Ok(result) => result,
-					Err(payload) => std::panic::resume_unwind(payload),
-				}
+				let native = self
+					.native
+					.take()
+					.expect("a native-only command is present when its spawn lifecycle begins");
+				command.refresh(&native);
+				(AttemptState::NativeOnly, Some(native), true)
 			}
+		};
+		let mut attempt = SpawnAttempt {
+			state,
+			native,
+			platform,
+			native_only_base,
+			kill_on_drop: None,
+			#[cfg(windows)]
+			windows_policy: WindowsSpawnPolicy::default(),
+			#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
+			unix_policy: crate::unix::SpawnPolicy::default(),
+			backend: PhantomData,
+		};
+		let result =
+			std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| invoke(self, &mut attempt)));
+		#[cfg(unix)]
+		attempt.disarm_platform();
+		let native = attempt.native.take();
+		self.native = if native_only_base { native } else { None };
+		match result {
+			Ok(result) => result,
+			Err(payload) => std::panic::resume_unwind(payload),
 		}
 	}
 }
@@ -1150,10 +1126,12 @@ impl<B: Backend> SpawnAttempt<B> {
 	pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
 		let arg = arg.as_ref();
 		match &mut self.state {
-			AttemptState::Tracked { intent, .. } => {
-				intent.args.push(CommandArg::Regular(arg.to_owned()))
-			}
-			AttemptState::NativeOnly(command) => command.arg(arg),
+			AttemptState::Tracked(intent) => intent.args.push(CommandArg::Regular(arg.to_owned())),
+			AttemptState::NativeOnly => self
+				.native
+				.as_mut()
+				.expect("a native-only attempt retains its native command")
+				.arg(arg),
 		}
 		self
 	}
@@ -1177,10 +1155,12 @@ impl<B: Backend> SpawnAttempt<B> {
 	pub fn raw_arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {
 		let arg = arg.as_ref();
 		match &mut self.state {
-			AttemptState::Tracked { intent, .. } => {
-				intent.args.push(CommandArg::Raw(arg.to_owned()))
-			}
-			AttemptState::NativeOnly(command) => command.raw_arg(arg),
+			AttemptState::Tracked(intent) => intent.args.push(CommandArg::Raw(arg.to_owned())),
+			AttemptState::NativeOnly => self
+				.native
+				.as_mut()
+				.expect("a native-only attempt retains its native command")
+				.raw_arg(arg),
 		}
 		self
 	}
@@ -1190,10 +1170,14 @@ impl<B: Backend> SpawnAttempt<B> {
 		let key = key.as_ref();
 		let value = value.as_ref();
 		match &mut self.state {
-			AttemptState::Tracked { intent, .. } => intent
+			AttemptState::Tracked(intent) => intent
 				.env
 				.push(EnvChange::Set(key.to_owned(), value.to_owned())),
-			AttemptState::NativeOnly(command) => command.env(key, value),
+			AttemptState::NativeOnly => self
+				.native
+				.as_mut()
+				.expect("a native-only attempt retains its native command")
+				.env(key, value),
 		}
 		self
 	}
@@ -1215,8 +1199,12 @@ impl<B: Backend> SpawnAttempt<B> {
 	pub fn env_remove(&mut self, key: impl AsRef<OsStr>) -> &mut Self {
 		let key = key.as_ref();
 		match &mut self.state {
-			AttemptState::Tracked { intent, .. } => intent.env_remove(key),
-			AttemptState::NativeOnly(command) => command.env_remove(key),
+			AttemptState::Tracked(intent) => intent.env_remove(key),
+			AttemptState::NativeOnly => self
+				.native
+				.as_mut()
+				.expect("a native-only attempt retains its native command")
+				.env_remove(key),
 		}
 		self
 	}
@@ -1224,11 +1212,15 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// Clear configured variables and prevent inheritance for this spawn attempt.
 	pub fn env_clear(&mut self) -> &mut Self {
 		match &mut self.state {
-			AttemptState::Tracked { intent, .. } => {
+			AttemptState::Tracked(intent) => {
 				intent.env_clear = true;
 				intent.env.clear();
 			}
-			AttemptState::NativeOnly(command) => command.env_clear(),
+			AttemptState::NativeOnly => self
+				.native
+				.as_mut()
+				.expect("a native-only attempt retains its native command")
+				.env_clear(),
 		}
 		self
 	}
@@ -1237,8 +1229,12 @@ impl<B: Backend> SpawnAttempt<B> {
 	pub fn current_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
 		let dir = dir.as_ref();
 		match &mut self.state {
-			AttemptState::Tracked { intent, .. } => intent.current_dir = Some(dir.to_owned()),
-			AttemptState::NativeOnly(command) => command.current_dir(dir),
+			AttemptState::Tracked(intent) => intent.current_dir = Some(dir.to_owned()),
+			AttemptState::NativeOnly => self
+				.native
+				.as_mut()
+				.expect("a native-only attempt retains its native command")
+				.current_dir(dir),
 		}
 		self
 	}
@@ -1264,18 +1260,24 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// Get the configured program for this spawn attempt.
 	pub fn get_program(&self) -> &OsStr {
 		match &self.state {
-			AttemptState::Tracked { intent, .. } => &intent.program,
-			AttemptState::NativeOnly(command) => command.get_program(),
+			AttemptState::Tracked(intent) => &intent.program,
+			AttemptState::NativeOnly => self
+				.native
+				.as_ref()
+				.expect("a native-only attempt retains its native command")
+				.get_program(),
 		}
 	}
 
 	/// Get the configured arguments for this spawn attempt.
 	pub fn get_args(&self) -> Box<dyn Iterator<Item = &OsStr> + '_> {
 		match &self.state {
-			AttemptState::Tracked { intent, .. } => {
-				Box::new(intent.args.iter().map(CommandArg::value))
-			}
-			AttemptState::NativeOnly(command) => command.get_args(),
+			AttemptState::Tracked(intent) => Box::new(intent.args.iter().map(CommandArg::value)),
+			AttemptState::NativeOnly => self
+				.native
+				.as_ref()
+				.expect("a native-only attempt retains its native command")
+				.get_args(),
 		}
 	}
 
@@ -1286,16 +1288,20 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// `validate_attempt` callback, so providers receive `Some` there.
 	pub fn get_portable_args(&self) -> Option<&[CommandArg]> {
 		match &self.state {
-			AttemptState::Tracked { intent, .. } => Some(&intent.args),
-			AttemptState::NativeOnly(_) => None,
+			AttemptState::Tracked(intent) => Some(&intent.args),
+			AttemptState::NativeOnly => None,
 		}
 	}
 
 	/// Get explicitly configured environment changes for this spawn attempt.
 	pub fn get_envs(&self) -> Box<dyn Iterator<Item = (&OsStr, Option<&OsStr>)> + '_> {
 		match &self.state {
-			AttemptState::Tracked { intent, .. } => Box::new(intent.get_envs()),
-			AttemptState::NativeOnly(command) => command.get_envs(),
+			AttemptState::Tracked(intent) => Box::new(intent.get_envs()),
+			AttemptState::NativeOnly => self
+				.native
+				.as_ref()
+				.expect("a native-only attempt retains its native command")
+				.get_envs(),
 		}
 	}
 
@@ -1306,16 +1312,20 @@ impl<B: Backend> SpawnAttempt<B> {
 	/// callback, so providers receive `Some` there.
 	pub fn inherits_environment(&self) -> Option<bool> {
 		match &self.state {
-			AttemptState::Tracked { intent, .. } => Some(!intent.env_clear),
-			AttemptState::NativeOnly(_) => None,
+			AttemptState::Tracked(intent) => Some(!intent.env_clear),
+			AttemptState::NativeOnly => None,
 		}
 	}
 
 	/// Get the configured current directory for this spawn attempt.
 	pub fn get_current_dir(&self) -> Option<&Path> {
 		match &self.state {
-			AttemptState::Tracked { intent, .. } => intent.current_dir.as_deref(),
-			AttemptState::NativeOnly(command) => command.get_current_dir(),
+			AttemptState::Tracked(intent) => intent.current_dir.as_deref(),
+			AttemptState::NativeOnly => self
+				.native
+				.as_ref()
+				.expect("a native-only attempt retains its native command")
+				.get_current_dir(),
 		}
 	}
 
@@ -1418,12 +1428,10 @@ impl<B: Backend> SpawnAttempt<B> {
 		#[cfg(windows)]
 		let windows_policy = self.windows_policy;
 		{
-			let command = match &mut self.state {
-				AttemptState::NativeOnly(command) => command,
-				AttemptState::Tracked { native, .. } => native
-					.as_mut()
-					.expect("the attempt is materialized before platform setup"),
-			};
+			let command = self
+				.native
+				.as_mut()
+				.expect("the attempt is materialized before platform setup");
 			if let Some(kill_on_drop) = kill_on_drop {
 				command.configure_kill_on_drop(kill_on_drop);
 			}
@@ -1437,48 +1445,51 @@ impl<B: Backend> SpawnAttempt<B> {
 		{
 			let policy = self.unix_policy;
 			let native_only_base = self.native_only_base;
-			let command = match &mut self.state {
-				AttemptState::NativeOnly(command) => command,
-				AttemptState::Tracked { native, .. } => native
-					.as_mut()
-					.expect("the attempt is materialized before platform setup"),
-			};
+			let command = self
+				.native
+				.as_mut()
+				.expect("the attempt is materialized before platform setup");
 			self.platform
 				.unix
 				.prepare(command, native_only_base, policy);
 		}
 	}
 
+	#[cfg(unix)]
 	fn disarm_platform(&mut self) {
 		#[cfg(all(unix, any(feature = "std", feature = "tokio1")))]
 		self.platform.unix.disarm();
 	}
 
 	fn materialize_native(&mut self) {
-		if let AttemptState::Tracked { intent, native } = &mut self.state {
-			if native.is_none() {
-				*native = Some(intent.materialize::<B::NativeCommand>());
-			}
+		if self.native.is_none()
+			&& let AttemptState::Tracked(intent) = &self.state
+		{
+			self.native = Some(intent.materialize::<B::NativeCommand>());
 		}
 	}
 
 	fn make_native_only(&mut self) {
+		if matches!(&self.state, AttemptState::NativeOnly) {
+			return;
+		}
 		self.materialize_native();
-		let native = match &mut self.state {
-			AttemptState::Tracked { native, .. } => native
-				.take()
-				.expect("the tracked attempt was materialized above"),
-			AttemptState::NativeOnly(_) => return,
-		};
-		self.state = AttemptState::NativeOnly(native);
+		self.state = AttemptState::NativeOnly;
 	}
 
 	fn native_command_mut(&mut self) -> &mut B::NativeCommand {
-		match &mut self.state {
-			AttemptState::Tracked { native, .. } => native
-				.as_mut()
-				.expect("the tracked attempt was materialized before native access"),
-			AttemptState::NativeOnly(command) => command,
+		self.native
+			.as_mut()
+			.expect("the attempt is materialized before native access")
+	}
+
+	#[cfg(windows)]
+	pub(crate) fn prepare_for_final_owner(&mut self) {
+		if !self.native_only_base {
+			// Retire attempt-owned allocations before the sole native cleanup owner can disarm.
+			// A native-only base instead keeps its command for the infallible restoration move.
+			drop(self.native.take());
+			self.state = AttemptState::NativeOnly;
 		}
 	}
 
@@ -1517,11 +1528,12 @@ impl<B: Backend> SpawnAttempt<B> {
 	))]
 	pub(crate) fn take_native_for_provider_spawn(&mut self) -> B::NativeCommand {
 		self.materialize_native();
-		match &mut self.state {
-			AttemptState::Tracked { native, .. } => native
+		match &self.state {
+			AttemptState::Tracked(_) => self
+				.native
 				.take()
 				.expect("the tracked provider attempt was materialized above"),
-			AttemptState::NativeOnly(_) => {
+			AttemptState::NativeOnly => {
 				unreachable!("portable providers reject native-only attempts before spawning")
 			}
 		}
@@ -1552,7 +1564,7 @@ impl<B: Backend> SpawnAttempt<B> {
 
 	/// Return whether this spawn attempt contains opaque native-only state.
 	pub fn is_native_only(&self) -> bool {
-		matches!(self.state, AttemptState::NativeOnly(_))
+		matches!(self.state, AttemptState::NativeOnly)
 	}
 }
 

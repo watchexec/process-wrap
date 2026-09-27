@@ -497,29 +497,6 @@ impl dyn ChildWrapper + '_ {
 	}
 
 	#[cfg(windows)]
-	fn visit_spawn_layers_until(
-		&mut self,
-		mut visit: impl FnMut(&mut dyn ChildWrapper) -> Result<bool>,
-	) -> Result<()> {
-		let mut inner = self;
-		loop {
-			if visit(inner)? {
-				return Ok(());
-			}
-
-			let inner_type = (&*inner as &dyn Any).type_id();
-			let inner_ptr = std::ptr::from_mut(inner);
-			let next = inner.inner_mut();
-			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
-				&& inner_type == (&*next as &dyn Any).type_id()
-			{
-				return Ok(());
-			}
-			inner = next;
-		}
-	}
-
-	#[cfg(windows)]
 	pub(crate) fn finalize_spawn_before_commit(&mut self) -> Result<FinalJobOwner> {
 		self.visit_spawn_layers(|inner| inner.finalize_spawn_layer())?;
 		self.visit_spawn_layers(|inner| inner.disarm_spawn_cleanup_layer())?;
@@ -548,22 +525,23 @@ impl dyn ChildWrapper + '_ {
 		let Some(identity) = owner.identity else {
 			return Ok(());
 		};
-		let mut found = false;
-		self.visit_spawn_layers_until(|inner| {
+		let mut inner = self;
+		loop {
 			if spawn_layer_identity(inner) == identity {
-				inner.disarm_job_object_layer()?;
-				found = true;
-				Ok(true)
-			} else {
-				Ok(false)
+				return inner.disarm_job_object_layer();
 			}
-		})?;
-		if found {
-			Ok(())
-		} else {
-			Err(std::io::Error::other(
-				"the captured JobObject cleanup owner left the child chain",
-			))
+
+			let inner_type = (&*inner as &dyn Any).type_id();
+			let inner_ptr = std::ptr::from_mut(inner);
+			let next = inner.inner_mut();
+			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
+				&& inner_type == (&*next as &dyn Any).type_id()
+			{
+				return Err(std::io::Error::other(
+					"the captured JobObject cleanup owner left the child chain",
+				));
+			}
+			inner = next;
 		}
 	}
 
