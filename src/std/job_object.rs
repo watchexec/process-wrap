@@ -159,6 +159,7 @@ impl CommandWrapper for JobObject {
 pub struct JobObjectChild {
 	inner: Option<Box<dyn ChildWrapper>>,
 	prepared: Option<PreparedChild>,
+	extracted: Option<PreparedJobObject>,
 	exit_status: ChildExitStatus,
 	job_drained: bool,
 	final_kill_on_drop: bool,
@@ -170,6 +171,7 @@ impl JobObjectChild {
 		Self {
 			inner: None,
 			prepared: None,
+			extracted: None,
 			exit_status: ChildExitStatus::Running,
 			job_drained: false,
 			final_kill_on_drop,
@@ -196,6 +198,14 @@ impl JobObjectChild {
 	}
 
 	fn with_job_port<R>(&self, inspect: impl FnOnce(&JobPort) -> R) -> R {
+		if let Some(prepared) = self.extracted.as_ref() {
+			return inspect(
+				prepared
+					.job_port
+					.as_ref()
+					.expect("the extracted JobObject layer retains its job handles"),
+			);
+		}
 		self.prepared()
 			.with::<PreparedJobObject, _>(|prepared| {
 				inspect(
@@ -205,6 +215,15 @@ impl JobObjectChild {
 						.expect("the installed JobObject layer retains its job handles"),
 				)
 			})
+			.expect("JobObject prepared state retains its concrete type")
+	}
+
+	fn take_prepared(&mut self) -> PreparedJobObject {
+		if let Some(prepared) = self.extracted.take() {
+			return prepared;
+		}
+		self.prepared()
+			.take_prepared_value::<PreparedJobObject>()
 			.expect("JobObject prepared state retains its concrete type")
 	}
 }
@@ -263,24 +282,30 @@ impl ChildWrapper for JobObjectChild {
 			.take()
 			.expect("an installed JobObject layer owns its child");
 		if self.spawn_finalized && self.final_kill_on_drop {
-			self.prepared()
-				.with_mut::<PreparedJobObject, _>(|prepared| {
-					let job_port = prepared
-						.job_port
-						.take()
-						.expect("the installed JobObject layer retains its job handles");
-					// Manually close the completion port while retaining the job handle. Closing a
-					// kill-on-close job here would make the extracted child unusable.
-					let job_port = std::mem::ManuallyDrop::new(job_port);
-					// SAFETY: `job_port` owns the completion-port handle and suppresses `JobPort::drop`.
-					unsafe { CloseHandle(HANDLE(job_port.completion_port.as_raw_handle())) }.ok();
-				})
-				.expect("JobObject prepared state retains its concrete type");
+			let mut prepared = self.take_prepared();
+			let job_port = prepared
+				.job_port
+				.take()
+				.expect("the installed JobObject layer retains its job handles");
+			// Manually close the completion port while retaining the job handle. Closing a
+			// kill-on-close job here would make the extracted child unusable.
+			let job_port = std::mem::ManuallyDrop::new(job_port);
+			// SAFETY: `job_port` owns the completion-port handle and suppresses `JobPort::drop`.
+			unsafe { CloseHandle(HANDLE(job_port.completion_port.as_raw_handle())) }.ok();
 		}
 		// Before spawn finalization, dropping the still-armed prepared job instead guarantees that
 		// removing this layer cannot let descendants escape a later lifecycle failure.
 
 		inner
+	}
+	fn retain_prepared_after_sidecar_removal_layer(&mut self) {
+		if self.extracted.is_none() {
+			let prepared = self
+				.prepared()
+				.take_prepared_value::<PreparedJobObject>()
+				.expect("JobObject prepared state retains its concrete type");
+			self.extracted = Some(prepared);
+		}
 	}
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
 		self.inner_ref().try_process_handle()
@@ -309,35 +334,47 @@ impl ChildWrapper for JobObjectChild {
 		let Self {
 			inner,
 			prepared,
+			extracted,
 			exit_status,
 			job_drained,
 			..
 		} = self;
-		let prepared = prepared
-			.as_ref()
-			.expect("an installed JobObject layer owns its prepared state");
 		let inner = inner
 			.as_deref_mut()
 			.expect("an installed JobObject layer owns its child");
-		wait_for_exit_and_job_drain_with(
-			exit_status,
-			job_drained,
-			|| inner.wait(),
-			|timeout| {
-				prepared
-					.with::<PreparedJobObject, _>(|prepared| {
-						let job_port = prepared
-							.job_port
-							.as_ref()
-							.expect("the installed JobObject layer retains its job handles");
-						poll_job_drain(job_port.job, job_port.completion_port.as_handle(), timeout)
-					})
-					.expect("JobObject prepared state retains its concrete type")
-			},
-			Instant::now,
-			std::thread::sleep,
-			|_| {},
-		)
+		let mut wait_with = |job_port: &JobPort| {
+			wait_for_exit_and_job_drain_with(
+				exit_status,
+				job_drained,
+				|| inner.wait(),
+				|timeout| {
+					poll_job_drain(job_port.job, job_port.completion_port.as_handle(), timeout)
+				},
+				Instant::now,
+				std::thread::sleep,
+				|_| {},
+			)
+		};
+		if let Some(extracted) = extracted.as_ref() {
+			return wait_with(
+				extracted
+					.job_port
+					.as_ref()
+					.expect("the extracted JobObject layer retains its job handles"),
+			);
+		}
+		prepared
+			.as_ref()
+			.expect("an installed JobObject layer owns its prepared state")
+			.with::<PreparedJobObject, _>(|prepared| {
+				wait_with(
+					prepared
+						.job_port
+						.as_ref()
+						.expect("the installed JobObject layer retains its job handles"),
+				)
+			})
+			.expect("JobObject prepared state retains its concrete type")
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
@@ -670,7 +707,7 @@ mod tests {
 			let paths = TreePaths::new(directory.path());
 			let state = Arc::new(LifecycleState::default());
 			let slot_calls = Arc::new(AtomicUsize::new(0));
-			let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+			let events = Arc::new(std::sync::Mutex::new(Vec::with_capacity(2)));
 			let mut command = topology_command(provider, &paths, &state)?;
 			command.wrap(PostOwnerAccessor {
 				slot_calls: Arc::clone(&slot_calls),

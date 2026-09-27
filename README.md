@@ -382,9 +382,10 @@ Callbacks run in this order:
 7. provider `spawn`
 8. every `post_spawn` hook
 9. every child wrapper
-10. transaction `commit`
-11. on Windows, the sole JobObject cleanup owner
-12. committed transaction-residue transfer to the returned child
+10. private return-sidecar allocation
+11. transaction `commit`
+12. committed transaction-residue installation
+13. on Windows, the sole JobObject cleanup owner
 
 Validation must reject unsupported portable policy before allocating operating-system resources.
 `spawn` returns a child satisfying the frontend's complete `ChildWrapper` contract together with a
@@ -393,12 +394,12 @@ later hook, wrapper, pre-commit child step, or commit error or unwinding panic c
 rollback while preserving the original failure. After capturing that failure, process-wrap first
 resolves transaction cleanup, then disposes any detached child layer, the child chain, and each
 Windows prepared value independently. Secondary cleanup panic payloads are quarantined without
-inspection or destruction. Successful commit ends failed-spawn rollback. On Windows, the sole
-JobObject owner remains authoritative until it disarms after commit. Process-wrap then transfers the
-committed transaction residue in a private transparent layer with the returned child. On a successful
-spawn, arbitrary residue destruction occurs outside the spawn lifecycle. Committed residue must
-retain no armed cleanup or independent process, terminal, controller, handle, pseudoconsole, or other
-liveness resource.
+inspection or destruction. Before commit, process-wrap preallocates the private return sidecar.
+Successful commit ends failed-spawn rollback, and its residue is installed in that sidecar. On Windows,
+the sole JobObject owner remains authoritative until it disarms after commit; no caller callback or
+allocation-dependent work follows that transition. On a successful spawn, arbitrary residue destruction
+occurs outside the spawn lifecycle. Committed residue must retain no armed cleanup or independent
+process, terminal, controller, handle, pseudoconsole, or other liveness resource.
 
 Rollback, wrapper restoration, original panic-payload preservation, and cleanup-diagnostic panic
 containment apply only to unwinding panics. With `panic=abort`, the process terminates before those

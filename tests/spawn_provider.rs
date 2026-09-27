@@ -487,6 +487,97 @@ macro_rules! spawn_provider_tests {
 
 			#[cfg(windows)]
 			#[derive(Debug)]
+			struct OrderedPrepared {
+				events: Arc<Mutex<Vec<&'static str>>>,
+			}
+
+			#[cfg(windows)]
+			impl Drop for OrderedPrepared {
+				fn drop(&mut self) {
+					self.events.lock().unwrap().push("prepared");
+				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct OrderedPreparedLayer {
+				inner: Option<Box<dyn ChildWrapper>>,
+				prepared: Option<PreparedChild>,
+				events: Arc<Mutex<Vec<&'static str>>>,
+			}
+
+			#[cfg(windows)]
+			impl ChildWrapperLayer for OrderedPreparedLayer {
+				fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+					ChildWrapperSlots::new(&mut self.inner)
+						.with_prepared::<OrderedPrepared>(&mut self.prepared)
+				}
+			}
+
+			#[cfg(windows)]
+			impl ChildWrapper for OrderedPreparedLayer {
+				fn inner(&self) -> &dyn ChildWrapper {
+					self.inner
+						.as_deref()
+						.expect("an installed ordered layer owns its child")
+				}
+
+				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+					self.inner
+						.as_deref_mut()
+						.expect("an installed ordered layer owns its child")
+				}
+
+				fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+					self.inner
+						.take()
+						.expect("an installed ordered layer owns its child")
+				}
+			}
+
+			#[cfg(windows)]
+			impl Drop for OrderedPreparedLayer {
+				fn drop(&mut self) {
+					self.events.lock().unwrap().push("layer");
+				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct OrderedPreparedWrapper {
+				events: Arc<Mutex<Vec<&'static str>>>,
+			}
+
+			#[cfg(windows)]
+			impl CommandWrapper for OrderedPreparedWrapper {
+				fn prepare_child(
+					&mut self,
+					_attempt: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
+					_command: &CommandWrap,
+				) -> io::Result<Option<Box<dyn std::any::Any + Send>>> {
+					Ok(Some(Box::new(OrderedPrepared {
+						events: Arc::clone(&self.events),
+					})))
+				}
+
+				fn wrap_prepared_child(
+					&mut self,
+					_child: &mut dyn ChildWrapper,
+					prepared: Option<PreparedChildRef<'_>>,
+					_command: &CommandWrap,
+				) -> io::Result<Option<PendingChildWrapper>> {
+					assert!(prepared.as_ref().is_some_and(PreparedChildRef::is::<OrderedPrepared>));
+					Ok(Some(PendingChildWrapper::new(OrderedPreparedLayer {
+						inner: None,
+						prepared: None,
+						events: Arc::clone(&self.events),
+					})))
+				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
 			struct OptionPreparedLayer {
 				inner: Option<Box<dyn ChildWrapper>>,
 				prepared: Option<PreparedChild>,
@@ -2244,6 +2335,60 @@ macro_rules! spawn_provider_tests {
 				assert_eq!(drops.load(Ordering::SeqCst), 1);
 				drop(child);
 				assert_eq!(drops.load(Ordering::SeqCst), 2);
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn returned_child_drops_layers_before_stable_prepared_storage() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for provider in [false, true] {
+					let shared = Arc::new(Shared::default());
+					let events = Arc::new(Mutex::new(Vec::new()));
+					let mut command = if provider {
+						provider_command(shared, "provider")
+					} else {
+						command()
+					};
+					command.wrap(OrderedPreparedWrapper {
+						events: Arc::clone(&events),
+					});
+
+					let child = command.spawn().expect("spawn with ordered prepared state");
+					assert!(events.lock().unwrap().is_empty());
+					drop(child);
+					assert_eq!(*events.lock().unwrap(), ["layer", "prepared"]);
+				}
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn native_prepared_sidecar_preserves_traversal_and_consuming_extraction() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				let events = Arc::new(Mutex::new(Vec::new()));
+				let mut command = command();
+				command.wrap(OrderedPreparedWrapper {
+					events: Arc::clone(&events),
+				});
+
+				let child = command.spawn().expect("spawn with a native prepared sidecar");
+				assert_ne!(
+					child.type_id(),
+					TypeId::of::<OrderedPreparedLayer>(),
+					"the private owner sidecar has its own top-level Any identity"
+				);
+				assert_eq!(
+					child.inner().type_id(),
+					TypeId::of::<OrderedPreparedLayer>(),
+					"the immediate application layer remains traversable"
+				);
+				assert!(child.try_inner_child().is_some());
+
+				let inner = child.into_inner();
+				assert!(inner.try_inner_child().is_some());
+				assert_eq!(*events.lock().unwrap(), ["layer", "prepared"]);
+				drop(inner);
 			}
 
 			#[cfg(windows)]

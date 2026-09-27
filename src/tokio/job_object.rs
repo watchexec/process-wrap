@@ -164,6 +164,7 @@ impl CommandWrapper for JobObject {
 pub struct JobObjectChild {
 	inner: Option<Box<dyn ChildWrapper>>,
 	prepared: Option<PreparedChild>,
+	extracted: Option<PreparedJobObject>,
 	exit_status: ChildExitStatus,
 	job_drained: bool,
 	poll_cadence: Option<tokio::task::JoinHandle<()>>,
@@ -176,6 +177,7 @@ impl JobObjectChild {
 		Self {
 			inner: None,
 			prepared: None,
+			extracted: None,
 			exit_status: ChildExitStatus::Running,
 			job_drained: false,
 			poll_cadence: None,
@@ -203,6 +205,14 @@ impl JobObjectChild {
 	}
 
 	fn with_job_port<R>(&self, inspect: impl FnOnce(&JobPort) -> R) -> R {
+		if let Some(prepared) = self.extracted.as_ref() {
+			return inspect(
+				prepared
+					.job_port
+					.as_ref()
+					.expect("the extracted JobObject layer retains its job handles"),
+			);
+		}
 		self.prepared()
 			.with::<PreparedJobObject, _>(|prepared| {
 				inspect(
@@ -212,6 +222,15 @@ impl JobObjectChild {
 						.expect("the installed JobObject layer retains its job handles"),
 				)
 			})
+			.expect("JobObject prepared state retains its concrete type")
+	}
+
+	fn take_prepared(&mut self) -> PreparedJobObject {
+		if let Some(prepared) = self.extracted.take() {
+			return prepared;
+		}
+		self.prepared()
+			.take_prepared_value::<PreparedJobObject>()
 			.expect("JobObject prepared state retains its concrete type")
 	}
 
@@ -265,24 +284,30 @@ impl ChildWrapper for JobObjectChild {
 			.take()
 			.expect("an installed JobObject layer owns its child");
 		if self.spawn_finalized && self.final_kill_on_drop {
-			self.prepared()
-				.with_mut::<PreparedJobObject, _>(|prepared| {
-					let job_port = prepared
-						.job_port
-						.take()
-						.expect("the installed JobObject layer retains its job handles");
-					// Manually close the completion port while retaining the job handle. Closing a
-					// kill-on-close job here would make the extracted child unusable.
-					let job_port = std::mem::ManuallyDrop::new(job_port);
-					// SAFETY: `job_port` owns the completion-port handle and suppresses `JobPort::drop`.
-					unsafe { CloseHandle(HANDLE(job_port.completion_port.as_raw_handle())) }.ok();
-				})
-				.expect("JobObject prepared state retains its concrete type");
+			let mut prepared = self.take_prepared();
+			let job_port = prepared
+				.job_port
+				.take()
+				.expect("the installed JobObject layer retains its job handles");
+			// Manually close the completion port while retaining the job handle. Closing a
+			// kill-on-close job here would make the extracted child unusable.
+			let job_port = std::mem::ManuallyDrop::new(job_port);
+			// SAFETY: `job_port` owns the completion-port handle and suppresses `JobPort::drop`.
+			unsafe { CloseHandle(HANDLE(job_port.completion_port.as_raw_handle())) }.ok();
 		}
 		// Before spawn finalization, dropping the still-armed prepared job instead guarantees that
 		// removing this layer cannot let descendants escape a later lifecycle failure.
 
 		inner
+	}
+	fn retain_prepared_after_sidecar_removal_layer(&mut self) {
+		if self.extracted.is_none() {
+			let prepared = self
+				.prepared()
+				.take_prepared_value::<PreparedJobObject>()
+				.expect("JobObject prepared state retains its concrete type");
+			self.extracted = Some(prepared);
+		}
 	}
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
 		self.inner_ref().try_process_handle()
@@ -682,7 +707,7 @@ mod tests {
 			let paths = TreePaths::new(directory.path());
 			let state = Arc::new(LifecycleState::default());
 			let slot_calls = Arc::new(AtomicUsize::new(0));
-			let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+			let events = Arc::new(std::sync::Mutex::new(Vec::with_capacity(2)));
 			let mut command = topology_command(provider, &paths, &state)?;
 			command.wrap(PostOwnerAccessor {
 				slot_calls: Arc::clone(&slot_calls),

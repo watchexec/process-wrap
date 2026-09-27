@@ -425,11 +425,13 @@ async fn job_object_falls_back_through_a_legacy_transparent_child() -> Result<()
 	command.wrap(LegacyTransparent).wrap(JobObject);
 	let mut child = command.spawn()?;
 
-	let direct_type = child.inner().type_id();
+	let job_type = child.inner().type_id();
+	let direct_type = child.inner().inner().type_id();
 	let has_handle = child.process_handle().is_some();
 	child.start_kill()?;
 	let _ = child.wait().await?;
 
+	assert_eq!(job_type, TypeId::of::<JobObjectChild>());
 	assert_eq!(direct_type, TypeId::of::<LegacyTransparentChild>());
 	assert!(has_handle);
 	Ok(())
@@ -489,16 +491,42 @@ async fn provider_job_assignment_precedes_commit_in_both_orders() -> Result<()> 
 }
 
 #[tokio::test]
+async fn provider_sidecar_removal_preserves_job_object_consuming_extraction() -> Result<()> {
+	let resumes = Arc::new(AtomicUsize::new(0));
+	let commits = Arc::new(AtomicUsize::new(0));
+	let mut command = CommandWrap::new("provider-owned-program");
+	command
+		.wrap(JobObject)
+		.wrap(ProviderWrapper(ProcessProvider {
+			resumes: Arc::clone(&resumes),
+			commits: Arc::clone(&commits),
+		}));
+
+	let child = command.spawn()?;
+	let mut job = child.into_inner();
+	assert_eq!(job.as_ref().type_id(), TypeId::of::<JobObjectChild>());
+	job.start_kill()?;
+	let status = job.wait().await?;
+	let mut child = job.into_inner();
+	assert_eq!(child.wait().await?, status);
+	assert_eq!(resumes.load(Ordering::SeqCst), 1);
+	assert_eq!(commits.load(Ordering::SeqCst), 1);
+	Ok(())
+}
+
+#[tokio::test]
 async fn job_object_falls_back_through_a_legacy_inline_child() -> Result<()> {
 	let mut command = sleeping_command_wrap();
 	command.wrap(LegacyInline).wrap(JobObject);
 	let mut child = command.spawn()?;
 
-	let direct_type = child.inner().type_id();
+	let job_type = child.inner().type_id();
+	let direct_type = child.inner().inner().type_id();
 	let has_handle = child.process_handle().is_some();
 	child.start_kill()?;
 	let _ = child.wait().await?;
 
+	assert_eq!(job_type, TypeId::of::<JobObjectChild>());
 	assert_eq!(direct_type, TypeId::of::<LegacyInlineChild>());
 	assert!(has_handle);
 	Ok(())
@@ -511,8 +539,9 @@ async fn job_object_uses_delegated_handle_and_preserves_the_direct_child() -> Re
 	let mut child = command.spawn()?;
 
 	let outer_has_handle = child.process_handle().is_some();
-	let direct_type = child.inner().type_id();
-	let direct_mut_type = child.inner_mut().type_id();
+	let prepared_layer_type = child.inner().type_id();
+	let direct_type = child.inner().inner().type_id();
+	let prepared_layer_mut_type = child.inner_mut().type_id();
 	let mut direct = child.into_inner();
 	let consumed_type = direct.as_ref().type_id();
 	let consumed_has_handle = direct.process_handle().is_some();
@@ -521,8 +550,9 @@ async fn job_object_uses_delegated_handle_and_preserves_the_direct_child() -> Re
 	let _ = direct.wait().await?;
 
 	assert!(outer_has_handle);
+	assert_eq!(prepared_layer_type, TypeId::of::<JobObjectChild>());
 	assert_eq!(direct_type, TypeId::of::<TransparentChild>());
-	assert_eq!(direct_mut_type, TypeId::of::<TransparentChild>());
+	assert_eq!(prepared_layer_mut_type, TypeId::of::<JobObjectChild>());
 	assert_eq!(consumed_type, TypeId::of::<TransparentChild>());
 	assert!(consumed_has_handle);
 	Ok(())

@@ -551,13 +551,15 @@ impl<N: fmt::Debug> fmt::Debug for CommandState<N> {
 /// the original failure is preserved. Transaction destruction after rollback is contained separately,
 /// and secondary panic payloads are quarantined without being inspected or destroyed.
 ///
-/// Successful commit ends failed-spawn rollback. Process-wrap retains the committed transaction
-/// residue until the sole JobObject owner, if any, disarms successfully, then transfers that residue
-/// in a private transparent layer with the returned child. On a successful spawn, arbitrary
+/// Before commit, process-wrap preallocates a private transparent return sidecar. Successful commit
+/// ends failed-spawn rollback, and process-wrap installs the committed transaction residue in that
+/// sidecar before the sole JobObject owner, if any, disarms. After that owner succeeds, no caller
+/// callback or allocation-dependent work runs before return. On a successful spawn, arbitrary
 /// transaction destruction therefore occurs only after the child has left the spawn lifecycle. A
 /// committed transaction must retain no armed cleanup or independent process, terminal, controller,
-/// handle, pseudoconsole, or other liveness resource. If the final owner fails after commit, its still-armed cleanup remains
-/// authoritative while process-wrap contains disposal of the committed residue as secondary cleanup.
+/// handle, pseudoconsole, or other liveness resource. If the final owner fails after commit, its
+/// still-armed cleanup remains authoritative while process-wrap contains disposal of the committed
+/// residue as secondary cleanup.
 ///
 /// On non-Windows targets there is no hidden child-finalization phase, so commit follows the public
 /// hooks directly. These panic guarantees require unwinding; `panic=abort` terminates the process

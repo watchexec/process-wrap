@@ -15,12 +15,65 @@ use nix::{
 	unistd::Pid,
 };
 
+#[cfg(windows)]
+macro_rules! prepared_owner_child_contract {
+	() => {
+		fn stdin(&mut self) -> &mut Option<ChildStdin> {
+			self.child_mut().stdin()
+		}
+
+		fn stdout(&mut self) -> &mut Option<ChildStdout> {
+			self.child_mut().stdout()
+		}
+
+		fn stderr(&mut self) -> &mut Option<ChildStderr> {
+			self.child_mut().stderr()
+		}
+
+		fn id(&self) -> u32 {
+			self.child_ref().id()
+		}
+
+		fn kill(&mut self) -> Result<()> {
+			self.child_mut().kill()
+		}
+
+		fn start_kill(&mut self) -> Result<()> {
+			self.child_mut().start_kill()
+		}
+
+		fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+			self.child_mut().try_wait()
+		}
+
+		fn wait(&mut self) -> Result<ExitStatus> {
+			self.child_mut().wait()
+		}
+
+		fn wait_with_output(mut self: Box<Self>) -> Result<Output> {
+			let child = self
+				.take_child()
+				.expect("a prepared-owner sidecar retains its child");
+			let output = child.wait_with_output();
+			drop(self);
+			output
+		}
+
+		#[cfg(unix)]
+		fn signal(&self, sig: i32) -> Result<()> {
+			self.child_ref().signal(sig)
+		}
+	};
+}
+
 crate::generic_wrap::Wrap!(
 	crate::Blocking,
 	NativeCommand,
 	Child,
 	ChildWrapper,
-	|child| child
+	|child| child,
+	"std",
+	prepared_owner_child_contract
 );
 
 /// Wrapper for `std::process::Child`.
@@ -156,6 +209,14 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	fn disarm_job_object_layer(&mut self) -> Result<()> {
 		Ok(())
 	}
+
+	/// Move built-in prepared state into this layer before its private owner sidecar is removed.
+	///
+	/// This hook is used only during caller-initiated, post-transfer consuming extraction. Custom
+	/// layers cannot obtain process-wrap's strong prepared owner through it.
+	#[doc(hidden)]
+	#[cfg(all(windows, feature = "job-object"))]
+	fn retain_prepared_after_sidecar_removal_layer(&mut self) {}
 
 	/// Obtain a clone if possible.
 	///
@@ -503,6 +564,23 @@ impl dyn ChildWrapper + '_ {
 			Err(std::io::Error::other(
 				"the captured JobObject cleanup owner left the child chain",
 			))
+		}
+	}
+
+	#[cfg(all(windows, feature = "job-object"))]
+	pub(crate) fn retain_prepared_after_sidecar_removal(&mut self) {
+		let mut inner = self;
+		loop {
+			inner.retain_prepared_after_sidecar_removal_layer();
+			let inner_type = (&*inner as &dyn Any).type_id();
+			let inner_ptr = std::ptr::from_mut(inner);
+			let next = inner.inner_mut();
+			if std::ptr::addr_eq(inner_ptr, std::ptr::from_mut(next))
+				&& inner_type == (&*next as &dyn Any).type_id()
+			{
+				return;
+			}
+			inner = next;
 		}
 	}
 
