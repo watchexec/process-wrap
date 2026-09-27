@@ -311,8 +311,9 @@ macro_rules! Wrap {
 			"Moving or retaining this token cannot prolong the prepared value's lifetime. Resource ",
 			"types which themselves expose interior mutation or independently clonable native owners ",
 			"remain responsible for those capabilities.\n\n",
-			"On native Windows success, a private outer sidecar retains the strong prepared storage. ",
-			"It delegates the full child contract, exposes the immediate application layer through ",
+			"On native Windows success, a private outer sidecar retains the strong prepared storage and ",
+			"any disarmed spawn-cleanup handle until child disposal or consuming sidecar removal. It ",
+			"delegates the full child contract, exposes the immediate application layer through ",
 			"`inner` and `inner_mut`, and consumes that application layer through `into_inner`. Its ",
 			"private concrete type is the returned trait object's top-level `Any` identity while ",
 			"prepared storage remains installed.\n\n",
@@ -871,9 +872,11 @@ macro_rules! Wrap {
 
 		#[cfg(windows)]
 		struct PreparedOwnerChild {
-			// Field order is intentional: the complete child chain drops before prepared storage.
+			// Field order is intentional: the complete child chain drops before prepared storage and
+			// the disarmed duplicate process handle.
 			child: Option<Box<dyn $childer>>,
 			prepared: Vec<Option<PreparedChildOwner>>,
+			spawn_cleanup: Option<crate::command::WindowsSpawnCleanup>,
 		}
 
 		#[cfg(windows)]
@@ -882,10 +885,19 @@ macro_rules! Wrap {
 				child: Box<dyn $childer>,
 				prepared: Vec<Option<PreparedChildOwner>>,
 			) -> Box<Self> {
-				debug_assert!(prepared.iter().any(Option::is_some));
+				Self::new_with_spawn_cleanup(child, prepared, None)
+			}
+
+			fn new_with_spawn_cleanup(
+				child: Box<dyn $childer>,
+				prepared: Vec<Option<PreparedChildOwner>>,
+				spawn_cleanup: Option<crate::command::WindowsSpawnCleanup>,
+			) -> Box<Self> {
+				debug_assert!(prepared.iter().any(Option::is_some) || spawn_cleanup.is_some());
 				Box::new(Self {
 					child: Some(child),
 					prepared,
+					spawn_cleanup,
 				})
 			}
 
@@ -903,6 +915,16 @@ macro_rules! Wrap {
 
 			fn take_child(&mut self) -> Option<Box<dyn $childer>> {
 				self.child.take()
+			}
+
+			fn take_spawn_cleanup(&mut self) -> Option<crate::command::WindowsSpawnCleanup> {
+				self.spawn_cleanup.take()
+			}
+
+			fn disarm_spawn_cleanup(&mut self) {
+				if let Some(cleanup) = self.spawn_cleanup.as_mut() {
+					cleanup.disarm();
+				}
 			}
 		}
 
@@ -940,6 +962,8 @@ macro_rules! Wrap {
 					})
 				});
 				if self.prepared.is_empty() {
+					// Consuming the public sidecar ends its custody. `self` then closes any disarmed
+					// duplicate handle exactly once while the extracted child moves to the caller.
 					inner
 				} else {
 					self.child = Some(inner);
@@ -967,7 +991,7 @@ macro_rules! Wrap {
 		#[cfg(windows)]
 		enum NativeSuccessChild {
 			Plain(Box<dyn $childer>),
-			Prepared(Box<PreparedOwnerChild>),
+			Sidecar(Box<PreparedOwnerChild>),
 		}
 
 		#[cfg(windows)]
@@ -975,9 +999,14 @@ macro_rules! Wrap {
 			fn new(
 				child: Box<dyn $childer>,
 				prepared: Vec<Option<PreparedChildOwner>>,
+				spawn_cleanup: Option<crate::command::WindowsSpawnCleanup>,
 			) -> Self {
-				if prepared.iter().any(Option::is_some) {
-					Self::Prepared(PreparedOwnerChild::new(child, prepared))
+				if prepared.iter().any(Option::is_some) || spawn_cleanup.is_some() {
+					Self::Sidecar(PreparedOwnerChild::new_with_spawn_cleanup(
+						child,
+						prepared,
+						spawn_cleanup,
+					))
 				} else {
 					Self::Plain(child)
 				}
@@ -986,14 +1015,27 @@ macro_rules! Wrap {
 			fn child_mut(&mut self) -> &mut dyn $childer {
 				match self {
 					Self::Plain(child) => child.as_mut(),
-					Self::Prepared(child) => child.as_mut(),
+					Self::Sidecar(child) => child.as_mut(),
+				}
+			}
+
+			fn take_spawn_cleanup(&mut self) -> Option<crate::command::WindowsSpawnCleanup> {
+				match self {
+					Self::Plain(_) => None,
+					Self::Sidecar(child) => child.take_spawn_cleanup(),
+				}
+			}
+
+			fn disarm_spawn_cleanup(&mut self) {
+				if let Self::Sidecar(child) = self {
+					child.disarm_spawn_cleanup();
 				}
 			}
 
 			fn into_child(self) -> Box<dyn $childer> {
 				match self {
 					Self::Plain(child) => child,
-					Self::Prepared(child) => child,
+					Self::Sidecar(child) => child,
 				}
 			}
 		}
@@ -1576,13 +1618,14 @@ macro_rules! Wrap {
 					let mut success = NativeSuccessChild::new(
 						child,
 						::std::mem::take(&mut prepared),
+						cleanup,
 					);
 					let final_owner = match Self::capture_io(|| {
 						success.child_mut().finalize_spawn_before_commit()
 					}) {
 						Ok(owner) => owner,
 						Err(failure) => {
-							drop(cleanup.take());
+							Self::cleanup_native_spawn_guard(&mut success);
 							Self::cleanup_pending_child(&mut pending);
 							Self::cleanup_native_success(success);
 							return failure.finish::<Box<dyn $childer>>();
@@ -1596,13 +1639,11 @@ macro_rules! Wrap {
 					});
 					match final_result {
 						Ok(()) => {
-							if let Some(cleanup) = cleanup.as_mut() {
-								cleanup.disarm();
-							}
+							success.disarm_spawn_cleanup();
 							Ok(success.into_child())
 						}
 						Err(failure) => {
-							drop(cleanup.take());
+							Self::cleanup_native_spawn_guard(&mut success);
 							Self::cleanup_pending_child(&mut pending);
 							Self::cleanup_native_success(success);
 							failure.finish::<Box<dyn $childer>>()
@@ -1646,10 +1687,18 @@ macro_rules! Wrap {
 			}
 
 			#[cfg(windows)]
-			fn cleanup_native_success(success: NativeSuccessChild) {
+			fn cleanup_native_spawn_guard(success: &mut NativeSuccessChild) {
+				if let Some(cleanup) = success.take_spawn_cleanup() {
+					Self::dispose_value(cleanup);
+				}
+			}
+
+			#[cfg(windows)]
+			fn cleanup_native_success(mut success: NativeSuccessChild) {
+				Self::cleanup_native_spawn_guard(&mut success);
 				match success {
 					NativeSuccessChild::Plain(child) => Self::dispose_value(child),
-					NativeSuccessChild::Prepared(mut sidecar) => {
+					NativeSuccessChild::Sidecar(mut sidecar) => {
 						Self::cleanup_child(&mut sidecar.child);
 						Self::cleanup_prepared(&mut sidecar.prepared);
 						Self::dispose_value(sidecar);

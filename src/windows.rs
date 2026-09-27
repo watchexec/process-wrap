@@ -269,6 +269,18 @@ pub(crate) mod test_support {
 		crate::test_allocator::current_probe().finish()
 	}
 
+	pub fn arm_spawn_cleanup_handle_probe() {
+		crate::test_allocator::current_spawn_cleanup_handle_probe().arm();
+	}
+
+	pub fn spawn_cleanup_handle_close_count() -> usize {
+		crate::test_allocator::current_spawn_cleanup_handle_probe().close_count()
+	}
+
+	pub fn finish_spawn_cleanup_handle_probe() -> usize {
+		crate::test_allocator::current_spawn_cleanup_handle_probe().finish()
+	}
+
 	pub fn record_owner_event(event: &'static str) {
 		crate::test_allocator::current_probe().observe_operation();
 		OWNER_EVENTS.with(|slot| {

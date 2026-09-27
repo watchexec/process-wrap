@@ -678,8 +678,37 @@ pub(crate) mod test_allocator {
 		}
 	}
 
+	#[derive(Default)]
+	pub(crate) struct SpawnCleanupHandleProbe {
+		active: AtomicBool,
+		closes: std::sync::atomic::AtomicUsize,
+	}
+
+	impl SpawnCleanupHandleProbe {
+		pub(crate) fn arm(&self) {
+			assert!(!self.active.swap(true, Ordering::SeqCst));
+			self.closes.store(0, Ordering::SeqCst);
+		}
+
+		fn observe_close(&self) {
+			if self.active.load(Ordering::SeqCst) {
+				self.closes.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+
+		pub(crate) fn close_count(&self) -> usize {
+			self.closes.load(Ordering::SeqCst)
+		}
+
+		pub(crate) fn finish(&self) -> usize {
+			self.active.store(false, Ordering::SeqCst);
+			self.close_count()
+		}
+	}
+
 	thread_local! {
 		static POST_TRANSITION_PROBE: Cell<Option<&'static PostTransitionProbe>> = const { Cell::new(None) };
+		static SPAWN_CLEANUP_HANDLE_PROBE: Cell<Option<&'static SpawnCleanupHandleProbe>> = const { Cell::new(None) };
 	}
 
 	pub(crate) fn current_probe() -> &'static PostTransitionProbe {
@@ -689,6 +718,23 @@ pub(crate) mod test_allocator {
 		let probe = Box::leak(Box::new(PostTransitionProbe::default()));
 		POST_TRANSITION_PROBE.set(Some(probe));
 		probe
+	}
+
+	pub(crate) fn current_spawn_cleanup_handle_probe() -> &'static SpawnCleanupHandleProbe {
+		if let Some(probe) = SPAWN_CLEANUP_HANDLE_PROBE.get() {
+			return probe;
+		}
+		let probe = Box::leak(Box::new(SpawnCleanupHandleProbe::default()));
+		SPAWN_CLEANUP_HANDLE_PROBE.set(Some(probe));
+		probe
+	}
+
+	pub(crate) fn observe_spawn_cleanup_handle_close() {
+		let _ = SPAWN_CLEANUP_HANDLE_PROBE.try_with(|slot| {
+			if let Some(probe) = slot.get() {
+				probe.observe_close();
+			}
+		});
 	}
 
 	fn observe_allocator_callback() {

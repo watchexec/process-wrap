@@ -679,7 +679,7 @@ pub(crate) fn terminate_process_and_wait(process: BorrowedHandle<'_>) -> std::io
 #[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct WindowsSpawnCleanup {
-	process: OwnedHandle,
+	process: Option<OwnedHandle>,
 	armed: bool,
 }
 
@@ -687,7 +687,7 @@ pub(crate) struct WindowsSpawnCleanup {
 impl WindowsSpawnCleanup {
 	pub(crate) fn new(process: BorrowedHandle<'_>) -> std::io::Result<Self> {
 		Ok(Self {
-			process: process.try_clone_to_owned()?,
+			process: Some(process.try_clone_to_owned()?),
 			armed: true,
 		})
 	}
@@ -701,8 +701,15 @@ impl WindowsSpawnCleanup {
 impl Drop for WindowsSpawnCleanup {
 	fn drop(&mut self) {
 		if self.armed {
-			let _ = terminate_process_and_wait(self.process.as_handle());
+			let process = self
+				.process
+				.as_ref()
+				.expect("an armed Windows spawn cleanup retains its process handle");
+			let _ = terminate_process_and_wait(process.as_handle());
 		}
+		drop(self.process.take());
+		#[cfg(test)]
+		crate::test_allocator::observe_spawn_cleanup_handle_close();
 	}
 }
 

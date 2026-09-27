@@ -431,9 +431,10 @@ mod tests {
 	use crate::windows::test_support::{
 		LifecycleState, OwnerError, OwnerFailure, OwnerPanic, PanickingCommittedTransaction,
 		ProcessGuard, TreePaths, arm_extra_prepared_owner, arm_owner_events, arm_owner_failure,
-		arm_owner_transition_probe, assert_tree_terminated, clear_extra_prepared_owners,
-		clear_owner_events, clear_owner_failure, finish_owner_transition_probe, observe_descendant,
-		publish_process_guards, record_owner_event,
+		arm_owner_transition_probe, arm_spawn_cleanup_handle_probe, assert_tree_terminated,
+		clear_extra_prepared_owners, clear_owner_events, clear_owner_failure,
+		finish_owner_transition_probe, finish_spawn_cleanup_handle_probe, observe_descendant,
+		publish_process_guards, record_owner_event, spawn_cleanup_handle_close_count,
 	};
 
 	use super::*;
@@ -657,6 +658,100 @@ mod tests {
 			command.wrap(ObserveNativeTree(observer));
 		}
 		Ok(command)
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn native_spawn_cleanup_handle_closes_with_returned_child() -> Result<()> {
+		let directory = tempfile::tempdir()?;
+		let paths = TreePaths::new(directory.path());
+		let state = Arc::new(LifecycleState::default());
+		let mut command = topology_command(false, &paths, &state)?;
+
+		for attempt in 0..2 {
+			arm_spawn_cleanup_handle_probe();
+			let mut child = command.spawn()?;
+			assert_eq!(
+				spawn_cleanup_handle_close_count(),
+				0,
+				"the exact duplicate process handle remains owned through public spawn return"
+			);
+			child.start_kill()?;
+			let _ = child.wait().await?;
+			assert_eq!(
+				spawn_cleanup_handle_close_count(),
+				0,
+				"child operations retain cleanup-handle custody"
+			);
+			if attempt == 0 {
+				drop(child);
+			} else {
+				let child = child.into_inner();
+				assert_eq!(
+					spawn_cleanup_handle_close_count(),
+					1,
+					"consuming the custody sidecar closes the exact duplicate once"
+				);
+				drop(child);
+			}
+			assert_eq!(
+				spawn_cleanup_handle_close_count(),
+				1,
+				"returned-child disposal closes the exact duplicate process handle once"
+			);
+			assert_eq!(finish_spawn_cleanup_handle_probe(), 1);
+			assert_tree_terminated(&paths, &state)?;
+			if attempt == 0 {
+				std::fs::remove_file(&paths.descendant_pid)?;
+			}
+		}
+		Ok(())
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn native_final_owner_failures_close_armed_spawn_cleanup_once() -> Result<()> {
+		for was_panic in [false, true] {
+			let directory = tempfile::tempdir()?;
+			let paths = TreePaths::new(directory.path());
+			let state = Arc::new(LifecycleState::default());
+			let identity = Arc::new(());
+			let failure = if was_panic {
+				OwnerFailure::Panic(Arc::clone(&identity))
+			} else {
+				OwnerFailure::Error(Arc::clone(&identity))
+			};
+			let mut command = topology_command(false, &paths, &state)?;
+			arm_owner_failure(failure);
+			arm_owner_transition_probe();
+			arm_spawn_cleanup_handle_probe();
+
+			let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
+			let failure_was_not_consumed = clear_owner_failure();
+			let primary_preserved = primary_owner_failure_preserved(outcome, &identity, was_panic);
+			let (transitioned, allocator_callback, later_operation) =
+				finish_owner_transition_probe();
+			assert!(!transitioned, "the native policy transition must not run");
+			assert!(!allocator_callback);
+			assert!(!later_operation);
+			assert_eq!(spawn_cleanup_handle_close_count(), 1);
+			assert_eq!(finish_spawn_cleanup_handle_probe(), 1);
+			assert!(
+				!failure_was_not_consumed,
+				"the final owner hook did not consume its injected failure"
+			);
+			assert!(
+				primary_preserved,
+				"armed cleanup replaced the final owner failure"
+			);
+			assert_tree_terminated(&paths, &state)?;
+			std::fs::remove_file(&paths.descendant_pid)?;
+
+			let mut child = command.spawn().expect("the command remains reusable");
+			child.start_kill()?;
+			let _ = child.wait().await?;
+			drop(child);
+			assert_tree_terminated(&paths, &state)?;
+		}
+		Ok(())
 	}
 
 	#[tokio::test(flavor = "current_thread")]
