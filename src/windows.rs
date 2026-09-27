@@ -197,32 +197,122 @@ pub(crate) mod test_support {
 		Panic(Arc<()>),
 	}
 
-	#[derive(Debug, Default)]
-	pub struct JobPortCloseProbe {
-		pub job_closes: AtomicUsize,
-		pub completion_port_closes: AtomicUsize,
-	}
+	#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
+	mod job_extraction {
+		use super::*;
 
-	impl JobPortCloseProbe {
-		pub fn counts(&self) -> (usize, usize) {
-			(
-				self.job_closes.load(Ordering::SeqCst),
-				self.completion_port_closes.load(Ordering::SeqCst),
-			)
+		#[derive(Debug, Default)]
+		pub struct JobPortCloseProbe {
+			pub job_closes: AtomicUsize,
+			pub completion_port_closes: AtomicUsize,
+		}
+
+		impl JobPortCloseProbe {
+			pub fn counts(&self) -> (usize, usize) {
+				(
+					self.job_closes.load(Ordering::SeqCst),
+					self.completion_port_closes.load(Ordering::SeqCst),
+				)
+			}
+		}
+
+		static JOB_EXTRACTION_QUERY_FAILURES: AtomicUsize = AtomicUsize::new(0);
+		static JOB_EXTRACTION_DISARM_FAILURES: AtomicUsize = AtomicUsize::new(0);
+		static JOB_CUSTODIAN_START_FAILURES: AtomicUsize = AtomicUsize::new(0);
+		static JOB_CUSTODIAN_WORKER_STARTS: AtomicUsize = AtomicUsize::new(0);
+		static JOB_PORT_LAST_RESORT_RETENTIONS: AtomicUsize = AtomicUsize::new(0);
+
+		thread_local! {
+			static JOB_PORT_CLOSE_PROBE: RefCell<Option<Arc<JobPortCloseProbe>>> = const { RefCell::new(None) };
+		}
+
+		fn take_failure(counter: &AtomicUsize) -> bool {
+			counter
+				.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+					remaining.checked_sub(1)
+				})
+				.is_ok()
+		}
+
+		pub fn serial_job_extraction() -> std::sync::MutexGuard<'static, ()> {
+			static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+			LOCK.get_or_init(|| std::sync::Mutex::new(()))
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+		}
+
+		pub fn arm_job_port_close_probe() -> Arc<JobPortCloseProbe> {
+			let probe = Arc::new(JobPortCloseProbe::default());
+			JOB_PORT_CLOSE_PROBE.with(|slot| {
+				assert!(slot.borrow_mut().replace(Arc::clone(&probe)).is_none());
+			});
+			probe
+		}
+
+		pub fn current_job_port_close_probe() -> Option<Arc<JobPortCloseProbe>> {
+			JOB_PORT_CLOSE_PROBE.with(|slot| slot.borrow().clone())
+		}
+
+		pub fn clear_job_port_close_probe() {
+			JOB_PORT_CLOSE_PROBE.with(|slot| {
+				assert!(slot.borrow_mut().take().is_some());
+			});
+		}
+
+		pub fn set_job_extraction_query_failures(failures: usize) {
+			JOB_EXTRACTION_QUERY_FAILURES.store(failures, Ordering::SeqCst);
+		}
+
+		pub fn take_job_extraction_query_failure() -> bool {
+			take_failure(&JOB_EXTRACTION_QUERY_FAILURES)
+		}
+
+		pub fn set_job_extraction_disarm_failures(failures: usize) {
+			JOB_EXTRACTION_DISARM_FAILURES.store(failures, Ordering::SeqCst);
+		}
+
+		pub fn take_job_extraction_disarm_failure() -> bool {
+			take_failure(&JOB_EXTRACTION_DISARM_FAILURES)
+		}
+
+		pub fn set_job_custodian_start_failures(failures: usize) {
+			JOB_CUSTODIAN_START_FAILURES.store(failures, Ordering::SeqCst);
+		}
+
+		pub fn take_job_custodian_start_failure() -> bool {
+			take_failure(&JOB_CUSTODIAN_START_FAILURES)
+		}
+
+		pub fn observe_job_custodian_worker_start() {
+			JOB_CUSTODIAN_WORKER_STARTS.fetch_add(1, Ordering::SeqCst);
+		}
+
+		pub fn job_custodian_worker_starts() -> usize {
+			JOB_CUSTODIAN_WORKER_STARTS.load(Ordering::SeqCst)
+		}
+
+		pub fn observe_job_port_last_resort_retention() {
+			JOB_PORT_LAST_RESORT_RETENTIONS.fetch_add(1, Ordering::SeqCst);
+		}
+
+		pub fn job_port_last_resort_retentions() -> usize {
+			JOB_PORT_LAST_RESORT_RETENTIONS.load(Ordering::SeqCst)
+		}
+
+		pub fn reset_job_extraction_faults() {
+			JOB_EXTRACTION_QUERY_FAILURES.store(0, Ordering::SeqCst);
+			JOB_EXTRACTION_DISARM_FAILURES.store(0, Ordering::SeqCst);
+			JOB_CUSTODIAN_START_FAILURES.store(0, Ordering::SeqCst);
 		}
 	}
 
-	static JOB_EXTRACTION_QUERY_FAILURES: AtomicUsize = AtomicUsize::new(0);
-	static JOB_EXTRACTION_DISARM_FAILURES: AtomicUsize = AtomicUsize::new(0);
-	static JOB_CUSTODIAN_START_FAILURES: AtomicUsize = AtomicUsize::new(0);
-	static JOB_CUSTODIAN_WORKER_STARTS: AtomicUsize = AtomicUsize::new(0);
-	static JOB_PORT_LAST_RESORT_RETENTIONS: AtomicUsize = AtomicUsize::new(0);
+	#[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
+	pub use job_extraction::*;
 
 	thread_local! {
 		static OWNER_FAILURE: RefCell<Option<OwnerFailure>> = const { RefCell::new(None) };
 		static OWNER_EVENTS: RefCell<Option<Arc<Mutex<Vec<&'static str>>>>> = const { RefCell::new(None) };
 		static EXTRA_PREPARED_OWNER: RefCell<ExtraPreparedOwner> = RefCell::new(ExtraPreparedOwner::default());
-		static JOB_PORT_CLOSE_PROBE: RefCell<Option<Arc<JobPortCloseProbe>>> = const { RefCell::new(None) };
 	}
 
 	#[derive(Default)]
@@ -256,85 +346,6 @@ pub(crate) mod test_support {
 			state.owners.clear();
 			(inject, owner_count)
 		})
-	}
-
-	fn take_failure(counter: &AtomicUsize) -> bool {
-		counter
-			.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-				remaining.checked_sub(1)
-			})
-			.is_ok()
-	}
-
-	pub fn serial_job_extraction() -> std::sync::MutexGuard<'static, ()> {
-		static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-		LOCK.get_or_init(|| std::sync::Mutex::new(()))
-			.lock()
-			.unwrap_or_else(std::sync::PoisonError::into_inner)
-	}
-
-	pub fn arm_job_port_close_probe() -> Arc<JobPortCloseProbe> {
-		let probe = Arc::new(JobPortCloseProbe::default());
-		JOB_PORT_CLOSE_PROBE.with(|slot| {
-			assert!(slot.borrow_mut().replace(Arc::clone(&probe)).is_none());
-		});
-		probe
-	}
-
-	pub fn current_job_port_close_probe() -> Option<Arc<JobPortCloseProbe>> {
-		JOB_PORT_CLOSE_PROBE.with(|slot| slot.borrow().clone())
-	}
-
-	pub fn clear_job_port_close_probe() {
-		JOB_PORT_CLOSE_PROBE.with(|slot| {
-			assert!(slot.borrow_mut().take().is_some());
-		});
-	}
-
-	pub fn set_job_extraction_query_failures(failures: usize) {
-		JOB_EXTRACTION_QUERY_FAILURES.store(failures, Ordering::SeqCst);
-	}
-
-	pub fn take_job_extraction_query_failure() -> bool {
-		take_failure(&JOB_EXTRACTION_QUERY_FAILURES)
-	}
-
-	pub fn set_job_extraction_disarm_failures(failures: usize) {
-		JOB_EXTRACTION_DISARM_FAILURES.store(failures, Ordering::SeqCst);
-	}
-
-	pub fn take_job_extraction_disarm_failure() -> bool {
-		take_failure(&JOB_EXTRACTION_DISARM_FAILURES)
-	}
-
-	pub fn set_job_custodian_start_failures(failures: usize) {
-		JOB_CUSTODIAN_START_FAILURES.store(failures, Ordering::SeqCst);
-	}
-
-	pub fn take_job_custodian_start_failure() -> bool {
-		take_failure(&JOB_CUSTODIAN_START_FAILURES)
-	}
-
-	pub fn observe_job_custodian_worker_start() {
-		JOB_CUSTODIAN_WORKER_STARTS.fetch_add(1, Ordering::SeqCst);
-	}
-
-	pub fn job_custodian_worker_starts() -> usize {
-		JOB_CUSTODIAN_WORKER_STARTS.load(Ordering::SeqCst)
-	}
-
-	pub fn observe_job_port_last_resort_retention() {
-		JOB_PORT_LAST_RESORT_RETENTIONS.fetch_add(1, Ordering::SeqCst);
-	}
-
-	pub fn job_port_last_resort_retentions() -> usize {
-		JOB_PORT_LAST_RESORT_RETENTIONS.load(Ordering::SeqCst)
-	}
-
-	pub fn reset_job_extraction_faults() {
-		JOB_EXTRACTION_QUERY_FAILURES.store(0, Ordering::SeqCst);
-		JOB_EXTRACTION_DISARM_FAILURES.store(0, Ordering::SeqCst);
-		JOB_CUSTODIAN_START_FAILURES.store(0, Ordering::SeqCst);
 	}
 
 	pub fn arm_owner_failure(failure: OwnerFailure) {
@@ -677,7 +688,7 @@ unsafe impl Sync for JobHandle {}
 pub(crate) struct JobPort {
 	pub job: JobHandle,
 	pub completion_port: StdOwnedHandle,
-	#[cfg(test)]
+	#[cfg(all(test, feature = "tokio1", feature = "kill-on-drop"))]
 	close_probe: Option<std::sync::Arc<test_support::JobPortCloseProbe>>,
 }
 
@@ -685,7 +696,7 @@ impl Drop for JobPort {
 	fn drop(&mut self) {
 		// SAFETY: `JobPort` solely owns this job handle.
 		unsafe { CloseHandle(self.job.0) }.ok();
-		#[cfg(test)]
+		#[cfg(all(test, feature = "tokio1", feature = "kill-on-drop"))]
 		if let Some(probe) = self.close_probe.as_ref() {
 			probe
 				.job_closes
@@ -826,7 +837,7 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 	Ok(JobPort {
 		job: JobHandle(job.into_raw()),
 		completion_port,
-		#[cfg(test)]
+		#[cfg(all(test, feature = "tokio1", feature = "kill-on-drop"))]
 		close_probe: test_support::current_job_port_close_probe(),
 	})
 }
