@@ -85,16 +85,45 @@ macro_rules! spawn_provider_tests {
 				Panic(&'static str),
 			}
 
+			#[cfg(miri)]
+			#[derive(Debug)]
+			struct MiriRollbackPanicPayload;
+
+			#[cfg(miri)]
+			impl Drop for MiriRollbackPanicPayload {
+				fn drop(&mut self) {
+					panic_any(());
+				}
+			}
+
 			#[derive(Debug)]
 			struct CommittedDropPayload(Arc<()>);
 
 			#[derive(Debug)]
 			struct PanickingDropPayload {
+				#[cfg(not(miri))]
 				drops: Arc<AtomicUsize>,
+			}
+
+			impl PanickingDropPayload {
+				fn new(drops: &Arc<AtomicUsize>) -> Self {
+					#[cfg(miri)]
+					{
+						let _ = drops;
+						Self {}
+					}
+					#[cfg(not(miri))]
+					{
+						Self {
+							drops: Arc::clone(drops),
+						}
+					}
+				}
 			}
 
 			impl Drop for PanickingDropPayload {
 				fn drop(&mut self) {
+					#[cfg(not(miri))]
 					self.drops.fetch_add(1, Ordering::SeqCst);
 					panic_any("a secondary panic payload was dropped");
 				}
@@ -249,7 +278,14 @@ macro_rules! spawn_provider_tests {
 
 					match failure {
 						Some(Failure::Error(kind, message)) => Err(io::Error::new(kind, message)),
-						Some(Failure::Panic(message)) => panic_any(message),
+						Some(Failure::Panic(message)) => {
+							#[cfg(miri)]
+							if point == Point::Rollback {
+								let _ = message;
+								panic_any(MiriRollbackPanicPayload);
+							}
+							panic_any(message);
+						}
 						None => Ok(()),
 					}
 				}
@@ -2231,9 +2267,9 @@ macro_rules! spawn_provider_tests {
 				for was_panic in [false, true] {
 					let shared = Arc::new(Shared::default());
 					let secondary_drops = Arc::new(AtomicUsize::new(0));
-					shared.set_rollback_behavior(RollbackBehavior::Panic(PanickingDropPayload {
-						drops: Arc::clone(&secondary_drops),
-					}));
+					shared.set_rollback_behavior(RollbackBehavior::Panic(
+						PanickingDropPayload::new(&secondary_drops),
+					));
 					let identity = Arc::new(());
 					let failure = if was_panic {
 						PrimaryFailure::Panic(Arc::clone(&identity))
@@ -2262,9 +2298,9 @@ macro_rules! spawn_provider_tests {
 					let shared = Arc::new(Shared::default());
 					let secondary_drops = Arc::new(AtomicUsize::new(0));
 					shared.set_transaction_drop_behavior(
-						TransactionDropBehavior::PanicSecondary(PanickingDropPayload {
-							drops: Arc::clone(&secondary_drops),
-						}),
+						TransactionDropBehavior::PanicSecondary(PanickingDropPayload::new(
+							&secondary_drops,
+						)),
 					);
 					let identity = Arc::new(());
 					let failure = if was_panic {
@@ -2331,13 +2367,11 @@ macro_rules! spawn_provider_tests {
 				let shared = Arc::new(Shared::default());
 				let rollback_payload_drops = Arc::new(AtomicUsize::new(0));
 				let transaction_payload_drops = Arc::new(AtomicUsize::new(0));
-				shared.set_rollback_behavior(RollbackBehavior::Panic(PanickingDropPayload {
-					drops: Arc::clone(&rollback_payload_drops),
-				}));
+				shared.set_rollback_behavior(RollbackBehavior::Panic(
+					PanickingDropPayload::new(&rollback_payload_drops),
+				));
 				shared.set_transaction_drop_behavior(TransactionDropBehavior::PanicSecondary(
-					PanickingDropPayload {
-						drops: Arc::clone(&transaction_payload_drops),
-					},
+					PanickingDropPayload::new(&transaction_payload_drops),
 				));
 				let identity = Arc::new(());
 				let mut command = provider_command_with_primary_failure(
@@ -2359,9 +2393,7 @@ macro_rules! spawn_provider_tests {
 				for fail_commit in [false, true] {
 					let shared = Arc::new(Shared::default());
 					let secondary_drops = Arc::new(AtomicUsize::new(0));
-					shared.set_child_drop_payload(PanickingDropPayload {
-						drops: Arc::clone(&secondary_drops),
-					});
+					shared.set_child_drop_payload(PanickingDropPayload::new(&secondary_drops));
 					let identity = Arc::new(());
 					let mut command = if fail_commit {
 						shared.set_commit_primary_failure(PrimaryFailure::Error(Arc::clone(&identity)));
@@ -2420,9 +2452,7 @@ macro_rules! spawn_provider_tests {
 					.ends_with(":commit");
 				let shared = Arc::new(Shared::default());
 				let secondary_drops = Arc::new(AtomicUsize::new(0));
-				shared.set_child_drop_payload(PanickingDropPayload {
-					drops: Arc::clone(&secondary_drops),
-				});
+				shared.set_child_drop_payload(PanickingDropPayload::new(&secondary_drops));
 				let identity = Arc::new(());
 				let mut command = if fail_commit {
 					shared.set_commit_primary_failure(PrimaryFailure::Panic(Arc::clone(&identity)));
@@ -2889,15 +2919,11 @@ macro_rules! spawn_provider_tests {
 				command
 					.wrap(FirstPrepared {
 						shared: Arc::clone(&shared),
-						payload: Mutex::new(Some(PanickingDropPayload {
-							drops: Arc::clone(&first_drops),
-						})),
+						payload: Mutex::new(Some(PanickingDropPayload::new(&first_drops))),
 					})
 					.wrap(SecondPrepared {
 						shared: Arc::clone(&shared),
-						payload: Mutex::new(Some(PanickingDropPayload {
-							drops: Arc::clone(&second_drops),
-						})),
+						payload: Mutex::new(Some(PanickingDropPayload::new(&second_drops))),
 					})
 					.wrap(FailPrepare(Mutex::new(Some(failure))));
 
@@ -3068,9 +3094,9 @@ macro_rules! spawn_provider_tests {
 					shared.set_finalization_layers(layers.clone());
 					shared.fail_once(Point::DisarmOwner, failure);
 					shared.set_transaction_drop_behavior(
-						TransactionDropBehavior::PanicSecondary(PanickingDropPayload {
-							drops: Arc::clone(&secondary_drops),
-						}),
+						TransactionDropBehavior::PanicSecondary(PanickingDropPayload::new(
+							&secondary_drops,
+						)),
 					);
 					let mut command = provider_command(Arc::clone(&shared), "provider");
 
@@ -3128,13 +3154,9 @@ macro_rules! spawn_provider_tests {
 				let child_payload_drops = Arc::new(AtomicUsize::new(0));
 				let prepared_payload_drops = Arc::new(AtomicUsize::new(0));
 				let residue_payload_drops = Arc::new(AtomicUsize::new(0));
-				shared.set_child_drop_payload(PanickingDropPayload {
-					drops: Arc::clone(&child_payload_drops),
-				});
+				shared.set_child_drop_payload(PanickingDropPayload::new(&child_payload_drops));
 				shared.set_transaction_drop_behavior(TransactionDropBehavior::PanicSecondary(
-					PanickingDropPayload {
-						drops: Arc::clone(&residue_payload_drops),
-					},
+					PanickingDropPayload::new(&residue_payload_drops),
 				));
 				let layers = vec![finalization_layer("owner", true)];
 				shared.set_finalization_layers(layers.clone());
@@ -3153,9 +3175,7 @@ macro_rules! spawn_provider_tests {
 				let mut command = provider_command(Arc::clone(&shared), "provider");
 				command.wrap(FirstPrepared {
 					shared: Arc::clone(&shared),
-					payload: Mutex::new(Some(PanickingDropPayload {
-						drops: Arc::clone(&prepared_payload_drops),
-					})),
+					payload: Mutex::new(Some(PanickingDropPayload::new(&prepared_payload_drops))),
 				});
 
 				let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
