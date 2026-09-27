@@ -885,6 +885,721 @@ macro_rules! Wrap {
 			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 1);
 		}
 
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug)]
+		struct PreparedPublicationControl {
+			placed_tx: ::std::sync::mpsc::Sender<()>,
+			placed_rx: ::std::sync::Mutex<::std::sync::mpsc::Receiver<()>>,
+			closing_tx: ::std::sync::Mutex<Option<::std::sync::mpsc::Sender<()>>>,
+			closing_rx: ::std::sync::Mutex<::std::sync::mpsc::Receiver<()>>,
+			active_release: ::std::sync::Mutex<Option<::std::sync::mpsc::Sender<()>>>,
+			queued_release: ::std::sync::Mutex<Option<::std::sync::mpsc::Sender<()>>>,
+			closing_release: ::std::sync::Mutex<Option<::std::sync::mpsc::Sender<()>>>,
+			active_result: ::std::sync::Mutex<Option<::std::sync::mpsc::Receiver<bool>>>,
+			queued_result: ::std::sync::Mutex<Option<::std::sync::mpsc::Receiver<bool>>>,
+			workers: ::std::sync::Mutex<Vec<::std::thread::JoinHandle<()>>>,
+			queued_callbacks: ::std::sync::Arc<::std::sync::atomic::AtomicUsize>,
+			retained_token: ::std::sync::Mutex<Option<::std::sync::Arc<PreparedChild>>>,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl PreparedPublicationControl {
+			const TIMEOUT: ::std::time::Duration = ::std::time::Duration::from_secs(5);
+
+			fn new() -> ::std::sync::Arc<Self> {
+				let (placed_tx, placed_rx) = ::std::sync::mpsc::channel();
+				let (closing_tx, closing_rx) = ::std::sync::mpsc::channel();
+				::std::sync::Arc::new(Self {
+					placed_tx,
+					placed_rx: ::std::sync::Mutex::new(placed_rx),
+					closing_tx: ::std::sync::Mutex::new(Some(closing_tx)),
+					closing_rx: ::std::sync::Mutex::new(closing_rx),
+					active_release: ::std::sync::Mutex::new(None),
+					queued_release: ::std::sync::Mutex::new(None),
+					closing_release: ::std::sync::Mutex::new(None),
+					active_result: ::std::sync::Mutex::new(None),
+					queued_result: ::std::sync::Mutex::new(None),
+					workers: ::std::sync::Mutex::new(Vec::new()),
+					queued_callbacks: ::std::sync::Arc::new(
+						::std::sync::atomic::AtomicUsize::new(0),
+					),
+					retained_token: ::std::sync::Mutex::new(None),
+				})
+			}
+
+			fn start(&self, token: PreparedChild) {
+				let state = token
+					.state
+					.upgrade()
+					.expect("the private owner remains live during wrapping");
+				let token = ::std::sync::Arc::new(token);
+				let (active_entered_tx, active_entered_rx) = ::std::sync::mpsc::channel();
+				let (active_release_tx, active_release_rx) = ::std::sync::mpsc::channel();
+				let (active_result_tx, active_result_rx) = ::std::sync::mpsc::channel();
+				let active_token = ::std::sync::Arc::clone(&token);
+				let active = ::std::thread::spawn(move || {
+					let result = active_token.with::<PreparedRaceDrop, _>(|_| {
+						let _ = active_entered_tx.send(());
+						active_release_rx.recv().is_ok()
+					}) == Some(true);
+					let _ = active_result_tx.send(result);
+				});
+				active_entered_rx
+					.recv_timeout(Self::TIMEOUT)
+					.expect("reader A owns the prepared value before wrapping returns");
+
+				let (queued_reached_tx, queued_reached_rx) = ::std::sync::mpsc::channel();
+				let (queued_release_tx, queued_release_rx) = ::std::sync::mpsc::channel();
+				*state
+					.value_lock_attempt
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner) =
+					Some(PreparedStateTestRendezvous {
+						reached: queued_reached_tx,
+						release: queued_release_rx,
+					});
+				let (queued_result_tx, queued_result_rx) = ::std::sync::mpsc::channel();
+				let queued_token = ::std::sync::Arc::clone(&token);
+				let queued_callbacks = ::std::sync::Arc::clone(&self.queued_callbacks);
+				let queued = ::std::thread::spawn(move || {
+					let accessed = queued_token
+						.with::<PreparedRaceDrop, _>(|_| {
+							queued_callbacks
+								.fetch_add(1, ::std::sync::atomic::Ordering::SeqCst);
+						})
+						.is_some();
+					let _ = queued_result_tx.send(accessed);
+				});
+				queued_reached_rx
+					.recv_timeout(Self::TIMEOUT)
+					.expect("reader B upgraded and attempted value while A owned it");
+
+				let (closing_release_tx, closing_release_rx) = ::std::sync::mpsc::channel();
+				let closing_tx = self
+					.closing_tx
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.take()
+					.expect("the publication fixture arms closing once");
+				*state
+					.after_closing
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner) =
+					Some(PreparedStateTestRendezvous {
+						reached: closing_tx,
+						release: closing_release_rx,
+					});
+
+				*self
+					.active_release
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner) = Some(active_release_tx);
+				*self
+					.queued_release
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner) = Some(queued_release_tx);
+				*self
+					.closing_release
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner) = Some(closing_release_tx);
+				*self
+					.active_result
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner) = Some(active_result_rx);
+				*self
+					.queued_result
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner) = Some(queued_result_rx);
+				self.workers
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.extend([active, queued]);
+				*self
+					.retained_token
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner) = Some(token);
+				self.placed_tx
+					.send(())
+					.expect("the test observes both publication readers");
+			}
+
+			fn wait_placed(&self) {
+				self.placed_rx
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.recv_timeout(Self::TIMEOUT)
+					.expect("the later wrapper placed active and queued readers");
+			}
+
+			fn wait_closing(&self) {
+				self.closing_rx
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.recv_timeout(Self::TIMEOUT)
+					.expect("the real lifecycle path published prepared closing");
+			}
+
+			fn release(slot: &::std::sync::Mutex<Option<::std::sync::mpsc::Sender<()>>>) {
+				if let Some(release) = slot
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.take()
+				{
+					let _ = release.send(());
+				}
+			}
+
+			fn release_queued(&self) {
+				Self::release(&self.queued_release);
+			}
+
+			fn release_active(&self) {
+				Self::release(&self.active_release);
+			}
+
+			fn release_closing(&self) {
+				Self::release(&self.closing_release);
+			}
+
+			fn release_all(&self) {
+				self.release_queued();
+				self.release_active();
+				self.release_closing();
+			}
+
+			fn collect_readers(&self) -> (bool, bool) {
+				let active = self
+					.active_result
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.take()
+					.expect("reader A retains its result")
+					.recv_timeout(Self::TIMEOUT)
+					.expect("reader A completes after release");
+				let queued = self
+					.queued_result
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.take()
+					.expect("reader B retains its result")
+					.recv_timeout(Self::TIMEOUT)
+					.expect("reader B completes after closing");
+				for worker in ::std::mem::take(
+					&mut *self
+						.workers
+						.lock()
+						.unwrap_or_else(::std::sync::PoisonError::into_inner),
+				) {
+					worker.join().expect("prepared publication reader does not panic");
+				}
+				(active, queued)
+			}
+
+			fn finish_readers(&self) {
+				let (active, queued) = self.collect_readers();
+				assert!(active, "reader A completes its finite admitted callback");
+				assert!(!queued, "reader B is rejected after closing publication");
+				assert_eq!(
+					self.queued_callbacks
+						.load(::std::sync::atomic::Ordering::SeqCst),
+					0
+				);
+			}
+
+			fn assert_closed(&self) {
+				let token = self
+					.retained_token
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner);
+				assert!(
+					token
+						.as_ref()
+						.expect("the fixture retains its weak token")
+						.with::<PreparedRaceDrop, _>(|_| ())
+						.is_none(),
+					"the retained token cannot access state after close"
+				);
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl Drop for PreparedPublicationControl {
+			fn drop(&mut self) {
+				if let Some(release) = self
+					.queued_release
+					.get_mut()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.take()
+				{
+					let _ = release.send(());
+				}
+				if let Some(release) = self
+					.active_release
+					.get_mut()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.take()
+				{
+					let _ = release.send(());
+				}
+				if let Some(release) = self
+					.closing_release
+					.get_mut()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.take()
+				{
+					let _ = release.send(());
+				}
+				for worker in ::std::mem::take(
+					self.workers
+						.get_mut()
+						.unwrap_or_else(::std::sync::PoisonError::into_inner),
+				) {
+					if let Err(payload) = worker.join() {
+						::std::mem::forget(payload);
+					}
+				}
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug)]
+		struct PreparedPublicationLayer {
+			inner: Option<Box<dyn $childer>>,
+			prepared: Option<PreparedChild>,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl ChildWrapperLayer for PreparedPublicationLayer {
+			fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+				ChildWrapperSlots::new(&mut self.inner)
+					.with_prepared::<PreparedRaceDrop>(&mut self.prepared)
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl $childer for PreparedPublicationLayer {
+			fn inner(&self) -> &dyn $childer {
+				self.inner
+					.as_deref()
+					.expect("the publication layer owns its child")
+			}
+
+			fn inner_mut(&mut self) -> &mut dyn $childer {
+				self.inner
+					.as_deref_mut()
+					.expect("the publication layer owns its child")
+			}
+
+			fn into_inner(mut self: Box<Self>) -> Box<dyn $childer> {
+				self.inner
+					.take()
+					.expect("the publication layer owns its child")
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug)]
+		struct PreparedPublicationProducer {
+			drops: ::std::sync::Arc<::std::sync::atomic::AtomicUsize>,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl CommandWrapper for PreparedPublicationProducer {
+			fn prepare_child(
+				&mut self,
+				_attempt: &mut SpawnAttempt,
+				_child: &mut dyn $childer,
+				_command: &Command,
+			) -> ::std::io::Result<Option<Box<dyn ::std::any::Any + Send>>> {
+				Ok(Some(Box::new(PreparedRaceDrop(::std::sync::Arc::clone(
+					&self.drops,
+				)))))
+			}
+
+			fn wrap_prepared_child(
+				&mut self,
+				_child: &mut dyn $childer,
+				prepared: Option<PreparedChildRef<'_>>,
+				_command: &Command,
+			) -> ::std::io::Result<Option<PendingChildWrapper>> {
+				assert!(prepared.as_ref().is_some_and(PreparedChildRef::is::<PreparedRaceDrop>));
+				Ok(Some(PendingChildWrapper::new(PreparedPublicationLayer {
+					inner: None,
+					prepared: None,
+				})))
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug)]
+		struct PreparedPublicationReaders {
+			start_once: bool,
+			control: ::std::sync::Arc<PreparedPublicationControl>,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl CommandWrapper for PreparedPublicationReaders {
+			fn wrap_prepared_child(
+				&mut self,
+				child: &mut dyn $childer,
+				prepared: Option<PreparedChildRef<'_>>,
+				_command: &Command,
+			) -> ::std::io::Result<Option<PendingChildWrapper>> {
+				assert!(prepared.is_none());
+				if self.start_once {
+					self.start_once = false;
+					let layer = (child as &mut dyn ::std::any::Any)
+						.downcast_mut::<PreparedPublicationLayer>()
+						.expect("the earlier publication layer is directly reachable");
+					let token = layer
+						.prepared
+						.take()
+						.expect("the earlier layer contains its installed weak token");
+					self.control.start(token);
+				}
+				Ok(None)
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug)]
+		struct PreparedPublicationFailure(bool);
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl CommandWrapper for PreparedPublicationFailure {
+			fn wrap_child(
+				&mut self,
+				_child: &mut dyn $childer,
+				_command: &Command,
+			) -> ::std::io::Result<Option<PendingChildWrapper>> {
+				if ::std::mem::take(&mut self.0) {
+					Err(::std::io::Error::other("later publication wrapping failed"))
+				} else {
+					Ok(None)
+				}
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug)]
+		struct PreparedPublicationChild;
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl $childer for PreparedPublicationChild {
+			fn inner(&self) -> &dyn $childer {
+				self
+			}
+			fn inner_mut(&mut self) -> &mut dyn $childer {
+				self
+			}
+			fn into_inner(self: Box<Self>) -> Box<dyn $childer> {
+				self
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug, Default)]
+		struct PreparedPublicationTransactionState {
+			commits: ::std::sync::atomic::AtomicUsize,
+			rollbacks: ::std::sync::atomic::AtomicUsize,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug)]
+		struct PreparedPublicationTransaction(
+			::std::sync::Arc<PreparedPublicationTransactionState>,
+		);
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl crate::SpawnTransaction for PreparedPublicationTransaction {
+			fn commit(&mut self) -> ::std::io::Result<()> {
+				self.0
+					.commits
+					.fetch_add(1, ::std::sync::atomic::Ordering::SeqCst);
+				Ok(())
+			}
+			fn rollback(&mut self) -> ::std::io::Result<()> {
+				self.0
+					.rollbacks
+					.fetch_add(1, ::std::sync::atomic::Ordering::SeqCst);
+				Ok(())
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug)]
+		struct PreparedPublicationProvider {
+			state: ::std::sync::Arc<PreparedPublicationTransactionState>,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl SpawnProvider for PreparedPublicationProvider {
+			fn spawn(
+				&self,
+				_attempt: &mut SpawnAttempt,
+				_command: &Command,
+			) -> ::std::io::Result<ProviderProduct> {
+				Ok(ProviderProduct::new(
+					Box::new(PreparedPublicationChild),
+					Box::new(PreparedPublicationTransaction(::std::sync::Arc::clone(
+						&self.state,
+					))),
+				))
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Debug)]
+		struct PreparedPublicationProviderWrapper(PreparedPublicationProvider);
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl CommandWrapper for PreparedPublicationProviderWrapper {
+			fn spawn_provider(&self) -> Option<&dyn SpawnProvider> {
+				Some(&self.0)
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		struct PreparedPublicationThreadCleanup {
+			control: ::std::sync::Arc<PreparedPublicationControl>,
+			workers: Vec<::std::thread::JoinHandle<()>>,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl PreparedPublicationThreadCleanup {
+			fn new(control: ::std::sync::Arc<PreparedPublicationControl>) -> Self {
+				Self {
+					control,
+					workers: Vec::new(),
+				}
+			}
+			fn push(&mut self, worker: ::std::thread::JoinHandle<()>) {
+				self.workers.push(worker);
+			}
+			fn finish(mut self) {
+				self.control.release_all();
+				for worker in ::std::mem::take(&mut self.workers) {
+					worker.join().expect("publication lifecycle worker does not panic");
+				}
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		impl Drop for PreparedPublicationThreadCleanup {
+			fn drop(&mut self) {
+				self.control.release_all();
+				for worker in ::std::mem::take(&mut self.workers) {
+					if let Err(payload) = worker.join() {
+						::std::mem::forget(payload);
+					}
+				}
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		fn prepared_publication_command(
+			provider: bool,
+			fail_later: bool,
+			control: ::std::sync::Arc<PreparedPublicationControl>,
+			drops: ::std::sync::Arc<::std::sync::atomic::AtomicUsize>,
+			transaction: ::std::sync::Arc<PreparedPublicationTransactionState>,
+		) -> Command {
+			let mut command = if provider {
+				Command::new("provider-owned-program")
+			} else {
+				Command::with_new("cmd.exe", |command| {
+					command.args(["/D", "/S", "/C", "exit /b 0"]);
+				})
+			};
+			if provider {
+				command.wrap(PreparedPublicationProviderWrapper(
+					PreparedPublicationProvider { state: transaction },
+				));
+			}
+			command
+				.wrap(PreparedPublicationProducer { drops })
+				.wrap(PreparedPublicationReaders {
+					start_once: true,
+					control,
+				});
+			if fail_later {
+				command.wrap(PreparedPublicationFailure(true));
+			}
+			command
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		fn run_prepared_publication_spawn(
+			mut command: Command,
+		) -> (Command, ::std::io::Result<Box<dyn $childer>>) {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("build prepared-publication runtime");
+			let _runtime_guard = runtime.enter();
+			let result = command.spawn();
+			(command, result)
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		fn assert_published_active_and_queued_readers_allow_spawn_return(provider: bool) {
+			let drops = ::std::sync::Arc::new(::std::sync::atomic::AtomicUsize::new(0));
+			let transaction = ::std::sync::Arc::new(PreparedPublicationTransactionState::default());
+			let control = PreparedPublicationControl::new();
+			let command = prepared_publication_command(
+				provider,
+				false,
+				::std::sync::Arc::clone(&control),
+				::std::sync::Arc::clone(&drops),
+				::std::sync::Arc::clone(&transaction),
+			);
+			let (spawned_tx, spawned_rx) = ::std::sync::mpsc::channel();
+			let mut cleanup = PreparedPublicationThreadCleanup::new(::std::sync::Arc::clone(
+				&control,
+			));
+			cleanup.push(::std::thread::spawn(move || {
+				let _ = spawned_tx.send(run_prepared_publication_spawn(command));
+			}));
+			control.wait_placed();
+
+			let first = spawned_rx.recv_timeout(::std::time::Duration::from_secs(2));
+			let returned_success_while_held = matches!(&first, Ok((_, Ok(_))));
+			if !returned_success_while_held {
+				control.release_all();
+				let outcome = match first {
+					Ok(outcome) => outcome,
+					Err(::std::sync::mpsc::RecvTimeoutError::Timeout) => spawned_rx
+						.recv_timeout(PreparedPublicationControl::TIMEOUT)
+						.expect("spawn returns after emergency publication-reader release"),
+					Err(::std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+						cleanup.finish();
+						panic!("the publication spawn worker disconnected")
+					}
+				};
+				let _ = control.collect_readers();
+				drop(outcome);
+				cleanup.finish();
+				panic!("public spawn did not return while active and queued readers remained held");
+			}
+
+			let (mut command, result) = first.expect("successful first publication outcome");
+			let child = result.expect("published readers cannot reject the successful spawn");
+			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 0);
+			let (closed_tx, closed_rx) = ::std::sync::mpsc::channel();
+			cleanup.push(::std::thread::spawn(move || {
+				drop(child);
+				let _ = closed_tx.send(());
+			}));
+			control.wait_closing();
+			assert_eq!(
+				closed_rx.try_recv(),
+				Err(::std::sync::mpsc::TryRecvError::Empty)
+			);
+			control.release_queued();
+			control.release_active();
+			control.finish_readers();
+			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 0);
+			control.release_closing();
+			closed_rx
+				.recv_timeout(PreparedPublicationControl::TIMEOUT)
+				.expect("returned-child close completes after reader release");
+			control.assert_closed();
+			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 1);
+
+			let (returned_command, reused) = run_prepared_publication_spawn(command);
+			command = returned_command;
+			drop(reused.expect("the command remains reusable"));
+			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 2);
+			if provider {
+				assert_eq!(transaction.commits.load(::std::sync::atomic::Ordering::SeqCst), 2);
+				assert_eq!(transaction.rollbacks.load(::std::sync::atomic::Ordering::SeqCst), 0);
+			}
+			drop(command);
+			cleanup.finish();
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		fn assert_later_failure_rejects_published_queued_reader(provider: bool) {
+			let drops = ::std::sync::Arc::new(::std::sync::atomic::AtomicUsize::new(0));
+			let transaction = ::std::sync::Arc::new(PreparedPublicationTransactionState::default());
+			let control = PreparedPublicationControl::new();
+			let command = prepared_publication_command(
+				provider,
+				true,
+				::std::sync::Arc::clone(&control),
+				::std::sync::Arc::clone(&drops),
+				::std::sync::Arc::clone(&transaction),
+			);
+			let (finished_tx, finished_rx) = ::std::sync::mpsc::channel();
+			let mut cleanup = PreparedPublicationThreadCleanup::new(::std::sync::Arc::clone(
+				&control,
+			));
+			cleanup.push(::std::thread::spawn(move || {
+				let _ = finished_tx.send(run_prepared_publication_spawn(command));
+			}));
+			control.wait_placed();
+			control.wait_closing();
+			let early = finished_rx.try_recv();
+			let remained_pending = matches!(
+				&early,
+				Err(::std::sync::mpsc::TryRecvError::Empty)
+			);
+			control.release_queued();
+			control.release_active();
+			control.finish_readers();
+			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 0);
+			control.release_closing();
+			let (mut command, result) = match early {
+				Ok(outcome) => outcome,
+				Err(::std::sync::mpsc::TryRecvError::Empty) => finished_rx
+					.recv_timeout(PreparedPublicationControl::TIMEOUT)
+					.expect("failure cleanup completes after reader release"),
+				Err(::std::sync::mpsc::TryRecvError::Disconnected) => {
+					cleanup.finish();
+					panic!("the publication spawn worker disconnected")
+				}
+			};
+			assert!(
+				remained_pending,
+				"failure cleanup returned while A owned the prepared value"
+			);
+			let error = result.expect_err("the later wrapping callback fails");
+			assert_eq!(error.to_string(), "later publication wrapping failed");
+			control.assert_closed();
+			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 1);
+			if provider {
+				assert_eq!(transaction.commits.load(::std::sync::atomic::Ordering::SeqCst), 0);
+				assert_eq!(transaction.rollbacks.load(::std::sync::atomic::Ordering::SeqCst), 1);
+			}
+
+			let (returned_command, reused) = run_prepared_publication_spawn(command);
+			command = returned_command;
+			drop(reused.expect("the command remains reusable"));
+			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 2);
+			if provider {
+				assert_eq!(transaction.commits.load(::std::sync::atomic::Ordering::SeqCst), 1);
+				assert_eq!(transaction.rollbacks.load(::std::sync::atomic::Ordering::SeqCst), 1);
+			}
+			drop(command);
+			cleanup.finish();
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn published_active_and_queued_readers_allow_native_and_provider_spawn_return() {
+			for provider in [false, true] {
+				assert_published_active_and_queued_readers_allow_spawn_return(provider);
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn later_failure_rejects_published_queued_reader_for_native_and_provider() {
+			for provider in [false, true] {
+				assert_later_failure_rejects_published_queued_reader(provider);
+			}
+		}
+
 		#[cfg(windows)]
 		struct PreparedChildSlot<'a> {
 			value: &'a mut Option<PreparedChild>,

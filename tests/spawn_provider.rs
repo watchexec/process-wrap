@@ -3123,21 +3123,30 @@ macro_rules! spawn_provider_tests {
 					entered
 						.recv_timeout(EXIT_TIMEOUT)
 						.expect("the later wrapper starts an admitted prepared reader");
-					let outcome = observe_spawn.recv_timeout(Duration::from_secs(2));
-					if outcome.is_err() {
-						let _ = reader.finish();
-					}
-					let (mut command, result) = outcome.unwrap_or_else(|_| {
-						observe_spawn
+					let first = observe_spawn.recv_timeout(Duration::from_secs(2));
+					let returned_success_while_held = matches!(&first, Ok((_, Ok(_))));
+					let reader_completed = reader.finish();
+					let outcome = match first {
+						Ok(outcome) => outcome,
+						Err(mpsc::RecvTimeoutError::Timeout) => observe_spawn
 							.recv_timeout(EXIT_TIMEOUT)
-							.expect("spawn returns after emergency reader release")
-					});
+							.expect("spawn returns after emergency reader release"),
+						Err(mpsc::RecvTimeoutError::Disconnected) => {
+							let _ = spawn_worker.join();
+							panic!("the spawn worker disconnected before reporting its result")
+						}
+					};
 					spawn_worker.join().expect("the spawn worker completes");
+					assert!(reader_completed, "the admitted prepared callback completes");
+					assert!(
+						returned_success_while_held,
+						"public spawn did not return successfully before the active reader was released"
+					);
+					let (mut command, result) = outcome;
 					let child = result.expect(
 						"a sanctioned prepared reader may remain active across completed wrapping",
 					);
 					assert_eq!(drops.load(Ordering::SeqCst), 0);
-					assert!(reader.finish(), "the admitted prepared callback completes");
 					drop(child);
 					assert_eq!(drops.load(Ordering::SeqCst), 1);
 
