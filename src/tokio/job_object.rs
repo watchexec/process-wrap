@@ -296,6 +296,8 @@ impl ChildWrapper for JobObjectChild {
 		let final_kill_on_drop = self.final_kill_on_drop;
 		self.with_job_port(|job_port| set_job_kill_on_drop(job_port.job, final_kill_on_drop))?;
 		self.spawn_finalized = true;
+		#[cfg(test)]
+		crate::windows::test_support::record_owner_event("owner-disarmed");
 		Ok(())
 	}
 
@@ -380,8 +382,11 @@ impl ChildWrapper for JobObjectChild {
 mod tests {
 	use std::{
 		os::windows::{io::BorrowedHandle, process::CommandExt},
-		panic::{AssertUnwindSafe, catch_unwind},
-		sync::{Arc, atomic::Ordering},
+		panic::{AssertUnwindSafe, catch_unwind, panic_any},
+		sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering},
+		},
 	};
 
 	use windows::Win32::System::Threading::CREATE_SUSPENDED;
@@ -389,9 +394,9 @@ mod tests {
 	use crate::tokio::{ProviderProduct, SpawnProvider};
 	use crate::windows::test_support::{
 		LifecycleState, OwnerError, OwnerFailure, OwnerPanic, PanickingCommittedTransaction,
-		ProcessGuard, TreePaths, arm_extra_prepared_owner, arm_owner_failure,
-		assert_tree_terminated, clear_extra_prepared_owners, clear_owner_failure,
-		observe_descendant, publish_process_guards,
+		ProcessGuard, TreePaths, arm_extra_prepared_owner, arm_owner_events, arm_owner_failure,
+		assert_tree_terminated, clear_extra_prepared_owners, clear_owner_events,
+		clear_owner_failure, observe_descendant, publish_process_guards, record_owner_event,
 	};
 
 	use super::*;
@@ -478,6 +483,78 @@ mod tests {
 				.lock()
 				.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(guard);
 			observe_descendant(&self.0.paths, &self.0.state)
+		}
+	}
+
+	#[derive(Debug)]
+	struct PostOwnerAccessorLayer {
+		inner: Option<Box<dyn ChildWrapper>>,
+		prepared: Option<PreparedChild>,
+		slot_calls: Arc<AtomicUsize>,
+		panic_on: usize,
+	}
+
+	impl ChildWrapperLayer for PostOwnerAccessorLayer {
+		fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+			let call = self.slot_calls.fetch_add(1, Ordering::SeqCst) + 1;
+			record_owner_event("slot-accessor");
+			if call == self.panic_on {
+				panic_any("slot accessor ran after final owner disarm");
+			}
+			ChildWrapperSlots::new(&mut self.inner).with_prepared::<()>(&mut self.prepared)
+		}
+	}
+
+	impl ChildWrapper for PostOwnerAccessorLayer {
+		fn inner(&self) -> &dyn ChildWrapper {
+			self.inner
+				.as_deref()
+				.expect("an installed accessor layer owns its child")
+		}
+
+		fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+			self.inner
+				.as_deref_mut()
+				.expect("an installed accessor layer owns its child")
+		}
+
+		fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+			self.inner
+				.take()
+				.expect("an installed accessor layer owns its child")
+		}
+	}
+
+	#[derive(Debug)]
+	struct PostOwnerAccessor {
+		slot_calls: Arc<AtomicUsize>,
+		panic_on: usize,
+	}
+
+	impl CommandWrapper for PostOwnerAccessor {
+		fn prepare_child(
+			&mut self,
+			_attempt: &mut SpawnAttempt,
+			_child: &mut dyn ChildWrapper,
+			_command: &CommandWrap,
+		) -> Result<Option<Box<dyn Any + Send>>> {
+			self.slot_calls.store(0, Ordering::SeqCst);
+			Ok(Some(Box::new(())))
+		}
+
+		fn wrap_prepared_child(
+			&mut self,
+			_child: &mut dyn ChildWrapper,
+			prepared: Option<PreparedChildRef<'_>>,
+			_command: &CommandWrap,
+		) -> Result<Option<PendingChildWrapper>> {
+			assert!(prepared.as_ref().is_some_and(PreparedChildRef::is::<()>));
+			Ok(Some(PendingChildWrapper::new(PostOwnerAccessorLayer {
+				inner: None,
+				prepared: None,
+				slot_calls: Arc::clone(&self.slot_calls),
+				panic_on: self.panic_on,
+			})))
 		}
 	}
 
@@ -594,6 +671,71 @@ mod tests {
 				state.rollbacks.load(Ordering::SeqCst),
 				usize::from(provider)
 			);
+		}
+		Ok(())
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn no_slot_accessor_runs_after_final_owner_disarm() -> Result<()> {
+		for provider in [false, true] {
+			let directory = tempfile::tempdir()?;
+			let paths = TreePaths::new(directory.path());
+			let state = Arc::new(LifecycleState::default());
+			let slot_calls = Arc::new(AtomicUsize::new(0));
+			let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+			let mut command = topology_command(provider, &paths, &state)?;
+			command.wrap(PostOwnerAccessor {
+				slot_calls: Arc::clone(&slot_calls),
+				panic_on: if provider { 4 } else { 3 },
+			});
+
+			for attempt in 0..2 {
+				events
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner)
+					.clear();
+				arm_owner_events(Arc::clone(&events));
+				let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
+				let mut succeeded = false;
+				match outcome {
+					Ok(Ok(mut child)) => {
+						child.start_kill()?;
+						let _ = child.wait().await?;
+						let disposal = catch_unwind(AssertUnwindSafe(|| drop(child)));
+						if provider {
+							let payload = disposal
+								.expect_err("the provider fixture residue panics on disposal");
+							std::mem::forget(payload);
+						} else {
+							disposal.expect("native child disposal does not panic");
+						}
+						succeeded = true;
+					}
+					Ok(Err(_)) => {}
+					Err(payload) => std::mem::forget(payload),
+				}
+				assert!(
+					clear_owner_events(),
+					"the owner event barrier remained armed"
+				);
+				let tree_result = assert_tree_terminated(&paths, &state);
+				assert!(
+					succeeded,
+					"a post-owner-only accessor panic must remain unreachable"
+				);
+				assert_eq!(slot_calls.load(Ordering::SeqCst), 1);
+				assert_eq!(
+					*events
+						.lock()
+						.unwrap_or_else(std::sync::PoisonError::into_inner),
+					["slot-accessor", "owner-disarmed"],
+					"the final owner transition follows the last caller-defined accessor"
+				);
+				tree_result?;
+				if attempt == 0 {
+					std::fs::remove_file(&paths.descendant_pid)?;
+				}
+			}
 		}
 		Ok(())
 	}

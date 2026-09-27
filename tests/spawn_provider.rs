@@ -568,13 +568,13 @@ macro_rules! spawn_provider_tests {
 
 			#[cfg(windows)]
 			#[derive(Debug)]
-			struct StealInstalledPrepared {
+			struct RetainInstalledPrepared {
 				steal_once: bool,
 				escaped: Option<PreparedChild>,
 			}
 
 			#[cfg(windows)]
-			impl CommandWrapper for StealInstalledPrepared {
+			impl CommandWrapper for RetainInstalledPrepared {
 				fn wrap_prepared_child(
 					&mut self,
 					child: &mut dyn ChildWrapper,
@@ -591,6 +591,91 @@ macro_rules! spawn_provider_tests {
 						assert!(self.escaped.is_some());
 					}
 					Ok(None)
+				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct AlternatingPreparedLayer {
+				inner: Option<Box<dyn ChildWrapper>>,
+				first: Option<PreparedChild>,
+				second: Option<PreparedChild>,
+				slot_calls: Arc<AtomicUsize>,
+			}
+
+			#[cfg(windows)]
+			impl ChildWrapperLayer for AlternatingPreparedLayer {
+				fn child_wrapper_slots(&mut self) -> ChildWrapperSlots<'_> {
+					let call = self.slot_calls.fetch_add(1, Ordering::SeqCst);
+					let prepared = if call == 0 {
+						&mut self.first
+					} else {
+						if self.second.is_none() {
+							self.second = self.first.take();
+						}
+						&mut self.second
+					};
+					ChildWrapperSlots::new(&mut self.inner)
+						.with_prepared::<PreparedGuard>(prepared)
+				}
+			}
+
+			#[cfg(windows)]
+			impl ChildWrapper for AlternatingPreparedLayer {
+				fn inner(&self) -> &dyn ChildWrapper {
+					self.inner
+						.as_deref()
+						.expect("an installed alternating layer owns its child")
+				}
+
+				fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+					self.inner
+						.as_deref_mut()
+						.expect("an installed alternating layer owns its child")
+				}
+
+				fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+					self.inner
+						.take()
+						.expect("an installed alternating layer owns its child")
+				}
+			}
+
+			#[cfg(windows)]
+			#[derive(Debug)]
+			struct AlternatingPrepared {
+				drops: Arc<AtomicUsize>,
+				slot_calls: Arc<AtomicUsize>,
+			}
+
+			#[cfg(windows)]
+			impl CommandWrapper for AlternatingPrepared {
+				fn prepare_child(
+					&mut self,
+					_attempt: &mut SpawnAttempt,
+					_child: &mut dyn ChildWrapper,
+					_command: &CommandWrap,
+				) -> io::Result<Option<Box<dyn std::any::Any + Send>>> {
+					Ok(Some(Box::new(PreparedGuard(Arc::clone(&self.drops)))))
+				}
+
+				fn wrap_prepared_child(
+					&mut self,
+					_child: &mut dyn ChildWrapper,
+					prepared: Option<PreparedChildRef<'_>>,
+					_command: &CommandWrap,
+				) -> io::Result<Option<PendingChildWrapper>> {
+					assert!(
+						prepared
+							.as_ref()
+							.is_some_and(PreparedChildRef::is::<PreparedGuard>)
+					);
+					Ok(Some(PendingChildWrapper::new(AlternatingPreparedLayer {
+						inner: None,
+						first: None,
+						second: None,
+						slot_calls: Arc::clone(&self.slot_calls),
+					})))
 				}
 			}
 
@@ -2163,42 +2248,75 @@ macro_rules! spawn_provider_tests {
 
 			#[cfg(windows)]
 			#[test]
-			fn installed_prepared_owner_must_remain_in_its_declared_layer() {
+			fn retained_installed_token_cannot_extend_prepared_state_liveness() {
 				let runtime = runtime();
 				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
-				let shared = Arc::new(Shared::default());
-				let drops = Arc::new(AtomicUsize::new(0));
-				let mut command = provider_command(Arc::clone(&shared), "provider");
-				command
-					.wrap(OptionPrepared {
+				for provider in [false, true] {
+					let shared = Arc::new(Shared::default());
+					let drops = Arc::new(AtomicUsize::new(0));
+					let mut command = if provider {
+						provider_command(Arc::clone(&shared), "provider")
+					} else {
+						command()
+					};
+					command
+						.wrap(OptionPrepared {
+							drops: Arc::clone(&drops),
+						})
+						.wrap(RetainInstalledPrepared {
+							steal_once: true,
+							escaped: None,
+						});
+
+					let child = command
+						.spawn()
+						.expect("a retained installed token is non-owning");
+					assert_eq!(drops.load(Ordering::SeqCst), 0);
+					drop(child);
+					assert_eq!(drops.load(Ordering::SeqCst), 1);
+					if provider {
+						assert_eq!(shared.events(), successful_events("provider"));
+						shared.clear_events();
+					}
+
+					let child = command.spawn().expect("the command remains reusable");
+					drop(child);
+					assert_eq!(drops.load(Ordering::SeqCst), 2);
+					if provider {
+						assert_eq!(shared.events(), successful_events("provider"));
+					}
+				}
+			}
+
+			#[cfg(windows)]
+			#[test]
+			fn prepared_slot_accessors_are_not_reinvoked_after_installation() {
+				let runtime = runtime();
+				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+				for provider in [false, true] {
+					let shared = Arc::new(Shared::default());
+					let drops = Arc::new(AtomicUsize::new(0));
+					let slot_calls = Arc::new(AtomicUsize::new(0));
+					let mut command = if provider {
+						provider_command(Arc::clone(&shared), "provider")
+					} else {
+						command()
+					};
+					command.wrap(AlternatingPrepared {
 						drops: Arc::clone(&drops),
-					})
-					.wrap(StealInstalledPrepared {
-						steal_once: true,
-						escaped: None,
+						slot_calls: Arc::clone(&slot_calls),
 					});
 
-				let error = command
-					.spawn()
-					.expect_err("moving the installed owner out of its layer must fail");
-				assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-				assert_eq!(
-					error.to_string(),
-					"prepared child state has an unexpected custody topology"
-				);
-				assert_eq!(drops.load(Ordering::SeqCst), 1);
-				let events = shared.events();
-				assert!(!events.contains(&Event::Commit));
-				assert_eq!(
-					events.iter().filter(|event| **event == Event::Rollback).count(),
-					1
-				);
-
-				shared.clear_events();
-				let child = command.spawn().expect("the command remains reusable");
-				drop(child);
-				assert_eq!(drops.load(Ordering::SeqCst), 2);
-				assert_eq!(shared.events(), successful_events("provider"));
+					let child = command.spawn().expect("spawn with an alternating slot layer");
+					assert_eq!(
+						slot_calls.load(Ordering::SeqCst),
+						1,
+						"the slot accessor is used only for initial installation"
+					);
+					assert_eq!(drops.load(Ordering::SeqCst), 0);
+					drop(child);
+					assert_eq!(drops.load(Ordering::SeqCst), 1);
+				}
 			}
 
 			#[cfg(windows)]

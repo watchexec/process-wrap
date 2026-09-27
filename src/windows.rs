@@ -196,6 +196,7 @@ pub(crate) mod test_support {
 
 	thread_local! {
 		static OWNER_FAILURE: RefCell<Option<OwnerFailure>> = const { RefCell::new(None) };
+		static OWNER_EVENTS: RefCell<Option<Arc<Mutex<Vec<&'static str>>>>> = const { RefCell::new(None) };
 		static EXTRA_PREPARED_OWNER: RefCell<ExtraPreparedOwner> = RefCell::new(ExtraPreparedOwner::default());
 	}
 
@@ -248,6 +249,27 @@ pub(crate) mod test_support {
 
 	pub fn clear_owner_failure() -> bool {
 		OWNER_FAILURE.with(|slot| slot.borrow_mut().take().is_some())
+	}
+
+	pub fn arm_owner_events(events: Arc<Mutex<Vec<&'static str>>>) {
+		OWNER_EVENTS.with(|slot| {
+			assert!(slot.borrow_mut().replace(events).is_none());
+		});
+	}
+
+	pub fn record_owner_event(event: &'static str) {
+		OWNER_EVENTS.with(|slot| {
+			if let Some(events) = slot.borrow().as_ref() {
+				events
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner)
+					.push(event);
+			}
+		});
+	}
+
+	pub fn clear_owner_events() -> bool {
+		OWNER_EVENTS.with(|slot| slot.borrow_mut().take().is_some())
 	}
 
 	#[derive(Debug)]
