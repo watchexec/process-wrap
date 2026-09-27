@@ -1,3 +1,4 @@
+#[cfg(any(feature = "std", feature = "tokio1"))]
 macro_rules! wrapper_lookup_tests {
 	($module:ident, $command_wrap:path, $command_wrapper:path) => {
 		mod $module {
