@@ -771,7 +771,7 @@ const _: () = {
 	assert_sync::<dyn ChildWrapper>();
 };
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, windows, feature = "job-object"))]
 mod prepared_output_wait_tests {
 	use std::{
 		future::Future,

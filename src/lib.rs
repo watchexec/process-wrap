@@ -649,6 +649,7 @@ pub(crate) mod test_allocator {
 	}
 
 	impl PostTransitionProbe {
+		#[cfg(feature = "job-object")]
 		pub(crate) fn arm(&self) {
 			assert!(!self.active.swap(true, Ordering::SeqCst));
 			self.transitioned.store(false, Ordering::SeqCst);
@@ -668,6 +669,7 @@ pub(crate) mod test_allocator {
 			}
 		}
 
+		#[cfg(feature = "job-object")]
 		pub(crate) fn finish(&self) -> (bool, bool, bool) {
 			self.active.store(false, Ordering::SeqCst);
 			(
@@ -678,12 +680,14 @@ pub(crate) mod test_allocator {
 		}
 	}
 
+	#[cfg(feature = "job-object")]
 	#[derive(Default)]
 	pub(crate) struct SpawnCleanupHandleProbe {
 		active: AtomicBool,
 		closes: std::sync::atomic::AtomicUsize,
 	}
 
+	#[cfg(feature = "job-object")]
 	impl SpawnCleanupHandleProbe {
 		pub(crate) fn arm(&self) {
 			assert!(!self.active.swap(true, Ordering::SeqCst));
@@ -708,6 +712,7 @@ pub(crate) mod test_allocator {
 
 	thread_local! {
 		static POST_TRANSITION_PROBE: Cell<Option<&'static PostTransitionProbe>> = const { Cell::new(None) };
+		#[cfg(feature = "job-object")]
 		static SPAWN_CLEANUP_HANDLE_PROBE: Cell<Option<&'static SpawnCleanupHandleProbe>> = const { Cell::new(None) };
 	}
 
@@ -720,6 +725,7 @@ pub(crate) mod test_allocator {
 		probe
 	}
 
+	#[cfg(feature = "job-object")]
 	pub(crate) fn current_spawn_cleanup_handle_probe() -> &'static SpawnCleanupHandleProbe {
 		if let Some(probe) = SPAWN_CLEANUP_HANDLE_PROBE.get() {
 			return probe;
@@ -729,6 +735,7 @@ pub(crate) mod test_allocator {
 		probe
 	}
 
+	#[cfg(feature = "job-object")]
 	pub(crate) fn observe_spawn_cleanup_handle_close() {
 		let _ = SPAWN_CLEANUP_HANDLE_PROBE.try_with(|slot| {
 			if let Some(probe) = slot.get() {

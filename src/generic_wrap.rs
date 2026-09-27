@@ -398,11 +398,11 @@ macro_rules! Wrap {
 			}
 		}
 
-		#[cfg(all(test, windows))]
+		#[cfg(all(test, windows, feature = "job-object"))]
 		#[derive(Debug)]
 		struct PreparedRaceDrop(::std::sync::Arc<::std::sync::atomic::AtomicUsize>);
 
-		#[cfg(all(test, windows))]
+		#[cfg(all(test, windows, feature = "job-object"))]
 		impl Drop for PreparedRaceDrop {
 			fn drop(&mut self) {
 				self.0
@@ -410,13 +410,13 @@ macro_rules! Wrap {
 			}
 		}
 
-		#[cfg(all(test, windows))]
+		#[cfg(all(test, windows, feature = "job-object"))]
 		struct PreparedRaceCleanup {
 			releases: Vec<::std::sync::mpsc::Sender<()>>,
 			workers: Vec<::std::thread::JoinHandle<()>>,
 		}
 
-		#[cfg(all(test, windows))]
+		#[cfg(all(test, windows, feature = "job-object"))]
 		impl PreparedRaceCleanup {
 			fn new() -> Self {
 				Self {
@@ -449,7 +449,7 @@ macro_rules! Wrap {
 			}
 		}
 
-		#[cfg(all(test, windows))]
+		#[cfg(all(test, windows, feature = "job-object"))]
 		impl Drop for PreparedRaceCleanup {
 			fn drop(&mut self) {
 				self.release_all();
@@ -767,7 +767,7 @@ macro_rules! Wrap {
 						}
 						prepared.installed_layer = Some(installed_layer);
 						*slot.value = Some(prepared.installed_token());
-						#[cfg(test)]
+						#[cfg(all(test, feature = "job-object"))]
 						if crate::windows::test_support::take_extra_prepared_owner_injection() {
 							crate::windows::test_support::retain_extra_prepared_owner(Box::new(
 								::std::sync::Arc::clone(&prepared.state),

@@ -708,7 +708,7 @@ impl Drop for WindowsSpawnCleanup {
 			let _ = terminate_process_and_wait(process.as_handle());
 		}
 		drop(self.process.take());
-		#[cfg(test)]
+		#[cfg(all(test, feature = "job-object"))]
 		crate::test_allocator::observe_spawn_cleanup_handle_close();
 	}
 }
