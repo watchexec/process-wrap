@@ -643,12 +643,12 @@ fn closed() -> io::Error {
 mod tests {
 	use std::os::fd::RawFd;
 
-	use nix::unistd::pipe;
+	use nix::unistd::pipe2;
 
 	use super::*;
 
 	fn pipe_pair() -> (OwnedFd, OwnedFd) {
-		let (reader, writer) = pipe().unwrap();
+		let (reader, writer) = pipe2(OFlag::O_CLOEXEC).unwrap();
 		set_nonblocking(&reader).unwrap();
 		(reader, writer)
 	}
@@ -659,6 +659,26 @@ mod tests {
 	}
 
 	fn assert_closed(reader: &OwnedFd) {
+		let mut descriptor = libc::pollfd {
+			fd: reader.as_raw_fd(),
+			events: libc::POLLIN,
+			revents: 0,
+		};
+		loop {
+			// SAFETY: `descriptor` is initialized for one live descriptor and remains valid for the call.
+			let ready = unsafe { libc::poll(&mut descriptor, 1, 5_000) };
+			if ready > 0 {
+				break;
+			}
+			if ready == 0 {
+				panic!("pipe reader timed out waiting for writer closure");
+			}
+			let error = io::Error::last_os_error();
+			if error.kind() != io::ErrorKind::Interrupted {
+				panic!("pipe reader failed while waiting for writer closure: {error}");
+			}
+		}
+
 		let mut byte = 0_u8;
 		// SAFETY: reader is a live nonblocking pipe descriptor and byte is writable for one byte.
 		let read =
@@ -723,6 +743,17 @@ mod tests {
 		if child.try_wait().unwrap().is_none() {
 			child.start_kill().expect("terminate transaction child");
 			child.wait().await.expect("reap transaction child");
+		}
+	}
+
+	#[test]
+	fn pipe_fixture_descriptors_are_close_on_exec() {
+		let (reader, writer) = pipe_pair();
+		for descriptor in [&reader, &writer] {
+			let flags = FdFlag::from_bits_truncate(
+				fcntl(descriptor, FcntlArg::F_GETFD).expect("read pipe descriptor flags"),
+			);
+			assert!(flags.contains(FdFlag::FD_CLOEXEC));
 		}
 	}
 
