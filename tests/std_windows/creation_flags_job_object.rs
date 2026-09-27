@@ -3,7 +3,7 @@ use std::{
 	io::{Error, ErrorKind},
 	os::windows::process::CommandExt,
 	panic::{AssertUnwindSafe, catch_unwind},
-	path::PathBuf,
+	path::{Path, PathBuf},
 	process::{Command as StdCommand, ExitStatus, Stdio},
 	sync::{
 		Arc, Mutex,
@@ -36,6 +36,8 @@ const DESCENDANT_PID_FILE: &str = "PROCESS_WRAP_DESCENDANT_PID_FILE";
 const FINAL_OWNER_TRACE_HELPER: &str = "PROCESS_WRAP_FINAL_OWNER_TRACE_HELPER";
 #[cfg(feature = "tracing")]
 const FINAL_OWNER_TRACE_STALL_HELPER: &str = "PROCESS_WRAP_FINAL_OWNER_TRACE_STALL_HELPER";
+#[cfg(feature = "tracing")]
+const FINAL_OWNER_TRACE_READY: &str = "PROCESS_WRAP_FINAL_OWNER_TRACE_READY";
 static PID_FILE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
@@ -599,9 +601,25 @@ fn armed_job_kills_descendants_after_later_failures() -> Result<()> {
 }
 
 #[cfg(feature = "tracing")]
+fn wait_for_final_owner_trace_readiness(path: &Path) -> Result<()> {
+	let deadline = Instant::now() + EXIT_TIMEOUT;
+	while !path.exists() {
+		if Instant::now() >= deadline {
+			return Err(Error::new(
+				ErrorKind::TimedOut,
+				"the final-owner tracing helper did not enter its stall branch",
+			));
+		}
+		std::thread::sleep(Duration::from_millis(5));
+	}
+	Ok(())
+}
+
+#[cfg(feature = "tracing")]
 fn run_final_owner_trace_helper(
 	environment: (&str, &str),
 	timeout: Duration,
+	readiness: Option<&Path>,
 ) -> Result<(std::process::Output, bool)> {
 	let mut command = StdCommand::new(std::env::current_exe()?);
 	command
@@ -611,14 +629,26 @@ fn run_final_owner_trace_helper(
 			"--nocapture",
 		])
 		.env(environment.0, environment.1);
-	bounded_process::run(command, timeout, None)
+	if let Some(readiness) = readiness {
+		command.env(FINAL_OWNER_TRACE_READY, readiness);
+		bounded_process::run_after_start(command, timeout, None, || {
+			wait_for_final_owner_trace_readiness(readiness)
+		})
+	} else {
+		bounded_process::run(command, timeout, None)
+	}
 }
 
 #[cfg(feature = "tracing")]
 #[test]
 fn final_owner_tracing_watchdog_terminates_a_stalled_helper() -> Result<()> {
-	let (output, timed_out) =
-		run_final_owner_trace_helper((FINAL_OWNER_TRACE_STALL_HELPER, "1"), Duration::ZERO)?;
+	let directory = tempfile::tempdir()?;
+	let readiness = directory.path().join("stall-ready");
+	let (output, timed_out) = run_final_owner_trace_helper(
+		(FINAL_OWNER_TRACE_STALL_HELPER, "1"),
+		Duration::ZERO,
+		Some(&readiness),
+	)?;
 	assert!(
 		timed_out,
 		"the zero-deadline watchdog must take its timeout path"
@@ -634,12 +664,17 @@ fn final_owner_tracing_watchdog_terminates_a_stalled_helper() -> Result<()> {
 #[test]
 fn final_owner_tracing_panic_leaves_job_cleanup_armed() -> Result<()> {
 	if std::env::var_os(FINAL_OWNER_TRACE_STALL_HELPER).is_some() {
+		let readiness = PathBuf::from(
+			std::env::var_os(FINAL_OWNER_TRACE_READY)
+				.ok_or_else(|| Error::other("the stall readiness path is missing"))?,
+		);
+		fs::write(readiness, b"ready")?;
 		std::thread::sleep(Duration::from_secs(30));
 		return Ok(());
 	}
 	if std::env::var_os(FINAL_OWNER_TRACE_HELPER).is_none() {
 		let (output, timed_out) =
-			run_final_owner_trace_helper((FINAL_OWNER_TRACE_HELPER, "1"), EXIT_TIMEOUT)?;
+			run_final_owner_trace_helper((FINAL_OWNER_TRACE_HELPER, "1"), EXIT_TIMEOUT, None)?;
 		assert!(
 			!timed_out,
 			"the isolated tracing regression exceeded its deadline"

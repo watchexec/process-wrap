@@ -196,16 +196,19 @@ fn preserve_after_cleanup(
 }
 
 pub(crate) fn run(
-	mut command: std::process::Command,
+	command: std::process::Command,
 	timeout: Duration,
 	reader_failure: Option<ReaderStartFailure>,
 ) -> io::Result<(Output, bool)> {
-	let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-		io::Error::new(
-			io::ErrorKind::InvalidInput,
-			"subprocess timeout is too large",
-		)
-	})?;
+	run_after_start(command, timeout, reader_failure, || Ok(()))
+}
+
+pub(crate) fn run_after_start(
+	mut command: std::process::Command,
+	timeout: Duration,
+	reader_failure: Option<ReaderStartFailure>,
+	ready: impl FnOnce() -> io::Result<()>,
+) -> io::Result<(Output, bool)> {
 	let spawned = command
 		.stdout(Stdio::piped())
 		.stderr(Stdio::piped())
@@ -238,6 +241,29 @@ pub(crate) fn run(
 				Some(stdout),
 				None,
 				error,
+			));
+		}
+	};
+
+	if let Err(error) = ready() {
+		return Err(preserve_after_cleanup(
+			&mut child,
+			Some(stdout),
+			Some(stderr),
+			error,
+		));
+	}
+	let deadline = match Instant::now().checked_add(timeout) {
+		Some(deadline) => deadline,
+		None => {
+			return Err(preserve_after_cleanup(
+				&mut child,
+				Some(stdout),
+				Some(stderr),
+				io::Error::new(
+					io::ErrorKind::InvalidInput,
+					"subprocess timeout is too large",
+				),
 			));
 		}
 	};
