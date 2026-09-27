@@ -641,7 +641,10 @@ fn closed() -> io::Error {
 
 #[cfg(test)]
 mod tests {
-	use std::os::fd::RawFd;
+	use std::{
+		os::fd::RawFd,
+		time::{Duration, Instant},
+	};
 
 	#[cfg(not(target_os = "macos"))]
 	use nix::unistd::pipe2;
@@ -662,26 +665,59 @@ mod tests {
 		assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
 	}
 
+	fn wait_for_descriptor_readiness(
+		timeout: Duration,
+		mut now: impl FnMut() -> Instant,
+		mut poll: impl FnMut(i32) -> io::Result<bool>,
+	) -> io::Result<()> {
+		let deadline = now().checked_add(timeout).ok_or_else(|| {
+			io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"descriptor wait deadline overflowed",
+			)
+		})?;
+		loop {
+			let remaining = deadline
+				.checked_duration_since(now())
+				.filter(|remaining| !remaining.is_zero())
+				.ok_or_else(|| {
+					io::Error::new(
+						io::ErrorKind::TimedOut,
+						"timed out waiting for writer closure",
+					)
+				})?;
+			let timeout_millis = remaining
+				.as_nanos()
+				.div_ceil(1_000_000)
+				.min(i32::MAX as u128);
+			let timeout_millis = i32::try_from(timeout_millis).map_err(io::Error::other)?;
+			match poll(timeout_millis) {
+				Ok(true) => return Ok(()),
+				Ok(false) => {}
+				Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+				Err(error) => return Err(error),
+			}
+		}
+	}
+
 	fn assert_closed(reader: &OwnedFd) {
 		let mut descriptor = libc::pollfd {
 			fd: reader.as_raw_fd(),
 			events: libc::POLLIN,
 			revents: 0,
 		};
-		loop {
+		wait_for_descriptor_readiness(Duration::from_secs(5), Instant::now, |timeout| {
 			// SAFETY: `descriptor` is initialized for one live descriptor and remains valid for the call.
-			let ready = unsafe { libc::poll(&mut descriptor, 1, 5_000) };
-			if ready > 0 {
-				break;
+			let ready = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+			if ready == -1 {
+				Err(io::Error::last_os_error())
+			} else {
+				Ok(ready > 0)
 			}
-			if ready == 0 {
-				panic!("descriptor reader timed out waiting for writer closure");
-			}
-			let error = io::Error::last_os_error();
-			if error.kind() != io::ErrorKind::Interrupted {
-				panic!("descriptor reader failed while waiting for writer closure: {error}");
-			}
-		}
+		})
+		.unwrap_or_else(|error| {
+			panic!("descriptor reader failed while waiting for writer closure: {error}")
+		});
 
 		let mut byte = [0_u8];
 		match read(reader, &mut byte) {
@@ -756,6 +792,66 @@ mod tests {
 			);
 			assert!(flags.contains(FdFlag::FD_CLOEXEC));
 		}
+	}
+
+	#[test]
+	fn interrupted_descriptor_wait_reuses_one_total_deadline() {
+		let start = Instant::now();
+		let mut times = [
+			start,
+			start + Duration::from_secs(1),
+			start + Duration::from_secs(3),
+			start + Duration::from_micros(4_999_500),
+		]
+		.into_iter();
+		let mut outcomes = [
+			Err(io::Error::from(io::ErrorKind::Interrupted)),
+			Err(io::Error::from(io::ErrorKind::Interrupted)),
+			Ok(true),
+		]
+		.into_iter();
+		let mut timeouts = Vec::new();
+
+		wait_for_descriptor_readiness(
+			Duration::from_secs(5),
+			|| times.next().expect("the clock has a value for every check"),
+			|timeout| {
+				timeouts.push(timeout);
+				outcomes.next().expect("the poll model has an outcome")
+			},
+		)
+		.expect("readiness arrives before the total deadline");
+
+		assert_eq!(timeouts, [4_000, 2_000, 1]);
+	}
+
+	#[test]
+	fn interrupted_descriptor_wait_expires_before_another_poll() {
+		let start = Instant::now();
+		let mut times = [
+			start,
+			start + Duration::from_secs(4),
+			start + Duration::from_secs(5),
+		]
+		.into_iter();
+		let mut polls = 0;
+
+		let error = wait_for_descriptor_readiness(
+			Duration::from_secs(5),
+			|| times.next().expect("the clock has a value for every check"),
+			|_| {
+				polls += 1;
+				if polls == 1 {
+					Err(io::Error::from(io::ErrorKind::Interrupted))
+				} else {
+					panic!("poll was called after the total deadline")
+				}
+			},
+		)
+		.expect_err("the interrupted wait reaches its total deadline");
+
+		assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+		assert_eq!(polls, 1);
 	}
 
 	#[test]
