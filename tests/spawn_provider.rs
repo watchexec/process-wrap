@@ -2457,49 +2457,82 @@ macro_rules! spawn_provider_tests {
 
 			#[cfg(feature = "tracing")]
 			#[test]
+			#[cfg_attr(miri, ignore = "requires a native child process")]
 			fn lifecycle_event_panics_roll_back_exactly_once_and_allow_reuse() {
 				let _tracing_guard = super::lifecycle_tracing::serial();
+				const CHILD_ENV: &str = "PROCESS_WRAP_PROVIDER_TRACE_IDENTITY";
+				let module = stringify!($module);
+				let selected = std::env::var(CHILD_ENV).ok();
+				if selected.as_deref().is_none_or(|value| !value.starts_with(module)) {
+					for event in ["post_spawn", "wrap_child"] {
+						let child_value = format!("{module}:{event}");
+						let (output, timed_out) = bounded_test_process(
+							concat!(
+								stringify!($module),
+								"::lifecycle_event_panics_roll_back_exactly_once_and_allow_reuse"
+							),
+							(CHILD_ENV, &child_value),
+							EXIT_TIMEOUT,
+						);
+						assert!(!timed_out, "lifecycle tracing identity exceeded its deadline");
+						assert!(
+							output.status.success(),
+							"{event} tracing identity was not preserved:\nstdout:\n{}\nstderr:\n{}",
+							String::from_utf8_lossy(&output.stdout),
+							String::from_utf8_lossy(&output.stderr),
+						);
+					}
+					return;
+				}
+
+				let event = if selected
+					.as_deref()
+					.expect("the subprocess selects a lifecycle event")
+					.ends_with(":post_spawn")
+				{
+					"post_spawn"
+				} else {
+					"wrap_child"
+				};
 				let runtime = runtime();
 				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
-				for event in ["post_spawn", "wrap_child"] {
-					let shared = Arc::new(Shared::default());
-					let identity = Arc::new(());
-					let dispatch = super::lifecycle_tracing::PanicOnLifecycleEvent::dispatch(
-						event,
-						1,
-						Arc::clone(&identity),
-					);
-					let mut command = provider_command(Arc::clone(&shared), "provider");
+				let shared = Arc::new(Shared::default());
+				let identity = Arc::new(());
+				let dispatch = super::lifecycle_tracing::PanicOnLifecycleEvent::dispatch(
+					event,
+					1,
+					Arc::clone(&identity),
+				);
+				let mut command = provider_command(Arc::clone(&shared), "provider");
 
-					let outcome = catch_unwind(AssertUnwindSafe(|| {
-						super::lifecycle_tracing::with_dispatch(&dispatch, || command.spawn())
-					}));
-					let payload = match outcome {
-						Err(payload) => payload,
-						Ok(result) => {
-							panic!("the {event} lifecycle event must resume its panic: {result:?}")
-						}
-					};
-					let payload = payload
-						.downcast::<super::lifecycle_tracing::LifecyclePanic>()
-						.expect("the exact typed subscriber payload is preserved");
-					assert!(Arc::ptr_eq(&payload.0, &identity));
-					assert_eq!(
-						shared
-							.events()
-							.iter()
-							.filter(|candidate| **candidate == Event::Rollback)
-							.count(),
-						1,
-						"the armed transaction rolls back exactly once"
-					);
+				let outcome = catch_unwind(AssertUnwindSafe(|| {
+					super::lifecycle_tracing::with_dispatch(&dispatch, || command.spawn())
+				}));
+				let payload = match outcome {
+					Err(payload) => payload,
+					Ok(result) => {
+						panic!("the {event} lifecycle event must resume its panic: {result:?}")
+					}
+				};
+				let payload = payload
+					.downcast::<super::lifecycle_tracing::LifecyclePanic>()
+					.expect("the exact typed subscriber payload is preserved");
+				assert!(Arc::ptr_eq(&payload.0, &identity));
+				assert_eq!(
+					shared
+						.events()
+						.iter()
+						.filter(|candidate| **candidate == Event::Rollback)
+						.count(),
+					1,
+					"the armed transaction rolls back exactly once"
+				);
 
-					shared.clear_events();
-					let child = super::lifecycle_tracing::with_dispatch(&dispatch, || command.spawn())
-						.expect("the one-shot subscriber leaves the command reusable");
-					drop(child);
-					assert_eq!(shared.events(), successful_events("provider"));
-				}
+				shared.clear_events();
+				let child = super::lifecycle_tracing::with_dispatch(&dispatch, || command.spawn())
+					.expect("the one-shot subscriber leaves the command reusable");
+				drop(child);
+				assert_eq!(shared.events(), successful_events("provider"));
 			}
 
 			#[cfg(feature = "tracing")]
@@ -4699,9 +4732,56 @@ macro_rules! real_provider_tests {
 			#[cfg_attr(miri, ignore = "requires native child processes")]
 			fn lifecycle_event_panic_rolls_back_and_reaps_a_live_child() {
 				let _tracing_guard = super::lifecycle_tracing::serial();
+				const CHILD_ENV: &str = "PROCESS_WRAP_REAL_PROVIDER_TRACE_IDENTITY";
+				let module = stringify!($module);
+				let selected = std::env::var(CHILD_ENV).ok();
+				if selected
+					.as_deref()
+					.is_none_or(|value| !value.starts_with(module))
+				{
+					for event in ["post_spawn", "wrap_child"] {
+						let child_value = format!("{module}:{event}");
+						let mut process =
+							std::process::Command::new(std::env::current_exe().unwrap());
+						process
+							.args([
+								"--exact",
+								concat!(
+									stringify!($module),
+									"::lifecycle_event_panic_rolls_back_and_reaps_a_live_child"
+								),
+								"--nocapture",
+							])
+							.env(CHILD_ENV, &child_value);
+						let (output, timed_out) =
+							super::bounded_process::run(process, EXIT_TIMEOUT, None)
+								.expect("run isolated real-process lifecycle regression");
+						assert!(
+							!timed_out,
+							"real-process tracing cleanup exceeded its deadline"
+						);
+						assert!(
+							output.status.success(),
+							"{event} real-process tracing cleanup failed:\nstdout:\n{}\nstderr:\n{}",
+							String::from_utf8_lossy(&output.stdout),
+							String::from_utf8_lossy(&output.stderr),
+						);
+					}
+					return;
+				}
+
+				let event = if selected
+					.as_deref()
+					.expect("the subprocess selects a lifecycle event")
+					.ends_with(":post_spawn")
+				{
+					"post_spawn"
+				} else {
+					"wrap_child"
+				};
 				let runtime = runtime();
 				let _runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
-				for event in ["post_spawn", "wrap_child"] {
+				{
 					let directory = tempfile::tempdir().unwrap();
 					let paths = MarkerPaths::new(directory.path());
 					let shared = Arc::new(Shared::default());
