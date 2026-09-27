@@ -102,11 +102,107 @@ macro_rules! Wrap {
 			}
 		}
 
+		#[cfg(all(test, windows))]
+		struct PreparedStateTestRendezvous {
+			reached: ::std::sync::mpsc::Sender<()>,
+			release: ::std::sync::mpsc::Receiver<()>,
+		}
+
+		#[cfg(all(test, windows))]
+		impl PreparedStateTestRendezvous {
+			fn wait(self) {
+				let _ = self.reached.send(());
+				let _ = self.release.recv();
+			}
+		}
+
+		#[cfg(windows)]
+		#[derive(Default)]
+		struct PreparedChildAdmission {
+			closing: bool,
+		}
+
 		#[cfg(windows)]
 		struct PreparedChildState {
+			// Accessors retain this lock through caller inspection. They take `admission` only long
+			// enough to linearize admission immediately before invoking the callback.
 			value: ::std::sync::Mutex<Option<Box<dyn ::std::any::Any + Send>>>,
+			admission: ::std::sync::Mutex<PreparedChildAdmission>,
 			type_id: ::std::any::TypeId,
-			revoked: ::std::sync::atomic::AtomicBool,
+			#[cfg(test)]
+			before_value_lock: ::std::sync::Mutex<Option<PreparedStateTestRendezvous>>,
+			#[cfg(test)]
+			after_closing: ::std::sync::Mutex<Option<PreparedStateTestRendezvous>>,
+		}
+
+		#[cfg(windows)]
+		impl PreparedChildState {
+			fn admitted_value(
+				&self,
+			) -> Option<
+				::std::sync::MutexGuard<'_, Option<Box<dyn ::std::any::Any + Send>>>,
+			> {
+				#[cfg(test)]
+				self.wait_before_value_lock();
+				let value = self
+					.value
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner);
+				let admission = self
+					.admission
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner);
+				if admission.closing {
+					drop(admission);
+					drop(value);
+					return None;
+				}
+				// Reading `closing == false` while holding `admission` is the accessor's
+				// linearization point. Keep `value` locked so a closer cannot take the box before or
+				// during the callback, but release `admission` so closing can be published.
+				drop(admission);
+				Some(value)
+			}
+
+			fn close(&self) {
+				{
+					let mut admission = self
+						.admission
+						.lock()
+						.unwrap_or_else(::std::sync::PoisonError::into_inner);
+					// The first write of `true` while holding `admission` is the revocation,
+					// failure-cleanup, or consuming-extraction linearization point. A later accessor
+					// must acquire this same mutex before inspecting the value and therefore observes
+					// the closed state.
+					admission.closing = true;
+				}
+				#[cfg(test)]
+				self.wait_after_closing();
+			}
+
+			#[cfg(test)]
+			fn wait_before_value_lock(&self) {
+				let rendezvous = self
+					.before_value_lock
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.take();
+				if let Some(rendezvous) = rendezvous {
+					rendezvous.wait();
+				}
+			}
+
+			#[cfg(test)]
+			fn wait_after_closing(&self) {
+				let rendezvous = self
+					.after_closing
+					.lock()
+					.unwrap_or_else(::std::sync::PoisonError::into_inner)
+					.take();
+				if let Some(rendezvous) = rendezvous {
+					rendezvous.wait();
+				}
+			}
 		}
 
 		#[cfg(windows)]
@@ -122,8 +218,12 @@ macro_rules! Wrap {
 				Self {
 					state: ::std::sync::Arc::new(PreparedChildState {
 						value: ::std::sync::Mutex::new(Some(value)),
+						admission: ::std::sync::Mutex::new(PreparedChildAdmission::default()),
 						type_id,
-						revoked: ::std::sync::atomic::AtomicBool::new(false),
+						#[cfg(test)]
+						before_value_lock: ::std::sync::Mutex::new(None),
+						#[cfg(test)]
+						after_closing: ::std::sync::Mutex::new(None),
 					}),
 					installed_layer: None,
 				}
@@ -139,7 +239,8 @@ macro_rules! Wrap {
 				}
 			}
 
-			fn take(&self) -> Option<Box<dyn ::std::any::Any + Send>> {
+			fn close_and_take(&self) -> Option<Box<dyn ::std::any::Any + Send>> {
+				self.state.close();
 				self.state
 					.value
 					.lock()
@@ -167,13 +268,10 @@ macro_rules! Wrap {
 		#[cfg(windows)]
 		impl Drop for PreparedChildOwner {
 			fn drop(&mut self) {
-				// Publish revocation before contending for the value lock. An inspection which already
-				// borrowed the value retains that lock, while every later locker observes revocation.
-				self.state
-					.revoked
-					.store(true, ::std::sync::atomic::Ordering::Release);
-				// `take` releases the lock before the value's destructor runs.
-				let value = self.take();
+				// Closing is published through the admission mutex before contending for the value.
+				// `close_and_take` releases the value lock before returning, so caller-defined
+				// destruction runs without either protocol mutex held.
+				let value = self.close_and_take();
 				drop(value);
 			}
 		}
@@ -254,13 +352,7 @@ macro_rules! Wrap {
 				#[cfg(test)]
 				crate::test_allocator::current_probe().observe_operation();
 				let state = self.state.upgrade()?;
-				let value = state
-					.value
-					.lock()
-					.unwrap_or_else(::std::sync::PoisonError::into_inner);
-				if state.revoked.load(::std::sync::atomic::Ordering::Acquire) {
-					return None;
-				}
+				let value = state.admitted_value()?;
 				value.as_deref()?.downcast_ref::<T>().map(inspect)
 			}
 
@@ -275,13 +367,9 @@ macro_rules! Wrap {
 				let Some(state) = self.state.upgrade() else {
 					return unavailable();
 				};
-				let value = state
-					.value
-					.lock()
-					.unwrap_or_else(::std::sync::PoisonError::into_inner);
-				if state.revoked.load(::std::sync::atomic::Ordering::Acquire) {
+				let Some(value) = state.admitted_value() else {
 					return unavailable();
-				}
+				};
 				let Some(value) = value.as_deref().and_then(|value| value.downcast_ref::<T>()) else {
 					return unavailable();
 				};
@@ -291,13 +379,13 @@ macro_rules! Wrap {
 			#[cfg(feature = "job-object")]
 			pub(crate) fn take_prepared_value<T: ::std::any::Any + Send>(&self) -> Option<T> {
 				let state = self.state.upgrade()?;
+				// Consuming extraction permanently closes public access before waiting for an active
+				// callback. A type mismatch restores the identical box while the state remains closed.
+				state.close();
 				let mut slot = state
 					.value
 					.lock()
 					.unwrap_or_else(::std::sync::PoisonError::into_inner);
-				if state.revoked.load(::std::sync::atomic::Ordering::Acquire) {
-					return None;
-				}
 				let value = slot.take()?;
 				match value.downcast::<T>() {
 					Ok(value) => Some(*value),
@@ -307,6 +395,250 @@ macro_rules! Wrap {
 					}
 				}
 			}
+		}
+
+		#[cfg(all(test, windows))]
+		#[derive(Debug)]
+		struct PreparedRaceDrop(::std::sync::Arc<::std::sync::atomic::AtomicUsize>);
+
+		#[cfg(all(test, windows))]
+		impl Drop for PreparedRaceDrop {
+			fn drop(&mut self) {
+				self.0
+					.fetch_add(1, ::std::sync::atomic::Ordering::SeqCst);
+			}
+		}
+
+		#[cfg(all(test, windows))]
+		struct PreparedRaceCleanup {
+			releases: Vec<::std::sync::mpsc::Sender<()>>,
+			workers: Vec<::std::thread::JoinHandle<()>>,
+		}
+
+		#[cfg(all(test, windows))]
+		impl PreparedRaceCleanup {
+			fn new() -> Self {
+				Self {
+					releases: Vec::new(),
+					workers: Vec::new(),
+				}
+			}
+
+			fn release_all(&self) {
+				for release in &self.releases {
+					let _ = release.send(());
+				}
+			}
+
+			fn finish(mut self) {
+				self.release_all();
+				let mut first_panic = None;
+				for worker in ::std::mem::take(&mut self.workers) {
+					if let Err(payload) = worker.join() {
+						if first_panic.is_none() {
+							first_panic = Some(payload);
+						} else {
+							::std::mem::forget(payload);
+						}
+					}
+				}
+				if let Some(payload) = first_panic {
+					::std::panic::resume_unwind(payload);
+				}
+			}
+		}
+
+		#[cfg(all(test, windows))]
+		impl Drop for PreparedRaceCleanup {
+			fn drop(&mut self) {
+				self.release_all();
+				for worker in ::std::mem::take(&mut self.workers) {
+					if let Err(payload) = worker.join() {
+						::std::mem::forget(payload);
+					}
+				}
+			}
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[derive(Clone, Copy)]
+		enum PreparedRaceCloser {
+			OwnerDrop,
+			ConsumingExtraction,
+			FailureCleanup,
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		fn assert_queued_prepared_access_is_rejected(closer: PreparedRaceCloser) {
+			const TIMEOUT: ::std::time::Duration = ::std::time::Duration::from_secs(5);
+
+			let drops = ::std::sync::Arc::new(::std::sync::atomic::AtomicUsize::new(0));
+			let callback_calls =
+				::std::sync::Arc::new(::std::sync::atomic::AtomicUsize::new(0));
+			let owner = PreparedChildOwner::new(Box::new(PreparedRaceDrop(
+				::std::sync::Arc::clone(&drops),
+			)));
+			let state = ::std::sync::Arc::clone(&owner.state);
+			let token = ::std::sync::Arc::new(owner.installed_token());
+			let mut cleanup = PreparedRaceCleanup::new();
+
+			let (active_entered_tx, active_entered_rx) = ::std::sync::mpsc::channel();
+			let (active_release_tx, active_release_rx) = ::std::sync::mpsc::channel();
+			let (active_result_tx, active_result_rx) = ::std::sync::mpsc::channel();
+			cleanup.releases.push(active_release_tx.clone());
+			let active_token = ::std::sync::Arc::clone(&token);
+			cleanup.workers.push(::std::thread::spawn(move || {
+				let completed = active_token.with::<PreparedRaceDrop, _>(|_| {
+					let _ = active_entered_tx.send(());
+					active_release_rx.recv().is_ok()
+				}) == Some(true);
+				let _ = active_result_tx.send(completed);
+			}));
+			active_entered_rx
+				.recv_timeout(TIMEOUT)
+				.expect("the active accessor acquired the prepared value");
+
+			let (queued_reached_tx, queued_reached_rx) = ::std::sync::mpsc::channel();
+			let (queued_release_tx, queued_release_rx) = ::std::sync::mpsc::channel();
+			*state
+				.before_value_lock
+				.lock()
+				.unwrap_or_else(::std::sync::PoisonError::into_inner) =
+				Some(PreparedStateTestRendezvous {
+					reached: queued_reached_tx,
+					release: queued_release_rx,
+				});
+			cleanup.releases.push(queued_release_tx.clone());
+			let (queued_result_tx, queued_result_rx) = ::std::sync::mpsc::channel();
+			let queued_token = ::std::sync::Arc::clone(&token);
+			let queued_callback_calls = ::std::sync::Arc::clone(&callback_calls);
+			cleanup.workers.push(::std::thread::spawn(move || {
+				let accessed = queued_token
+					.with::<PreparedRaceDrop, _>(|_| {
+						queued_callback_calls
+							.fetch_add(1, ::std::sync::atomic::Ordering::SeqCst);
+					})
+					.is_some();
+				let _ = queued_result_tx.send(accessed);
+			}));
+			queued_reached_rx
+				.recv_timeout(TIMEOUT)
+				.expect("the queued accessor upgraded before closing");
+
+			let (closing_reached_tx, closing_reached_rx) = ::std::sync::mpsc::channel();
+			let (closing_release_tx, closing_release_rx) = ::std::sync::mpsc::channel();
+			*state
+				.after_closing
+				.lock()
+				.unwrap_or_else(::std::sync::PoisonError::into_inner) =
+				Some(PreparedStateTestRendezvous {
+					reached: closing_reached_tx,
+					release: closing_release_rx,
+				});
+			cleanup.releases.push(closing_release_tx.clone());
+			queued_release_tx
+				.send(())
+				.expect("release the queued accessor to contend for the value");
+			let (destroyed_tx, destroyed_rx) = ::std::sync::mpsc::channel();
+			let extraction_token = ::std::sync::Arc::clone(&token);
+			cleanup.workers.push(::std::thread::spawn(move || {
+				match closer {
+					PreparedRaceCloser::OwnerDrop => drop(owner),
+					PreparedRaceCloser::ConsumingExtraction => {
+						let extracted = extraction_token
+							.take_prepared_value::<PreparedRaceDrop>()
+							.expect("consuming extraction retains the prepared concrete type");
+						drop(extracted);
+						drop(owner);
+					}
+					PreparedRaceCloser::FailureCleanup => {
+						let mut prepared = [Some(owner)];
+						crate::command::Command::<$backend>::cleanup_prepared(&mut prepared);
+					}
+				}
+				let _ = destroyed_tx.send(());
+			}));
+			closing_reached_rx
+				.recv_timeout(TIMEOUT)
+				.expect("the closing operation published its authoritative state");
+
+			assert_eq!(
+				destroyed_rx.try_recv(),
+				Err(::std::sync::mpsc::TryRecvError::Empty),
+				"closing returned while the active accessor retained the value"
+			);
+			assert_eq!(
+				drops.load(::std::sync::atomic::Ordering::SeqCst),
+				0,
+				"prepared state dropped during active access"
+			);
+			active_release_tx
+				.send(())
+				.expect("release the finite active accessor");
+			assert!(
+				!queued_result_rx
+					.recv_timeout(TIMEOUT)
+					.expect("the queued accessor completed before the closer took the value"),
+				"the queued accessor invoked its callback after closing"
+			);
+			assert_eq!(
+				callback_calls.load(::std::sync::atomic::Ordering::SeqCst),
+				0
+			);
+			closing_release_tx
+				.send(())
+				.expect("release closing to take the prepared value");
+			destroyed_rx
+				.recv_timeout(TIMEOUT)
+				.expect("the closing operation completed");
+			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 1);
+			assert!(
+				token.with::<PreparedRaceDrop, _>(|_| ()).is_none(),
+				"a retained token accessed state after closing"
+			);
+			assert!(
+				active_result_rx
+					.recv_timeout(TIMEOUT)
+					.expect("the active accessor completed")
+			);
+			cleanup.finish();
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn queued_prepared_access_is_rejected_by_owner_drop() {
+			assert_queued_prepared_access_is_rejected(PreparedRaceCloser::OwnerDrop);
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn queued_prepared_access_is_rejected_by_consuming_extraction() {
+			assert_queued_prepared_access_is_rejected(PreparedRaceCloser::ConsumingExtraction);
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn queued_prepared_access_is_rejected_by_failure_cleanup() {
+			assert_queued_prepared_access_is_rejected(PreparedRaceCloser::FailureCleanup);
+		}
+
+		#[cfg(all(test, windows, feature = "job-object"))]
+		#[test]
+		fn consuming_type_mismatch_restores_value_in_closed_state() {
+			let drops = ::std::sync::Arc::new(::std::sync::atomic::AtomicUsize::new(0));
+			let owner = PreparedChildOwner::new(Box::new(PreparedRaceDrop(
+				::std::sync::Arc::clone(&drops),
+			)));
+			let token = owner.installed_token();
+
+			assert!(token.take_prepared_value::<String>().is_none());
+			assert!(owner.has_value(), "the mismatched box remains in owner custody");
+			assert!(
+				token.with::<PreparedRaceDrop, _>(|_| ()).is_none(),
+				"consuming extraction closes access even when the concrete type mismatches"
+			);
+			drop(owner);
+			assert_eq!(drops.load(::std::sync::atomic::Ordering::SeqCst), 1);
 		}
 
 		#[cfg(windows)]
@@ -1307,7 +1639,7 @@ macro_rules! Wrap {
 			#[cfg(windows)]
 			fn cleanup_prepared(prepared: &mut [Option<PreparedChildOwner>]) {
 				for prepared in prepared.iter_mut().filter_map(Option::take) {
-					if let Some(value) = prepared.take() {
+					if let Some(value) = prepared.close_and_take() {
 						Self::dispose_value(value);
 					}
 				}

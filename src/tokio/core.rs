@@ -863,6 +863,7 @@ mod prepared_output_wait_tests {
 	fn assert_output_wait_drops_child_before_blocking_on_owner(complete: bool) {
 		let prepared_drops = Arc::new(AtomicUsize::new(0));
 		let future_drops = Arc::new(AtomicUsize::new(0));
+		let racing_callbacks = Arc::new(AtomicUsize::new(0));
 		let owner = PreparedChildOwner::new(Box::new(PreparedDrop(Arc::clone(&prepared_drops))));
 		let state = Arc::clone(&owner.state);
 		let token = Arc::new(owner.installed_token());
@@ -874,30 +875,65 @@ mod prepared_output_wait_tests {
 			vec![Some(owner)],
 		);
 		let output = child.wait_with_output();
+		let mut cleanup = PreparedRaceCleanup::new();
 
 		let (entered_tx, entered_rx) = mpsc::channel();
 		let (release_tx, release_rx) = mpsc::channel();
 		let (inspection_tx, inspection_rx) = mpsc::channel();
+		cleanup.releases.push(release_tx.clone());
 		let inspection_token = Arc::clone(&token);
-		let worker = thread::spawn(move || {
+		cleanup.workers.push(thread::spawn(move || {
 			let completed = inspection_token.with::<PreparedDrop, _>(|_| {
-				entered_tx
-					.send(())
-					.expect("the test receives the active-access rendezvous");
-				release_rx.recv_timeout(TIMEOUT).is_ok()
+				let _ = entered_tx.send(());
+				release_rx.recv().is_ok()
 			}) == Some(true);
 			let _ = inspection_tx.send(completed);
-		});
+		}));
 		entered_rx
 			.recv_timeout(TIMEOUT)
 			.expect("prepared inspection entered after upgrading and locking state");
 
-		let (started_tx, started_rx) = mpsc::channel();
+		let (racing_reached_tx, racing_reached_rx) = mpsc::channel();
+		let (racing_release_tx, racing_release_rx) = mpsc::channel();
+		*state
+			.before_value_lock
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PreparedStateTestRendezvous {
+			reached: racing_reached_tx,
+			release: racing_release_rx,
+		});
+		cleanup.releases.push(racing_release_tx.clone());
+		let (racing_tx, racing_rx) = mpsc::channel();
+		let racing_token = Arc::clone(&token);
+		let racing_callback_calls = Arc::clone(&racing_callbacks);
+		cleanup.workers.push(thread::spawn(move || {
+			let accessed = racing_token
+				.with::<PreparedDrop, _>(|_| {
+					racing_callback_calls.fetch_add(1, Ordering::SeqCst);
+				})
+				.is_some();
+			let _ = racing_tx.send(accessed);
+		}));
+		racing_reached_rx
+			.recv_timeout(TIMEOUT)
+			.expect("the racing accessor upgraded before owner closing");
+
+		let (closing_reached_tx, closing_reached_rx) = mpsc::channel();
+		let (closing_release_tx, closing_release_rx) = mpsc::channel();
+		*state
+			.after_closing
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PreparedStateTestRendezvous {
+			reached: closing_reached_tx,
+			release: closing_release_rx,
+		});
+		cleanup.releases.push(closing_release_tx.clone());
+		racing_release_tx
+			.send(())
+			.expect("release the racing accessor to contend for the value");
+
 		let (finished_tx, finished_rx) = mpsc::channel();
-		let output_worker = thread::spawn(move || {
-			started_tx
-				.send(())
-				.expect("the test observes output-wait disposal starting");
+		cleanup.workers.push(thread::spawn(move || {
 			if complete {
 				let mut output = Box::into_pin(output);
 				let waker = noop_waker();
@@ -910,39 +946,26 @@ mod prepared_output_wait_tests {
 				drop(output);
 			}
 			let _ = finished_tx.send(());
-		});
-		started_rx
+		}));
+		closing_reached_rx
 			.recv_timeout(TIMEOUT)
-			.expect("output-wait disposal thread started");
-
-		let deadline = std::time::Instant::now() + TIMEOUT;
-		while !state.revoked.load(std::sync::atomic::Ordering::Acquire)
-			&& std::time::Instant::now() < deadline
-		{
-			thread::yield_now();
-		}
+			.expect("output-wait disposal published owner closing");
 		assert!(
-			state.revoked.load(std::sync::atomic::Ordering::Acquire),
-			"prepared owner began revocation"
+			state
+				.admission
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+				.closing,
+			"the output-wait owner reached the authoritative closed state"
 		);
-		let (racing_tx, racing_rx) = mpsc::channel();
-		let racing_token = Arc::clone(&token);
-		let racing_worker = thread::spawn(move || {
-			let _ = racing_tx.send(racing_token.with::<PreparedDrop, _>(|_| ()).is_some());
-		});
-
-		let deadline = std::time::Instant::now() + TIMEOUT;
-		while future_drops.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
-			thread::yield_now();
-		}
 		assert_eq!(
 			future_drops.load(Ordering::SeqCst),
 			1,
-			"the child future drops before prepared-owner revocation"
+			"the child future drops before prepared-owner closing"
 		);
 		assert_eq!(
-			finished_rx.recv_timeout(Duration::from_millis(250)),
-			Err(mpsc::RecvTimeoutError::Timeout),
+			finished_rx.try_recv(),
+			Err(mpsc::TryRecvError::Empty),
 			"output-wait disposal returned during immutable prepared access"
 		);
 		assert_eq!(prepared_drops.load(Ordering::SeqCst), 0);
@@ -950,16 +973,20 @@ mod prepared_output_wait_tests {
 		release_tx
 			.send(())
 			.expect("release the finite prepared inspection");
+		assert!(
+			!racing_rx
+				.recv_timeout(TIMEOUT)
+				.expect("the queued prepared access completed before owner take"),
+			"a queued access invoked its callback after owner closing"
+		);
+		assert_eq!(racing_callbacks.load(Ordering::SeqCst), 0);
+		closing_release_tx
+			.send(())
+			.expect("release output-wait owner disposal");
 		finished_rx
 			.recv_timeout(TIMEOUT)
 			.expect("output-wait disposal completes after prepared inspection release");
 		assert_eq!(prepared_drops.load(Ordering::SeqCst), 1);
-		assert!(
-			!racing_rx
-				.recv_timeout(TIMEOUT)
-				.expect("racing prepared access completed"),
-			"an access which raced with revocation reacquired the prepared value"
-		);
 		assert!(
 			token.with::<PreparedDrop, _>(|_| ()).is_none(),
 			"a retained token accessed prepared state after owner destruction"
@@ -969,15 +996,7 @@ mod prepared_output_wait_tests {
 				.recv_timeout(TIMEOUT)
 				.expect("prepared inspection worker completed")
 		);
-		worker
-			.join()
-			.expect("prepared inspection worker did not panic");
-		racing_worker
-			.join()
-			.expect("racing prepared inspection worker did not panic");
-		output_worker
-			.join()
-			.expect("output-wait disposal worker did not panic");
+		cleanup.finish();
 	}
 
 	#[test]

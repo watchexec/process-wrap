@@ -1477,16 +1477,70 @@ macro_rules! spawn_provider_tests {
 			}
 
 			#[cfg(windows)]
+			struct PreparedAccessCleanup {
+				releases: Vec<mpsc::Sender<()>>,
+				workers: Vec<thread::JoinHandle<()>>,
+			}
+
+			#[cfg(windows)]
+			impl PreparedAccessCleanup {
+				fn new() -> Self {
+					Self {
+						releases: Vec::new(),
+						workers: Vec::new(),
+					}
+				}
+
+				fn release_all(&self) {
+					for release in &self.releases {
+						let _ = release.send(());
+					}
+				}
+
+				fn finish(mut self) {
+					self.release_all();
+					let mut first_panic = None;
+					for worker in std::mem::take(&mut self.workers) {
+						if let Err(payload) = worker.join() {
+							if first_panic.is_none() {
+								first_panic = Some(payload);
+							} else {
+								std::mem::forget(payload);
+							}
+						}
+					}
+					if let Some(payload) = first_panic {
+						std::panic::resume_unwind(payload);
+					}
+				}
+			}
+
+			#[cfg(windows)]
+			impl Drop for PreparedAccessCleanup {
+				fn drop(&mut self) {
+					self.release_all();
+					for worker in std::mem::take(&mut self.workers) {
+						if let Err(payload) = worker.join() {
+							std::mem::forget(payload);
+						}
+					}
+				}
+			}
+
+			#[cfg(windows)]
 			fn assert_active_prepared_access_blocks_destruction(
 				token: PreparedChild,
 				drops: Arc<AtomicUsize>,
 				destroy: impl FnOnce() + Send + 'static,
 			) {
+				let mut cleanup = PreparedAccessCleanup::new();
 				let (entered_tx, entered_rx) = mpsc::channel();
 				let (release_tx, release_rx) = mpsc::channel();
 				let (retry_tx, retry_rx) = mpsc::channel();
 				let (inspection_tx, inspection_rx) = mpsc::channel();
-				let worker = thread::spawn(move || {
+				cleanup.releases.push(release_tx.clone());
+				cleanup.releases.push(retry_tx.clone());
+				cleanup.workers.push(thread::spawn(move || {
 					let completed = token
 						.with::<Option<PreparedGuard>, _>(|prepared| {
 							assert!(prepared.is_some());
@@ -1502,20 +1556,20 @@ macro_rules! spawn_provider_tests {
 							.with::<Option<PreparedGuard>, _>(|prepared| prepared.is_some())
 							.is_some();
 					let _ = inspection_tx.send((completed, accessible_after_destruction));
-				});
+				}));
 
 				entered_rx
 					.recv_timeout(EXIT_TIMEOUT)
 					.expect("prepared inspection entered after upgrading and locking state");
 				let (started_tx, started_rx) = mpsc::channel();
 				let (destroyed_tx, destroyed_rx) = mpsc::channel();
-				let destroyer = thread::spawn(move || {
+				cleanup.workers.push(thread::spawn(move || {
 					started_tx
 						.send(())
 						.expect("the test observes destruction starting");
 					destroy();
 					let _ = destroyed_tx.send(());
-				});
+				}));
 				started_rx
 					.recv_timeout(EXIT_TIMEOUT)
 					.expect("destruction thread started");
@@ -1548,12 +1602,7 @@ macro_rules! spawn_provider_tests {
 					!accessible_after_destruction,
 					"a retained token reacquired prepared state after owner destruction"
 				);
-				worker
-					.join()
-					.expect("prepared inspection worker did not panic");
-				destroyer
-					.join()
-					.expect("authoritative destruction did not panic");
+				cleanup.finish();
 			}
 
 			fn provider_command_with_primary_failure(
