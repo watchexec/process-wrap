@@ -430,6 +430,7 @@ impl ChildWrapper for JobObjectChild {
 mod tests {
 	use std::{
 		fs,
+		future::{Future, poll_fn},
 		os::windows::{io::BorrowedHandle, process::CommandExt},
 		panic::{AssertUnwindSafe, catch_unwind, panic_any},
 		path::{Path, PathBuf},
@@ -438,6 +439,7 @@ mod tests {
 			Arc,
 			atomic::{AtomicUsize, Ordering},
 		},
+		task::Poll,
 	};
 
 	use windows::Win32::System::Threading::{
@@ -875,6 +877,68 @@ mod tests {
 		}
 	}
 
+	async fn warm_handle_count_infrastructure() -> Result<()> {
+		let directory = tempfile::tempdir()?;
+		let release = directory.path().join("release");
+		let mut command = StdCommand::new(std::env::current_exe()?);
+		command
+			.args([
+				"--exact",
+				"tokio::job_object::tests::extraction_custody_descendant_helper",
+				"--ignored",
+				"--nocapture",
+			])
+			.env(EXTRACTION_DESCENDANT_RELEASE, &release)
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null());
+		let mut command = tokio::process::Command::from(command);
+		command.kill_on_drop(true);
+		let mut child = command.spawn()?;
+
+		// Tokio registers its Windows process wait only after the first poll establishes that the
+		// process is still live. The helper cannot exit before `release` exists, so this poll must
+		// initialize RegisterWaitForSingleObject rather than take the already-exited fast path.
+		let mut wait = Box::pin(child.wait());
+		let first_poll = poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx))).await;
+		assert!(
+			first_poll.is_pending(),
+			"the registered-wait warm-up child exited before release"
+		);
+		drop(wait);
+
+		fs::write(&release, [])?;
+		assert!(child.wait().await?.success());
+		// Reaping drops Tokio's per-child wait registration, whose Windows implementation uses
+		// UnregisterWaitEx with INVALID_HANDLE_VALUE to synchronously finish any callback.
+		tokio::task::spawn_blocking(|| {})
+			.await
+			.map_err(Error::other)?;
+		Ok(())
+	}
+
+	async fn run_drained_extraction(job_first: bool) -> Result<()> {
+		let probe = arm_job_port_close_probe();
+		let mut command = extraction_command(true, job_first);
+		let mut child = command.spawn()?;
+		clear_job_port_close_probe();
+		let status = child.wait().await?;
+		let mut lower = child.into_inner();
+		assert_eq!(probe.counts(), (1, 1));
+		assert_eq!(lower.wait().await?, status);
+		assert_eq!(lower.try_wait()?, Some(status));
+		Ok(())
+	}
+
+	async fn run_drained_extraction_batch() -> Result<()> {
+		for job_first in [false, true] {
+			for _ in 0..32 {
+				run_drained_extraction(job_first).await?;
+			}
+		}
+		Ok(())
+	}
+
 	#[tokio::test(flavor = "current_thread")]
 	#[allow(clippy::await_holding_lock)] // Serializes process-global native fault injection.
 	async fn drained_kill_on_drop_extraction_closes_complete_job_ports_repeatedly() -> Result<()> {
@@ -882,24 +946,21 @@ mod tests {
 			return run_handle_count_regression_in_subprocess();
 		}
 		let _serial = serial_job_extraction();
-		let before = current_process_handle_count()?;
+
+		warm_handle_count_infrastructure().await?;
 		for job_first in [false, true] {
-			for _ in 0..32 {
-				let probe = arm_job_port_close_probe();
-				let mut command = extraction_command(true, job_first);
-				let mut child = command.spawn()?;
-				clear_job_port_close_probe();
-				let status = child.wait().await?;
-				let mut lower = child.into_inner();
-				assert_eq!(probe.counts(), (1, 1));
-				assert_eq!(lower.wait().await?, status);
-				assert_eq!(lower.try_wait()?, Some(status));
-			}
+			run_drained_extraction(job_first).await?;
 		}
-		let after = current_process_handle_count()?;
+
+		let warmed_baseline = current_process_handle_count()?;
+		run_drained_extraction_batch().await?;
+		let batch_a = current_process_handle_count()?;
+		run_drained_extraction_batch().await?;
+		let batch_b = current_process_handle_count()?;
 		assert!(
-			after <= before.saturating_add(8),
-			"repeated drained extraction grew process handles from {before} to {after}"
+			batch_a <= warmed_baseline && batch_b <= batch_a,
+			"drained extraction handle counts increased after warm-up: \
+			 warmed baseline {warmed_baseline}, batch A {batch_a}, batch B {batch_b}"
 		);
 		Ok(())
 	}
