@@ -2,6 +2,7 @@ name: Test
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches:
       - main
@@ -274,6 +275,8 @@ jobs:
           cargo package --locked
           cargo package --locked --list
 
+  # `semver-major` is trusted maintainer release intent for the whole PR, not an
+  # item-specific compatibility suppression.
   semver:
     name: Semver against PR base
     if: github.event_name == 'pull_request'
@@ -297,10 +300,46 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
-          printf 'Comparing against %s at %s\n' "$BASE_REF" "$BASE_SHA"
+          if [ -z "$BASE_REF" ] || [ -z "$BASE_SHA" ] || [ -z "$PR_LABELS_JSON" ] || [ "$PR_LABELS_JSON" = null ]; then
+            printf 'pull_request base and label metadata are required for the semver job\n' >&2
+            exit 1
+          fi
+          if ! semver_major="$(
+            printf '%s\n' "$PR_LABELS_JSON" \
+              | jq -er 'if type != "array" or any(.[]; type != "string") then error("invalid PR labels") elif index("semver-major") != null then "true" else "false" end'
+          )"; then
+            printf 'pull_request label metadata is malformed\n' >&2
+            exit 1
+          fi
+
           git cat-file -e "${BASE_SHA}^{commit}"
-          cargo semver-checks check-release --all-features --baseline-rev "$BASE_SHA"
+          if [ "$semver_major" = true ]; then
+            mapfile -t version_10_tags < <(git tag --list 'v10.*' --sort=-version:refname)
+            latest_version_10_tag=
+            for tag in "${version_10_tags[@]}"; do
+              if [[ "$tag" =~ ^v10\.[0-9]+\.[0-9]+$ ]] \
+                && git cat-file -e "${tag}^{commit}" \
+                && git merge-base "$BASE_SHA" "$tag" >/dev/null; then
+                latest_version_10_tag="$tag"
+                break
+              fi
+            done
+            if [ -z "$latest_version_10_tag" ]; then
+              printf 'no published version-10 tag is reachable from PR base %s\n' "$BASE_SHA" >&2
+              exit 1
+            fi
+            published_sha="$(git rev-parse "${latest_version_10_tag}^{commit}")"
+            printf 'PR base: %s at %s\n' "$BASE_REF" "$BASE_SHA"
+            printf 'Baseline: latest reachable published version-10 tag %s at %s\n' "$latest_version_10_tag" "$published_sha"
+            printf 'Selected release type: major (trusted semver-major label)\n'
+            cargo semver-checks check-release --all-features --baseline-rev "$latest_version_10_tag" --release-type major
+          else
+            printf 'Baseline: PR base %s at %s\n' "$BASE_REF" "$BASE_SHA"
+            printf 'Selected release type: inferred by cargo-semver-checks (semver-major absent)\n'
+            cargo semver-checks check-release --all-features --baseline-rev "$BASE_SHA"
+          fi
 
   formatting:
     name: Fmt check
