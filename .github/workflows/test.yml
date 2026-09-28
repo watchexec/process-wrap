@@ -316,25 +316,26 @@ jobs:
 
           git cat-file -e "${BASE_SHA}^{commit}"
           if [ "$semver_major" = true ]; then
+            # Only stable SemVer tags on the PR-base lineage can define the major baseline.
             mapfile -t version_10_tags < <(git tag --list 'v10.*' --sort=-version:refname)
-            latest_version_10_tag=
+            latest_version_10_ancestor=
             for tag in "${version_10_tags[@]}"; do
-              if [[ "$tag" =~ ^v10\.[0-9]+\.[0-9]+$ ]] \
+              if [[ "$tag" =~ ^v10\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
                 && git cat-file -e "${tag}^{commit}" \
-                && git merge-base "$BASE_SHA" "$tag" >/dev/null; then
-                latest_version_10_tag="$tag"
+                && git merge-base --is-ancestor "$tag" "$BASE_SHA"; then
+                latest_version_10_ancestor="$tag"
                 break
               fi
             done
-            if [ -z "$latest_version_10_tag" ]; then
-              printf 'no published version-10 tag is reachable from PR base %s\n' "$BASE_SHA" >&2
+            if [ -z "$latest_version_10_ancestor" ]; then
+              printf 'no stable version-10 tag is an ancestor of PR base %s\n' "$BASE_SHA" >&2
               exit 1
             fi
-            published_sha="$(git rev-parse "${latest_version_10_tag}^{commit}")"
+            ancestor_sha="$(git rev-parse "${latest_version_10_ancestor}^{commit}")"
             printf 'PR base: %s at %s\n' "$BASE_REF" "$BASE_SHA"
-            printf 'Baseline: latest reachable published version-10 tag %s at %s\n' "$latest_version_10_tag" "$published_sha"
+            printf 'Baseline: latest stable version-10 ancestor %s at %s\n' "$latest_version_10_ancestor" "$ancestor_sha"
             printf 'Selected release type: major (trusted semver-major label)\n'
-            cargo semver-checks check-release --all-features --baseline-rev "$latest_version_10_tag" --release-type major
+            cargo semver-checks check-release --all-features --baseline-rev "$latest_version_10_ancestor" --release-type major
           else
             printf 'Baseline: PR base %s at %s\n' "$BASE_REF" "$BASE_SHA"
             printf 'Selected release type: inferred by cargo-semver-checks (semver-major absent)\n'
