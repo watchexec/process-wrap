@@ -675,7 +675,9 @@ pub(crate) mod test_allocator {
 	#[derive(Default)]
 	pub(crate) struct PostTransitionProbe {
 		pub(crate) active: AtomicBool,
-		pub(crate) transitioned: AtomicBool,
+		queried: AtomicBool,
+		query_before_transition: AtomicBool,
+		transitioned: AtomicBool,
 		allocator_callback: AtomicBool,
 		operation: AtomicBool,
 	}
@@ -684,9 +686,23 @@ pub(crate) mod test_allocator {
 		#[cfg(feature = "job-object")]
 		pub(crate) fn arm(&self) {
 			assert!(!self.active.swap(true, Ordering::SeqCst));
+			self.queried.store(false, Ordering::SeqCst);
+			self.query_before_transition.store(false, Ordering::SeqCst);
 			self.transitioned.store(false, Ordering::SeqCst);
 			self.allocator_callback.store(false, Ordering::SeqCst);
 			self.operation.store(false, Ordering::SeqCst);
+		}
+
+		#[cfg(feature = "job-object")]
+		pub(crate) fn observe_query(&self) {
+			self.queried.store(true, Ordering::SeqCst);
+		}
+
+		#[cfg(feature = "job-object")]
+		pub(crate) fn observe_transition(&self) {
+			self.query_before_transition
+				.store(self.queried.load(Ordering::SeqCst), Ordering::SeqCst);
+			self.transitioned.store(true, Ordering::SeqCst);
 		}
 
 		pub(crate) fn observe_operation(&self) {
@@ -702,9 +718,10 @@ pub(crate) mod test_allocator {
 		}
 
 		#[cfg(feature = "job-object")]
-		pub(crate) fn finish(&self) -> (bool, bool, bool) {
+		pub(crate) fn finish(&self) -> (bool, bool, bool, bool) {
 			self.active.store(false, Ordering::SeqCst);
 			(
+				self.query_before_transition.load(Ordering::SeqCst),
 				self.transitioned.load(Ordering::SeqCst),
 				self.allocator_callback.load(Ordering::SeqCst),
 				self.operation.load(Ordering::SeqCst),

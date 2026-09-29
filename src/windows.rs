@@ -143,6 +143,155 @@ mod job_wait_tests {
 }
 
 #[cfg(test)]
+mod job_limit_tests {
+	use windows::Win32::System::JobObjects::{
+		JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+		JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+	};
+
+	use super::*;
+
+	fn query_extended_limits(job: JobHandle) -> Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION> {
+		let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+		// SAFETY: `job` is borrowed from the live owner below; `info` is initialized writable storage of
+		// exactly the size required by `JobObjectExtendedLimitInformation` and outlives the call.
+		unsafe {
+			QueryInformationJobObject(
+				Some(job.0),
+				JobObjectExtendedLimitInformation,
+				&mut info as *mut _ as _,
+				std::mem::size_of_val(&info)
+					.try_into()
+					.expect("extended job limits cannot exceed a DWORD"),
+				None,
+			)
+		}
+		.map_err(Error::other)?;
+		Ok(info)
+	}
+
+	fn set_extended_limits(
+		job: JobHandle,
+		info: &JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+	) -> Result<()> {
+		// SAFETY: `job` is borrowed from the live owner below; `info` is initialized readable storage of
+		// exactly the size required by `JobObjectExtendedLimitInformation` and outlives the call.
+		unsafe {
+			SetInformationJobObject(
+				job.0,
+				JobObjectExtendedLimitInformation,
+				info as *const _ as _,
+				std::mem::size_of_val(info)
+					.try_into()
+					.expect("extended job limits cannot exceed a DWORD"),
+			)
+		}
+		.map_err(Error::other)
+	}
+
+	fn running_under_wine() -> bool {
+		std::env::var_os("WINELOADER").is_some() && std::env::var_os("WINEDLLDIR0").is_some()
+	}
+
+	#[test]
+	fn kill_on_close_bit_mutation_preserves_complete_structure() {
+		let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+		info.BasicLimitInformation.PerProcessUserTimeLimit = 11;
+		info.BasicLimitInformation.PerJobUserTimeLimit = 12;
+		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+			| JOB_OBJECT_LIMIT_BREAKAWAY_OK
+			| JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+		info.BasicLimitInformation.MinimumWorkingSetSize = 13;
+		info.BasicLimitInformation.MaximumWorkingSetSize = 14;
+		info.BasicLimitInformation.ActiveProcessLimit = 15;
+		info.BasicLimitInformation.Affinity = 16;
+		info.BasicLimitInformation.PriorityClass = 17;
+		info.BasicLimitInformation.SchedulingClass = 18;
+		info.IoInfo.ReadOperationCount = 19;
+		info.IoInfo.WriteOperationCount = 20;
+		info.IoInfo.OtherOperationCount = 21;
+		info.IoInfo.ReadTransferCount = 22;
+		info.IoInfo.WriteTransferCount = 23;
+		info.IoInfo.OtherTransferCount = 24;
+		info.ProcessMemoryLimit = 25;
+		info.JobMemoryLimit = 26;
+		info.PeakProcessMemoryUsed = 27;
+		info.PeakJobMemoryUsed = 28;
+		let original = info;
+
+		set_job_kill_on_drop_flag(&mut info, true);
+		let mut enabled = original;
+		enabled.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+		assert_eq!(info, enabled);
+
+		set_job_kill_on_drop_flag(&mut info, false);
+		assert_eq!(info, original);
+	}
+
+	#[test]
+	fn kill_on_close_transition_preserves_peer_limit_fields() -> Result<()> {
+		if running_under_wine() {
+			// Wine's current extended-limit query zeroes the output structure, so the native preservation
+			// oracle is not available there. The structure-level test above remains selected under Wine.
+			return Ok(());
+		}
+		// SAFETY: null attributes and name request a new private job; the successful handle is owned below.
+		let owned_job = OwnedHandle(unsafe { CreateJobObjectW(None, None) }.map_err(Error::other)?);
+		let job = JobHandle(owned_job.0);
+		let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+		info.BasicLimitInformation.ActiveProcessLimit = 7;
+		set_extended_limits(job, &info)?;
+		let initial = query_extended_limits(job)?;
+		assert!(
+			initial
+				.BasicLimitInformation
+				.LimitFlags
+				.contains(JOB_OBJECT_LIMIT_ACTIVE_PROCESS),
+			"the isolated test job must install the peer limit before toggling kill-on-close"
+		);
+		assert_eq!(initial.BasicLimitInformation.ActiveProcessLimit, 7);
+
+		set_job_kill_on_drop(job, true)?;
+		let enabled = query_extended_limits(job)?;
+		assert!(
+			enabled
+				.BasicLimitInformation
+				.LimitFlags
+				.contains(JOB_OBJECT_LIMIT_ACTIVE_PROCESS),
+			"enabling kill-on-close must preserve the peer limit flag"
+		);
+		assert!(
+			enabled
+				.BasicLimitInformation
+				.LimitFlags
+				.contains(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE),
+			"enabling kill-on-close must install its own flag"
+		);
+		assert_eq!(enabled.BasicLimitInformation.ActiveProcessLimit, 7);
+
+		set_job_kill_on_drop(job, false)?;
+		let disabled = query_extended_limits(job)?;
+		assert!(
+			disabled
+				.BasicLimitInformation
+				.LimitFlags
+				.contains(JOB_OBJECT_LIMIT_ACTIVE_PROCESS),
+			"disabling kill-on-close must preserve the peer limit flag"
+		);
+		assert!(
+			!disabled
+				.BasicLimitInformation
+				.LimitFlags
+				.contains(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE),
+			"disabling kill-on-close must clear only its own flag"
+		);
+		assert_eq!(disabled.BasicLimitInformation.ActiveProcessLimit, 7);
+		Ok(())
+	}
+}
+
+#[cfg(test)]
 pub(crate) mod test_support {
 	use std::{
 		any::Any,
@@ -407,7 +556,7 @@ pub(crate) mod test_support {
 		crate::test_allocator::current_probe()
 	}
 
-	pub fn finish_owner_transition_probe() -> (bool, bool, bool) {
+	pub fn finish_owner_transition_probe() -> (bool, bool, bool, bool) {
 		crate::test_allocator::current_probe().finish()
 	}
 
@@ -764,60 +913,91 @@ pub(crate) fn set_job_kill_on_drop_observed(
 	set_job_kill_on_drop_inner(job, kill_on_drop, Some(probe))
 }
 
+fn query_job_extended_limits(job: JobHandle) -> Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION> {
+	let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+	let info_size = std::mem::size_of_val(&info)
+		.try_into()
+		.expect("extended JobObject limit information cannot exceed a DWORD");
+	// SAFETY:
+	// - `job` is borrowed from a live `JobPort` or newly created job owner and carries query access.
+	// - `info` is fully initialized, writable `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` storage.
+	// - `info_size` is its exact byte size, and the storage outlives this synchronous call.
+	// On success the information-class contract initializes the current complete extended-limit state.
+	unsafe {
+		QueryInformationJobObject(
+			Some(job.0),
+			JobObjectExtendedLimitInformation,
+			&mut info as *mut _ as _,
+			info_size,
+			None,
+		)
+	}
+	.map_err(Error::other)?;
+	Ok(info)
+}
+
+fn set_job_kill_on_drop_flag(info: &mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION, kill_on_drop: bool) {
+	if kill_on_drop {
+		info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+	} else {
+		info.BasicLimitInformation.LimitFlags &= !JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+	}
+}
+
 fn set_job_kill_on_drop_inner(
 	job: JobHandle,
 	kill_on_drop: bool,
 	#[cfg(test)] probe: Option<&crate::test_allocator::PostTransitionProbe>,
 ) -> Result<()> {
-	#[cfg(feature = "tracing")]
-	{
-		let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-		if kill_on_drop {
-			info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-		}
-		debug!(
-			kill_on_drop,
-			?info,
-			"setting SetInformationJobObject(limit)"
-		);
+	let mut info = query_job_extended_limits(job)?;
+	#[cfg(test)]
+	if let Some(probe) = probe {
+		probe.observe_query();
 	}
-	set_job_kill_on_drop_native(
-		job,
+	set_job_kill_on_drop_flag(&mut info, kill_on_drop);
+	#[cfg(feature = "tracing")]
+	debug!(
 		kill_on_drop,
+		?info,
+		"setting SetInformationJobObject(limit)"
+	);
+	set_job_extended_limits_native(
+		job,
+		&info,
 		#[cfg(test)]
 		probe,
 	)
 }
 
-fn set_job_kill_on_drop_native(
+fn set_job_extended_limits_native(
 	job: JobHandle,
-	kill_on_drop: bool,
+	info: &JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
 	#[cfg(test)] probe: Option<&crate::test_allocator::PostTransitionProbe>,
 ) -> Result<()> {
-	let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-	if kill_on_drop {
-		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-	}
-	// No caller-controlled callback runs in this helper. After a successful native transition it only
-	// records a test-only atomic observation and returns.
-	// SAFETY: `job` is live, and initialized `info` has the reported size and outlives the call.
+	let info_size = std::mem::size_of_val(info)
+		.try_into()
+		.expect("extended JobObject limit information cannot exceed a DWORD");
+	// No caller-controlled callback runs in this helper. All querying, formatting, tracing, test-probe
+	// lookup, and size conversion have completed. After a successful native transition, this function
+	// performs only test-only scalar/atomic observations and result moves before returning.
+	// SAFETY:
+	// - `job` is borrowed from a live `JobPort` or newly created job owner and carries set access.
+	// - `info` is initialized readable `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` storage containing the
+	//   complete queried state with only the requested bit changed.
+	// - `info_size` is its exact byte size, and the storage outlives this synchronous call.
 	let result = unsafe {
 		SetInformationJobObject(
 			job.0,
 			JobObjectExtendedLimitInformation,
-			&info as *const _ as _,
-			std::mem::size_of_val(&info)
-				.try_into()
-				.expect("cannot safely cast to DWORD"),
+			info as *const _ as _,
+			info_size,
 		)
 	};
 	#[cfg(test)]
 	if result.is_ok()
 		&& let Some(probe) = probe
 	{
-		probe
-			.transitioned
-			.store(true, std::sync::atomic::Ordering::SeqCst);
+		probe.observe_transition();
 	}
 	result.map_err(Error::other)
 }
@@ -993,12 +1173,7 @@ fn disarm_extracted_job(job: JobHandle) -> Result<()> {
 		test_support::observe_job_extraction_disarm(false);
 		return Err(Error::other("injected extracted JobObject disarm failure"));
 	}
-	let result = set_job_kill_on_drop_native(
-		job,
-		false,
-		#[cfg(test)]
-		None,
-	);
+	let result = set_job_kill_on_drop(job, false);
 	#[cfg(test)]
 	test_support::observe_job_extraction_disarm(result.is_ok());
 	result
