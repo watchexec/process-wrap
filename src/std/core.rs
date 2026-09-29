@@ -220,6 +220,18 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	#[cfg(all(windows, feature = "job-object"))]
 	fn retain_prepared_after_sidecar_removal_layer(&mut self) {}
 
+	/// Return the original PID retained by this exact child layer, if it advertises one.
+	///
+	/// Process-wrap consults this historical identity only while installing `ProcessGroup` or
+	/// `ProcessSession` supervision, including when a post-spawn hook has already reaped the child.
+	/// It may preserve the PID observed at spawn for that construction step; it is not proof that the
+	/// child remains live and must not be used after spawn returns as a signal or kill target or as a
+	/// substitute for lower-child synchronized live signalling.
+	///
+	/// A custom provider child whose live-facing [`ChildWrapper::id`] cannot supply the original PID
+	/// when process-wrap receives it must override this method if it advertises composition with
+	/// `ProcessGroup` or `ProcessSession`. Other children may retain the default; this contract does not
+	/// require every wrapper to preserve historical identity.
 	#[doc(hidden)]
 	#[cfg(all(unix, feature = "process-group"))]
 	fn spawned_id_layer(&self) -> Option<u32> {

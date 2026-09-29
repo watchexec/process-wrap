@@ -222,10 +222,18 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 		None
 	}
 
-	/// Return the original PID retained by this exact child layer.
+	/// Return the original PID retained by this exact child layer, if it advertises one.
 	///
-	/// This historical identity is consumed only while installing process-group or session supervision.
-	/// Ordinary child operations and signalling must continue to use live child state.
+	/// Process-wrap consults this historical identity only while installing `ProcessGroup` or
+	/// `ProcessSession` supervision, including when a post-spawn hook has already reaped the child.
+	/// It may preserve the PID observed at spawn for that construction step; it is not proof that the
+	/// child remains live and must not be used after spawn returns as a signal or kill target or as a
+	/// substitute for lower-child synchronized live signalling.
+	///
+	/// A custom provider child whose live-facing [`ChildWrapper::id`] cannot supply the original PID
+	/// when process-wrap receives it must override this method if it advertises composition with
+	/// `ProcessGroup` or `ProcessSession`. Other children may retain the default; this contract does not
+	/// require every wrapper to preserve historical identity.
 	#[doc(hidden)]
 	#[cfg(all(unix, feature = "process-group"))]
 	fn spawned_id_layer(&self) -> Option<u32> {
@@ -340,12 +348,19 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 		self.inner_mut().stderr()
 	}
 
-	/// Obtain the `Child`'s process ID.
+	/// Obtain the `Child`'s live-facing process ID.
 	///
-	/// In general this should be the PID of the top-level spawned process that was spawned
-	/// However, that may vary depending on what a wrapper does.
+	/// Raw Tokio children return `Some(pid)` while the child is live and can return `None` after
+	/// completion. Custom wrappers may vary according to their documented behavior, so even `Some(pid)`
+	/// is not by itself proof that the child remains live.
 	///
-	/// Returns an `Option` to resemble Tokio's API, but isn't expected to be `None` in practice.
+	/// This value is distinct from the historical spawned ID exposed by
+	/// [`ChildWrapper::spawned_id_layer`] only while installing `ProcessGroup` or `ProcessSession`
+	/// supervision. That installation-only identity must not be used as post-return liveness proof or as
+	/// a signal or kill target.
+	///
+	/// In general this should identify the top-level spawned process. However, that may vary depending
+	/// on what a wrapper does.
 	fn id(&self) -> Option<u32> {
 		self.inner().id()
 	}
