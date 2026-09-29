@@ -677,6 +677,7 @@ pub(crate) mod test_allocator {
 		pub(crate) active: AtomicBool,
 		queried: AtomicBool,
 		query_before_transition: AtomicBool,
+		query_after_transition: AtomicBool,
 		transitioned: AtomicBool,
 		allocator_callback: AtomicBool,
 		operation: AtomicBool,
@@ -688,6 +689,7 @@ pub(crate) mod test_allocator {
 			assert!(!self.active.swap(true, Ordering::SeqCst));
 			self.queried.store(false, Ordering::SeqCst);
 			self.query_before_transition.store(false, Ordering::SeqCst);
+			self.query_after_transition.store(false, Ordering::SeqCst);
 			self.transitioned.store(false, Ordering::SeqCst);
 			self.allocator_callback.store(false, Ordering::SeqCst);
 			self.operation.store(false, Ordering::SeqCst);
@@ -695,6 +697,9 @@ pub(crate) mod test_allocator {
 
 		#[cfg(feature = "job-object")]
 		pub(crate) fn observe_query(&self) {
+			if self.active.load(Ordering::SeqCst) && self.transitioned.load(Ordering::SeqCst) {
+				self.query_after_transition.store(true, Ordering::SeqCst);
+			}
 			self.queried.store(true, Ordering::SeqCst);
 		}
 
@@ -718,11 +723,12 @@ pub(crate) mod test_allocator {
 		}
 
 		#[cfg(feature = "job-object")]
-		pub(crate) fn finish(&self) -> (bool, bool, bool, bool) {
+		pub(crate) fn finish(&self) -> (bool, bool, bool, bool, bool) {
 			self.active.store(false, Ordering::SeqCst);
 			(
 				self.query_before_transition.load(Ordering::SeqCst),
 				self.transitioned.load(Ordering::SeqCst),
+				self.query_after_transition.load(Ordering::SeqCst),
 				self.allocator_callback.load(Ordering::SeqCst),
 				self.operation.load(Ordering::SeqCst),
 			)

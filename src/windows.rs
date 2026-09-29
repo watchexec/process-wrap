@@ -609,7 +609,7 @@ pub(crate) mod test_support {
 		crate::test_allocator::current_probe()
 	}
 
-	pub fn finish_owner_transition_probe() -> (bool, bool, bool, bool) {
+	pub fn finish_owner_transition_probe() -> (bool, bool, bool, bool, bool) {
 		crate::test_allocator::current_probe().finish()
 	}
 
@@ -966,7 +966,10 @@ pub(crate) fn set_job_kill_on_drop_observed(
 	set_job_kill_on_drop_inner(job, kill_on_drop, Some(probe))
 }
 
-fn query_job_extended_limits(job: JobHandle) -> Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION> {
+fn query_job_extended_limits(
+	job: JobHandle,
+	#[cfg(test)] probe: Option<&crate::test_allocator::PostTransitionProbe>,
+) -> Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION> {
 	let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
 	let info_size = std::mem::size_of_val(&info)
 		.try_into()
@@ -986,6 +989,10 @@ fn query_job_extended_limits(job: JobHandle) -> Result<JOBOBJECT_EXTENDED_LIMIT_
 		)
 	}
 	.map_err(Error::other)?;
+	#[cfg(test)]
+	if let Some(probe) = probe {
+		probe.observe_query();
+	}
 	Ok(info)
 }
 
@@ -1002,11 +1009,11 @@ fn set_job_kill_on_drop_inner(
 	kill_on_drop: bool,
 	#[cfg(test)] probe: Option<&crate::test_allocator::PostTransitionProbe>,
 ) -> Result<()> {
-	let mut info = query_job_extended_limits(job)?;
-	#[cfg(test)]
-	if let Some(probe) = probe {
-		probe.observe_query();
-	}
+	let mut info = query_job_extended_limits(
+		job,
+		#[cfg(test)]
+		probe,
+	)?;
 	set_job_kill_on_drop_flag(&mut info, kill_on_drop);
 	#[cfg(feature = "tracing")]
 	debug!(
@@ -1229,7 +1236,11 @@ fn disarm_extracted_job(job: JobHandle) -> Result<()> {
 			"injected extracted JobObject pre-set limit query failure",
 		));
 	}
-	let mut info = query_job_extended_limits(job)?;
+	let mut info = query_job_extended_limits(
+		job,
+		#[cfg(test)]
+		None,
+	)?;
 	set_job_kill_on_drop_flag(&mut info, false);
 
 	#[cfg(test)]
@@ -1253,7 +1264,11 @@ fn disarm_extracted_job(job: JobHandle) -> Result<()> {
 			"injected extracted JobObject post-set limit query failure",
 		));
 	}
-	let effective = query_job_extended_limits(job)?;
+	let effective = query_job_extended_limits(
+		job,
+		#[cfg(test)]
+		None,
+	)?;
 	let kill_on_close = effective
 		.BasicLimitInformation
 		.LimitFlags

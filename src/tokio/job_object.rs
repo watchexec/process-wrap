@@ -1325,13 +1325,19 @@ mod tests {
 			let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
 			let failure_was_not_consumed = clear_owner_failure();
 			let primary_preserved = primary_owner_failure_preserved(outcome, &identity, was_panic);
-			let (query_before_transition, transitioned, allocator_callback, later_operation) =
-				finish_owner_transition_probe();
+			let (
+				query_before_transition,
+				transitioned,
+				query_after_transition,
+				allocator_callback,
+				later_operation,
+			) = finish_owner_transition_probe();
 			assert!(
 				!query_before_transition,
 				"the injected final-owner failure must occur before the native limit query"
 			);
 			assert!(!transitioned, "the native policy transition must not run");
+			assert!(!query_after_transition);
 			assert!(!allocator_callback);
 			assert!(!later_operation);
 			assert_eq!(spawn_cleanup_handle_close_count(), 1);
@@ -1431,8 +1437,13 @@ mod tests {
 				arm_owner_transition_probe();
 				arm_owner_events(Arc::clone(&events));
 				let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
-				let (query_before_transition, transitioned, allocator_callback, later_operation) =
-					finish_owner_transition_probe();
+				let (
+					query_before_transition,
+					transitioned,
+					query_after_transition,
+					allocator_callback,
+					later_operation,
+				) = finish_owner_transition_probe();
 				let mut succeeded = false;
 				match outcome {
 					Ok(Ok(mut child)) => {
@@ -1460,6 +1471,10 @@ mod tests {
 					"the final-owner limit query must complete before the terminal native set"
 				);
 				assert!(transitioned, "the native final-owner transition completed");
+				assert!(
+					!query_after_transition,
+					"the terminal final-owner set must not be followed by another native limit query"
+				);
 				assert!(
 					!allocator_callback,
 					"an allocator callback ran after the native final-owner transition"
