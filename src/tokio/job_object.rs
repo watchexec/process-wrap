@@ -460,7 +460,9 @@ mod tests {
 			job_port_last_resort_retentions, observe_descendant, publish_process_guards,
 			record_owner_event, reset_job_extraction_faults, serial_job_extraction,
 			set_job_custodian_start_failures, set_job_extraction_disarm_failures,
-			set_job_extraction_query_failures, spawn_cleanup_handle_close_count,
+			set_job_extraction_post_query_failures, set_job_extraction_pre_query_failures,
+			set_job_extraction_query_failures, set_job_extraction_still_set_observations,
+			spawn_cleanup_handle_close_count,
 		},
 	};
 
@@ -970,18 +972,128 @@ mod tests {
 	async fn live_kill_on_drop_extraction_disarms_and_closes_before_returning() -> Result<()> {
 		let _serial = serial_job_extraction();
 		for job_first in [false, true] {
+			let baseline = job_extraction_branch_counts();
 			let probe = arm_job_port_close_probe();
 			let mut command = extraction_command(false, job_first);
 			let child = command.spawn()?;
 			clear_job_port_close_probe();
 			let mut lower = child.into_inner();
 			assert_eq!(probe.counts(), (1, 1));
+			let verified = job_extraction_branch_counts();
+			assert!(verified.disarm_attempts > baseline.disarm_attempts);
+			assert!(verified.set_successes > baseline.set_successes);
+			assert!(verified.verification_queries > baseline.verification_queries);
+			assert!(verified.verified_clears > baseline.verified_clears);
 			assert_eq!(lower.try_wait()?, None);
 			lower.start_kill()?;
 			let status = lower.wait().await?;
 			assert_eq!(lower.wait().await?, status);
 		}
 		Ok(())
+	}
+
+	#[derive(Clone, Copy, Debug)]
+	enum LiveDisarmFault {
+		PreQuery,
+		Set,
+		PostQueryFailure,
+		StillSet,
+	}
+
+	impl LiveDisarmFault {
+		fn arm(self, count: usize) {
+			match self {
+				Self::PreQuery => set_job_extraction_pre_query_failures(count),
+				Self::Set => set_job_extraction_disarm_failures(count),
+				Self::PostQueryFailure => set_job_extraction_post_query_failures(count),
+				Self::StillSet => set_job_extraction_still_set_observations(count),
+			}
+		}
+	}
+
+	async fn live_disarm_fault_enters_custody(fault: LiveDisarmFault) -> Result<()> {
+		let _serial = serial_job_extraction();
+		let _fault_cleanup = ExtractionFaultCleanup;
+		reset_job_port_custodian_for_test();
+		let worker_starts = job_custodian_worker_starts();
+		let baseline = job_extraction_branch_counts();
+		fault.arm(usize::MAX);
+
+		let probe = arm_job_port_close_probe();
+		let mut command = extraction_command(false, true);
+		let child = command.spawn()?;
+		clear_job_port_close_probe();
+		let mut lower = child.into_inner();
+		assert_eq!(
+			probe.counts(),
+			(0, 0),
+			"{fault:?} must transfer the complete live port instead of closing it"
+		);
+		assert_eq!(lower.try_wait()?, None);
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while job_custodian_worker_starts() == worker_starts {
+			assert!(
+				Instant::now() < deadline,
+				"{fault:?} did not start the shared custodian"
+			);
+			std::thread::sleep(Duration::from_millis(10));
+		}
+		assert_eq!(job_custodian_worker_starts(), worker_starts + 1);
+		assert_eq!(probe.counts(), (0, 0));
+		let unresolved = job_extraction_branch_counts();
+		assert!(unresolved.disarm_attempts > baseline.disarm_attempts);
+		assert_eq!(unresolved.verified_clears, baseline.verified_clears);
+		match fault {
+			LiveDisarmFault::PreQuery | LiveDisarmFault::Set => {
+				assert_eq!(unresolved.set_successes, baseline.set_successes);
+				assert_eq!(
+					unresolved.verification_queries,
+					baseline.verification_queries
+				);
+			}
+			LiveDisarmFault::PostQueryFailure | LiveDisarmFault::StillSet => {
+				assert!(unresolved.set_successes > baseline.set_successes);
+				assert!(unresolved.verification_queries > baseline.verification_queries);
+			}
+		}
+
+		fault.arm(0);
+		wait_for_job_port_closes(&probe, (1, 1));
+		let resolved = job_extraction_branch_counts();
+		assert!(resolved.verified_clears > baseline.verified_clears);
+		assert_eq!(
+			lower.try_wait()?,
+			None,
+			"verified custodian disarm must preserve the lower child"
+		);
+		lower.start_kill()?;
+		let status = lower.wait().await?;
+		assert_eq!(lower.wait().await?, status);
+		Ok(())
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	#[allow(clippy::await_holding_lock)] // Serializes process-global native fault injection.
+	async fn extraction_pre_query_failure_enters_custody() -> Result<()> {
+		live_disarm_fault_enters_custody(LiveDisarmFault::PreQuery).await
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	#[allow(clippy::await_holding_lock)] // Serializes process-global native fault injection.
+	async fn extraction_set_failure_enters_custody() -> Result<()> {
+		live_disarm_fault_enters_custody(LiveDisarmFault::Set).await
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	#[allow(clippy::await_holding_lock)] // Serializes process-global native fault injection.
+	async fn extraction_post_query_failure_enters_custody() -> Result<()> {
+		live_disarm_fault_enters_custody(LiveDisarmFault::PostQueryFailure).await
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	#[allow(clippy::await_holding_lock)] // Serializes process-global native fault injection.
+	async fn extraction_still_set_post_query_enters_custody() -> Result<()> {
+		live_disarm_fault_enters_custody(LiveDisarmFault::StillSet).await
 	}
 
 	#[tokio::test(flavor = "current_thread")]
@@ -1068,12 +1180,26 @@ mod tests {
 			std::thread::sleep(Duration::from_millis(10));
 		}
 		let unresolved = job_extraction_branch_counts();
-		assert!(unresolved.2 > baseline.2, "custody retried native disarm");
-		assert_eq!(
-			unresolved.3, baseline.3,
-			"no extracted-job disarm may succeed in this branch"
+		assert!(
+			unresolved.disarm_attempts > baseline.disarm_attempts,
+			"custody retried native disarm"
 		);
-		assert_eq!(unresolved.1, baseline.1, "the live tree has not drained");
+		assert_eq!(
+			unresolved.set_successes, baseline.set_successes,
+			"no extracted-job setter may succeed in this branch"
+		);
+		assert_eq!(
+			unresolved.verification_queries, baseline.verification_queries,
+			"a failed setter cannot reach post-set verification"
+		);
+		assert_eq!(
+			unresolved.verified_clears, baseline.verified_clears,
+			"no extracted-job disarm may verify clear in this branch"
+		);
+		assert_eq!(
+			unresolved.drain_observations, baseline.drain_observations,
+			"the live tree has not drained"
+		);
 
 		set_job_extraction_query_failures(0);
 		fs::File::create(&release)?;
@@ -1084,17 +1210,24 @@ mod tests {
 		wait_for_job_port_closes(&probe, (1, 1));
 		let drained = job_extraction_branch_counts();
 		assert!(
-			drained.0 > baseline.0,
+			drained.accounting_queries > baseline.accounting_queries,
 			"authoritative accounting was queried"
 		);
 		assert!(
-			drained.1 > baseline.1,
+			drained.drain_observations > baseline.drain_observations,
 			"authoritative accounting observed drain"
 		);
-		assert!(drained.2 > baseline.2, "native disarm remained attempted");
+		assert!(
+			drained.disarm_attempts > baseline.disarm_attempts,
+			"native disarm remained attempted"
+		);
 		assert_eq!(
-			drained.3, baseline.3,
-			"complete closure must not be attributed to disarm success"
+			drained.set_successes, baseline.set_successes,
+			"complete closure must not be attributed to setter success"
+		);
+		assert_eq!(
+			drained.verified_clears, baseline.verified_clears,
+			"complete closure must not be attributed to verified disarm"
 		);
 		Ok(())
 	}

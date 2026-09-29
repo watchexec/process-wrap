@@ -366,14 +366,19 @@ pub(crate) mod test_support {
 		}
 
 		static JOB_EXTRACTION_QUERY_FAILURES: AtomicUsize = AtomicUsize::new(0);
+		static JOB_EXTRACTION_PRE_QUERY_FAILURES: AtomicUsize = AtomicUsize::new(0);
 		static JOB_EXTRACTION_DISARM_FAILURES: AtomicUsize = AtomicUsize::new(0);
+		static JOB_EXTRACTION_POST_QUERY_FAILURES: AtomicUsize = AtomicUsize::new(0);
+		static JOB_EXTRACTION_STILL_SET_OBSERVATIONS: AtomicUsize = AtomicUsize::new(0);
 		static JOB_CUSTODIAN_START_FAILURES: AtomicUsize = AtomicUsize::new(0);
 		static JOB_CUSTODIAN_WORKER_STARTS: AtomicUsize = AtomicUsize::new(0);
 		static JOB_PORT_LAST_RESORT_RETENTIONS: AtomicUsize = AtomicUsize::new(0);
-		static JOB_EXTRACTION_QUERY_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+		static JOB_EXTRACTION_ACCOUNTING_QUERIES: AtomicUsize = AtomicUsize::new(0);
 		static JOB_EXTRACTION_DRAIN_OBSERVATIONS: AtomicUsize = AtomicUsize::new(0);
 		static JOB_EXTRACTION_DISARM_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
-		static JOB_EXTRACTION_DISARM_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
+		static JOB_EXTRACTION_SET_SUCCESSES: AtomicUsize = AtomicUsize::new(0);
+		static JOB_EXTRACTION_VERIFICATION_QUERIES: AtomicUsize = AtomicUsize::new(0);
+		static JOB_EXTRACTION_VERIFIED_CLEARS: AtomicUsize = AtomicUsize::new(0);
 
 		thread_local! {
 			static JOB_PORT_CLOSE_PROBE: RefCell<Option<Arc<JobPortCloseProbe>>> = const { RefCell::new(None) };
@@ -412,27 +417,48 @@ pub(crate) mod test_support {
 			});
 		}
 
+		#[derive(Clone, Copy, Debug)]
+		pub struct JobExtractionBranchCounts {
+			pub accounting_queries: usize,
+			pub drain_observations: usize,
+			pub disarm_attempts: usize,
+			pub set_successes: usize,
+			pub verification_queries: usize,
+			pub verified_clears: usize,
+		}
+
 		pub fn observe_job_extraction_query(drained: bool) {
-			JOB_EXTRACTION_QUERY_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+			JOB_EXTRACTION_ACCOUNTING_QUERIES.fetch_add(1, Ordering::SeqCst);
 			if drained {
 				JOB_EXTRACTION_DRAIN_OBSERVATIONS.fetch_add(1, Ordering::SeqCst);
 			}
 		}
 
-		pub fn observe_job_extraction_disarm(success: bool) {
+		pub fn observe_job_extraction_disarm_attempt() {
 			JOB_EXTRACTION_DISARM_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
-			if success {
-				JOB_EXTRACTION_DISARM_SUCCESSES.fetch_add(1, Ordering::SeqCst);
-			}
 		}
 
-		pub fn job_extraction_branch_counts() -> (usize, usize, usize, usize) {
-			(
-				JOB_EXTRACTION_QUERY_ATTEMPTS.load(Ordering::SeqCst),
-				JOB_EXTRACTION_DRAIN_OBSERVATIONS.load(Ordering::SeqCst),
-				JOB_EXTRACTION_DISARM_ATTEMPTS.load(Ordering::SeqCst),
-				JOB_EXTRACTION_DISARM_SUCCESSES.load(Ordering::SeqCst),
-			)
+		pub fn observe_job_extraction_set_success() {
+			JOB_EXTRACTION_SET_SUCCESSES.fetch_add(1, Ordering::SeqCst);
+		}
+
+		pub fn observe_job_extraction_verification_query() {
+			JOB_EXTRACTION_VERIFICATION_QUERIES.fetch_add(1, Ordering::SeqCst);
+		}
+
+		pub fn observe_job_extraction_verified_clear() {
+			JOB_EXTRACTION_VERIFIED_CLEARS.fetch_add(1, Ordering::SeqCst);
+		}
+
+		pub fn job_extraction_branch_counts() -> JobExtractionBranchCounts {
+			JobExtractionBranchCounts {
+				accounting_queries: JOB_EXTRACTION_ACCOUNTING_QUERIES.load(Ordering::SeqCst),
+				drain_observations: JOB_EXTRACTION_DRAIN_OBSERVATIONS.load(Ordering::SeqCst),
+				disarm_attempts: JOB_EXTRACTION_DISARM_ATTEMPTS.load(Ordering::SeqCst),
+				set_successes: JOB_EXTRACTION_SET_SUCCESSES.load(Ordering::SeqCst),
+				verification_queries: JOB_EXTRACTION_VERIFICATION_QUERIES.load(Ordering::SeqCst),
+				verified_clears: JOB_EXTRACTION_VERIFIED_CLEARS.load(Ordering::SeqCst),
+			}
 		}
 
 		pub fn set_job_extraction_query_failures(failures: usize) {
@@ -443,12 +469,36 @@ pub(crate) mod test_support {
 			take_failure(&JOB_EXTRACTION_QUERY_FAILURES)
 		}
 
+		pub fn set_job_extraction_pre_query_failures(failures: usize) {
+			JOB_EXTRACTION_PRE_QUERY_FAILURES.store(failures, Ordering::SeqCst);
+		}
+
+		pub fn take_job_extraction_pre_query_failure() -> bool {
+			take_failure(&JOB_EXTRACTION_PRE_QUERY_FAILURES)
+		}
+
 		pub fn set_job_extraction_disarm_failures(failures: usize) {
 			JOB_EXTRACTION_DISARM_FAILURES.store(failures, Ordering::SeqCst);
 		}
 
 		pub fn take_job_extraction_disarm_failure() -> bool {
 			take_failure(&JOB_EXTRACTION_DISARM_FAILURES)
+		}
+
+		pub fn set_job_extraction_post_query_failures(failures: usize) {
+			JOB_EXTRACTION_POST_QUERY_FAILURES.store(failures, Ordering::SeqCst);
+		}
+
+		pub fn take_job_extraction_post_query_failure() -> bool {
+			take_failure(&JOB_EXTRACTION_POST_QUERY_FAILURES)
+		}
+
+		pub fn set_job_extraction_still_set_observations(observations: usize) {
+			JOB_EXTRACTION_STILL_SET_OBSERVATIONS.store(observations, Ordering::SeqCst);
+		}
+
+		pub fn take_job_extraction_still_set_observation() -> bool {
+			take_failure(&JOB_EXTRACTION_STILL_SET_OBSERVATIONS)
 		}
 
 		pub fn set_job_custodian_start_failures(failures: usize) {
@@ -477,7 +527,10 @@ pub(crate) mod test_support {
 
 		pub fn reset_job_extraction_faults() {
 			JOB_EXTRACTION_QUERY_FAILURES.store(0, Ordering::SeqCst);
+			JOB_EXTRACTION_PRE_QUERY_FAILURES.store(0, Ordering::SeqCst);
 			JOB_EXTRACTION_DISARM_FAILURES.store(0, Ordering::SeqCst);
+			JOB_EXTRACTION_POST_QUERY_FAILURES.store(0, Ordering::SeqCst);
+			JOB_EXTRACTION_STILL_SET_OBSERVATIONS.store(0, Ordering::SeqCst);
 			JOB_CUSTODIAN_START_FAILURES.store(0, Ordering::SeqCst);
 		}
 	}
@@ -1169,14 +1222,52 @@ fn extracted_job_is_drained(job: JobHandle) -> Result<bool> {
 #[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
 fn disarm_extracted_job(job: JobHandle) -> Result<()> {
 	#[cfg(test)]
+	test_support::observe_job_extraction_disarm_attempt();
+	#[cfg(test)]
+	if test_support::take_job_extraction_pre_query_failure() {
+		return Err(Error::other(
+			"injected extracted JobObject pre-set limit query failure",
+		));
+	}
+	let mut info = query_job_extended_limits(job)?;
+	set_job_kill_on_drop_flag(&mut info, false);
+
+	#[cfg(test)]
 	if test_support::take_job_extraction_disarm_failure() {
-		test_support::observe_job_extraction_disarm(false);
 		return Err(Error::other("injected extracted JobObject disarm failure"));
 	}
-	let result = set_job_kill_on_drop(job, false);
+	set_job_extended_limits_native(
+		job,
+		&info,
+		#[cfg(test)]
+		None,
+	)?;
 	#[cfg(test)]
-	test_support::observe_job_extraction_disarm(result.is_ok());
-	result
+	test_support::observe_job_extraction_set_success();
+
+	#[cfg(test)]
+	test_support::observe_job_extraction_verification_query();
+	#[cfg(test)]
+	if test_support::take_job_extraction_post_query_failure() {
+		return Err(Error::other(
+			"injected extracted JobObject post-set limit query failure",
+		));
+	}
+	let effective = query_job_extended_limits(job)?;
+	let kill_on_close = effective
+		.BasicLimitInformation
+		.LimitFlags
+		.contains(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+	#[cfg(test)]
+	let kill_on_close = kill_on_close || test_support::take_job_extraction_still_set_observation();
+	if kill_on_close {
+		return Err(Error::other(
+			"extracted JobObject still reports kill-on-close after disarm",
+		));
+	}
+	#[cfg(test)]
+	test_support::observe_job_extraction_verified_clear();
+	Ok(())
 }
 
 #[cfg(all(feature = "tokio1", feature = "kill-on-drop"))]
