@@ -605,11 +605,15 @@ pub(crate) mod test_support {
 		crate::test_allocator::current_probe().arm();
 	}
 
+	pub fn arm_owner_setter_failure_probe() {
+		crate::test_allocator::current_probe().arm_setter_failure();
+	}
+
 	pub fn owner_transition_probe() -> &'static crate::test_allocator::PostTransitionProbe {
 		crate::test_allocator::current_probe()
 	}
 
-	pub fn finish_owner_transition_probe() -> (bool, bool, bool, bool, bool) {
+	pub fn finish_owner_transition_probe() -> crate::test_allocator::PostTransitionProbeState {
 		crate::test_allocator::current_probe().finish()
 	}
 
@@ -974,12 +978,16 @@ fn query_job_extended_limits(
 	let info_size = std::mem::size_of_val(&info)
 		.try_into()
 		.expect("extended JobObject limit information cannot exceed a DWORD");
+	#[cfg(test)]
+	if let Some(probe) = probe {
+		probe.observe_query_attempt();
+	}
 	// SAFETY:
 	// - `job` is borrowed from a live `JobPort` or newly created job owner and carries query access.
 	// - `info` is fully initialized, writable `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` storage.
 	// - `info_size` is its exact byte size, and the storage outlives this synchronous call.
 	// On success the information-class contract initializes the current complete extended-limit state.
-	unsafe {
+	let result = unsafe {
 		QueryInformationJobObject(
 			Some(job.0),
 			JobObjectExtendedLimitInformation,
@@ -987,11 +995,11 @@ fn query_job_extended_limits(
 			info_size,
 			None,
 		)
-	}
-	.map_err(Error::other)?;
+	};
+	result.map_err(Error::other)?;
 	#[cfg(test)]
 	if let Some(probe) = probe {
-		probe.observe_query();
+		probe.observe_query_success();
 	}
 	Ok(info)
 }
@@ -1037,14 +1045,25 @@ fn set_job_extended_limits_native(
 	let info_size = std::mem::size_of_val(info)
 		.try_into()
 		.expect("extended JobObject limit information cannot exceed a DWORD");
+	#[cfg(test)]
+	let info_size = match probe {
+		Some(probe) if probe.take_setter_failure() => 0,
+		_ => info_size,
+	};
 	// No caller-controlled callback runs in this helper. All querying, formatting, tracing, test-probe
 	// lookup, and size conversion have completed. After a successful native transition, this function
 	// performs only test-only scalar/atomic observations and result moves before returning.
+	#[cfg(test)]
+	if let Some(probe) = probe {
+		probe.observe_setter_attempt();
+	}
 	// SAFETY:
 	// - `job` is borrowed from a live `JobPort` or newly created job owner and carries set access.
 	// - `info` is initialized readable `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` storage containing the
 	//   complete queried state with only the requested bit changed.
-	// - `info_size` is its exact byte size, and the storage outlives this synchronous call.
+	// - Production `info_size` is the storage's exact byte size. The test-only failure seam may reduce
+	//   it to zero, which authorizes no structure bytes and cannot extend the native read beyond `info`.
+	// - The storage outlives this synchronous call.
 	let result = unsafe {
 		SetInformationJobObject(
 			job.0,

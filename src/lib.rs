@@ -672,41 +672,98 @@ pub(crate) mod test_allocator {
 		sync::atomic::{AtomicBool, Ordering},
 	};
 
+	#[derive(Clone, Copy, Debug)]
+	pub(crate) struct PostTransitionProbeState {
+		pub(crate) query_attempted: bool,
+		pub(crate) query_succeeded: bool,
+		pub(crate) query_attempted_before_setter: bool,
+		pub(crate) query_succeeded_before_setter: bool,
+		pub(crate) setter_attempted: bool,
+		pub(crate) transitioned: bool,
+		pub(crate) query_attempted_after_transition: bool,
+		pub(crate) allocator_callback: bool,
+		pub(crate) later_operation: bool,
+	}
+
 	#[derive(Default)]
 	pub(crate) struct PostTransitionProbe {
 		pub(crate) active: AtomicBool,
-		queried: AtomicBool,
-		query_before_transition: AtomicBool,
-		query_after_transition: AtomicBool,
+		query_attempted: AtomicBool,
+		query_succeeded: AtomicBool,
+		query_attempted_before_setter: AtomicBool,
+		query_succeeded_before_setter: AtomicBool,
+		setter_attempted: AtomicBool,
 		transitioned: AtomicBool,
+		query_attempted_after_transition: AtomicBool,
 		allocator_callback: AtomicBool,
 		operation: AtomicBool,
+		inject_setter_failure: AtomicBool,
 	}
 
 	impl PostTransitionProbe {
 		#[cfg(feature = "job-object")]
-		pub(crate) fn arm(&self) {
+		fn arm_with_setter_failure(&self, inject_setter_failure: bool) {
 			assert!(!self.active.swap(true, Ordering::SeqCst));
-			self.queried.store(false, Ordering::SeqCst);
-			self.query_before_transition.store(false, Ordering::SeqCst);
-			self.query_after_transition.store(false, Ordering::SeqCst);
+			self.query_attempted.store(false, Ordering::SeqCst);
+			self.query_succeeded.store(false, Ordering::SeqCst);
+			self.query_attempted_before_setter
+				.store(false, Ordering::SeqCst);
+			self.query_succeeded_before_setter
+				.store(false, Ordering::SeqCst);
+			self.setter_attempted.store(false, Ordering::SeqCst);
 			self.transitioned.store(false, Ordering::SeqCst);
+			self.query_attempted_after_transition
+				.store(false, Ordering::SeqCst);
 			self.allocator_callback.store(false, Ordering::SeqCst);
 			self.operation.store(false, Ordering::SeqCst);
+			self.inject_setter_failure
+				.store(inject_setter_failure, Ordering::SeqCst);
 		}
 
 		#[cfg(feature = "job-object")]
-		pub(crate) fn observe_query(&self) {
+		pub(crate) fn arm(&self) {
+			self.arm_with_setter_failure(false);
+		}
+
+		#[cfg(feature = "job-object")]
+		pub(crate) fn arm_setter_failure(&self) {
+			self.arm_with_setter_failure(true);
+		}
+
+		#[cfg(feature = "job-object")]
+		pub(crate) fn take_setter_failure(&self) -> bool {
+			self.inject_setter_failure.swap(false, Ordering::SeqCst)
+		}
+
+		#[cfg(feature = "job-object")]
+		pub(crate) fn observe_query_attempt(&self) {
 			if self.active.load(Ordering::SeqCst) && self.transitioned.load(Ordering::SeqCst) {
-				self.query_after_transition.store(true, Ordering::SeqCst);
+				self.query_attempted_after_transition
+					.store(true, Ordering::SeqCst);
 			}
-			self.queried.store(true, Ordering::SeqCst);
+			self.query_attempted.store(true, Ordering::SeqCst);
+		}
+
+		#[cfg(feature = "job-object")]
+		pub(crate) fn observe_query_success(&self) {
+			self.query_succeeded.store(true, Ordering::SeqCst);
+		}
+
+		#[cfg(feature = "job-object")]
+		pub(crate) fn observe_setter_attempt(&self) {
+			self.query_attempted_before_setter.store(
+				self.query_attempted.load(Ordering::SeqCst),
+				Ordering::SeqCst,
+			);
+			self.query_succeeded_before_setter.store(
+				self.query_succeeded.load(Ordering::SeqCst),
+				Ordering::SeqCst,
+			);
+			self.setter_attempted.store(true, Ordering::SeqCst);
 		}
 
 		#[cfg(feature = "job-object")]
 		pub(crate) fn observe_transition(&self) {
-			self.query_before_transition
-				.store(self.queried.load(Ordering::SeqCst), Ordering::SeqCst);
 			self.transitioned.store(true, Ordering::SeqCst);
 		}
 
@@ -723,15 +780,26 @@ pub(crate) mod test_allocator {
 		}
 
 		#[cfg(feature = "job-object")]
-		pub(crate) fn finish(&self) -> (bool, bool, bool, bool, bool) {
+		pub(crate) fn finish(&self) -> PostTransitionProbeState {
 			self.active.store(false, Ordering::SeqCst);
-			(
-				self.query_before_transition.load(Ordering::SeqCst),
-				self.transitioned.load(Ordering::SeqCst),
-				self.query_after_transition.load(Ordering::SeqCst),
-				self.allocator_callback.load(Ordering::SeqCst),
-				self.operation.load(Ordering::SeqCst),
-			)
+			self.inject_setter_failure.store(false, Ordering::SeqCst);
+			PostTransitionProbeState {
+				query_attempted: self.query_attempted.load(Ordering::SeqCst),
+				query_succeeded: self.query_succeeded.load(Ordering::SeqCst),
+				query_attempted_before_setter: self
+					.query_attempted_before_setter
+					.load(Ordering::SeqCst),
+				query_succeeded_before_setter: self
+					.query_succeeded_before_setter
+					.load(Ordering::SeqCst),
+				setter_attempted: self.setter_attempted.load(Ordering::SeqCst),
+				transitioned: self.transitioned.load(Ordering::SeqCst),
+				query_attempted_after_transition: self
+					.query_attempted_after_transition
+					.load(Ordering::SeqCst),
+				allocator_callback: self.allocator_callback.load(Ordering::SeqCst),
+				later_operation: self.operation.load(Ordering::SeqCst),
+			}
 		}
 	}
 

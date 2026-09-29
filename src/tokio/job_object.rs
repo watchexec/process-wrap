@@ -452,10 +452,10 @@ mod tests {
 		test_support::{
 			LifecycleState, OwnerError, OwnerFailure, OwnerPanic, PanickingCommittedTransaction,
 			ProcessGuard, TreePaths, arm_extra_prepared_owner, arm_job_port_close_probe,
-			arm_owner_events, arm_owner_failure, arm_owner_transition_probe,
-			arm_spawn_cleanup_handle_probe, assert_tree_terminated, clear_extra_prepared_owners,
-			clear_job_port_close_probe, clear_owner_events, clear_owner_failure,
-			finish_owner_transition_probe, finish_spawn_cleanup_handle_probe,
+			arm_owner_events, arm_owner_failure, arm_owner_setter_failure_probe,
+			arm_owner_transition_probe, arm_spawn_cleanup_handle_probe, assert_tree_terminated,
+			clear_extra_prepared_owners, clear_job_port_close_probe, clear_owner_events,
+			clear_owner_failure, finish_owner_transition_probe, finish_spawn_cleanup_handle_probe,
 			job_custodian_worker_starts, job_extraction_branch_counts,
 			job_port_last_resort_retentions, observe_descendant, publish_process_guards,
 			record_owner_event, reset_job_extraction_faults, serial_job_extraction,
@@ -1326,21 +1326,22 @@ mod tests {
 			let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
 			let failure_was_not_consumed = clear_owner_failure();
 			let primary_preserved = primary_owner_failure_preserved(outcome, &identity, was_panic);
-			let (
-				query_before_transition,
-				transitioned,
-				query_after_transition,
-				allocator_callback,
-				later_operation,
-			) = finish_owner_transition_probe();
+			let probe = finish_owner_transition_probe();
+			assert!(!probe.setter_attempted);
 			assert!(
-				!query_before_transition,
-				"the injected final-owner failure must occur before the native limit query"
+				!probe.transitioned,
+				"the native policy transition must not run"
 			);
-			assert!(!transitioned, "the native policy transition must not run");
-			assert!(!query_after_transition);
-			assert!(!allocator_callback);
-			assert!(!later_operation);
+			assert!(!probe.query_attempted_after_transition);
+			assert!(!probe.allocator_callback);
+			assert!(!probe.later_operation);
+			assert!(
+				!probe.query_attempted,
+				"the injected final-owner failure must occur before any native limit query attempt"
+			);
+			assert!(!probe.query_succeeded);
+			assert!(!probe.query_attempted_before_setter);
+			assert!(!probe.query_succeeded_before_setter);
 			assert_eq!(spawn_cleanup_handle_close_count(), 1);
 			assert_eq!(finish_spawn_cleanup_handle_probe(), 1);
 			assert!(
@@ -1358,6 +1359,65 @@ mod tests {
 			child.start_kill()?;
 			let _ = child.wait().await?;
 			drop(child);
+			assert_tree_terminated(&paths, &state)?;
+		}
+		Ok(())
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn final_owner_setter_failure_records_attempt_without_transition() -> Result<()> {
+		for provider in [false, true] {
+			let directory = tempfile::tempdir()?;
+			let paths = TreePaths::new(directory.path());
+			let state = Arc::new(LifecycleState::default());
+			let mut command = topology_command(provider, &paths, &state)?;
+			arm_owner_setter_failure_probe();
+			if !provider {
+				arm_spawn_cleanup_handle_probe();
+			}
+
+			let error = command
+				.spawn()
+				.expect_err("the injected native setter failure must fail spawn");
+			let probe = finish_owner_transition_probe();
+			assert_eq!(error.kind(), ErrorKind::Other);
+			assert!(probe.query_attempted);
+			assert!(probe.query_succeeded);
+			assert!(probe.query_attempted_before_setter);
+			assert!(probe.query_succeeded_before_setter);
+			assert!(probe.setter_attempted);
+			assert!(
+				!probe.transitioned,
+				"a failed native setter must not report a successful transition"
+			);
+			assert!(!probe.query_attempted_after_transition);
+			assert!(!probe.allocator_callback);
+			assert!(!probe.later_operation);
+			if !provider {
+				assert_eq!(spawn_cleanup_handle_close_count(), 1);
+				assert_eq!(finish_spawn_cleanup_handle_probe(), 1);
+			}
+			assert_tree_terminated(&paths, &state)?;
+			assert_eq!(state.commits.load(Ordering::SeqCst), usize::from(provider));
+			assert_eq!(state.rollbacks.load(Ordering::SeqCst), 0);
+			assert_eq!(
+				state.residue_drops.load(Ordering::SeqCst),
+				usize::from(provider)
+			);
+			assert_eq!(state.payload_drops.load(Ordering::SeqCst), 0);
+			std::fs::remove_file(&paths.descendant_pid)?;
+
+			let mut child = command.spawn().expect("the command remains reusable");
+			child.start_kill()?;
+			let _ = child.wait().await?;
+			let disposal = catch_unwind(AssertUnwindSafe(|| drop(child)));
+			if provider {
+				let payload =
+					disposal.expect_err("the provider fixture residue panics on disposal");
+				std::mem::forget(payload);
+			} else {
+				disposal.expect("native child disposal does not panic");
+			}
 			assert_tree_terminated(&paths, &state)?;
 		}
 		Ok(())
@@ -1438,13 +1498,7 @@ mod tests {
 				arm_owner_transition_probe();
 				arm_owner_events(Arc::clone(&events));
 				let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
-				let (
-					query_before_transition,
-					transitioned,
-					query_after_transition,
-					allocator_callback,
-					later_operation,
-				) = finish_owner_transition_probe();
+				let probe = finish_owner_transition_probe();
 				let mut succeeded = false;
 				match outcome {
 					Ok(Ok(mut child)) => {
@@ -1468,20 +1522,36 @@ mod tests {
 					"the owner event barrier remained armed"
 				);
 				assert!(
-					query_before_transition,
-					"the final-owner limit query must complete before the terminal native set"
+					probe.query_attempted,
+					"the native limit query was attempted"
 				);
-				assert!(transitioned, "the native final-owner transition completed");
+				assert!(probe.query_succeeded, "the native limit query succeeded");
 				assert!(
-					!query_after_transition,
+					probe.query_attempted_before_setter,
+					"the native limit query attempt must precede the setter attempt"
+				);
+				assert!(
+					probe.query_succeeded_before_setter,
+					"the native limit query must complete before the setter attempt"
+				);
+				assert!(
+					probe.setter_attempted,
+					"the terminal native setter was attempted"
+				);
+				assert!(
+					probe.transitioned,
+					"the native final-owner transition completed"
+				);
+				assert!(
+					!probe.query_attempted_after_transition,
 					"the terminal final-owner set must not be followed by another native limit query"
 				);
 				assert!(
-					!allocator_callback,
+					!probe.allocator_callback,
 					"an allocator callback ran after the native final-owner transition"
 				);
 				assert!(
-					!later_operation,
+					!probe.later_operation,
 					"a caller or test operation ran after the native final-owner transition"
 				);
 				let tree_result = assert_tree_terminated(&paths, &state);
@@ -1520,6 +1590,7 @@ mod tests {
 				OwnerFailure::Error(Arc::clone(&identity))
 			};
 			arm_owner_failure(failure);
+			arm_owner_transition_probe();
 
 			let mut command = CommandWrap::new("provider-owned-program");
 			command
@@ -1535,7 +1606,18 @@ mod tests {
 			let outcome = catch_unwind(AssertUnwindSafe(|| command.spawn()));
 			let failure_was_not_consumed = clear_owner_failure();
 			let primary_preserved = primary_owner_failure_preserved(outcome, &identity, was_panic);
+			let probe = finish_owner_transition_probe();
 			let tree_result = assert_tree_terminated(&paths, &state);
+
+			assert!(!probe.setter_attempted);
+			assert!(!probe.transitioned);
+			assert!(!probe.query_attempted_after_transition);
+			assert!(!probe.allocator_callback);
+			assert!(!probe.later_operation);
+			assert!(!probe.query_attempted);
+			assert!(!probe.query_succeeded);
+			assert!(!probe.query_attempted_before_setter);
+			assert!(!probe.query_succeeded_before_setter);
 
 			assert!(
 				!failure_was_not_consumed,
