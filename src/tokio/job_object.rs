@@ -1011,6 +1011,7 @@ mod tests {
 		}
 	}
 
+	#[allow(clippy::await_holding_lock)] // Serializes process-global native fault injection.
 	async fn live_disarm_fault_enters_custody(fault: LiveDisarmFault) -> Result<()> {
 		let _serial = serial_job_extraction();
 		let _fault_cleanup = ExtractionFaultCleanup;
