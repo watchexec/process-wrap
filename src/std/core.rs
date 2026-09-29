@@ -228,10 +228,12 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	/// child remains live and must not be used after spawn returns as a signal or kill target or as a
 	/// substitute for lower-child synchronized live signalling.
 	///
-	/// A custom provider child whose live-facing [`ChildWrapper::id`] cannot supply the original PID
-	/// when process-wrap receives it must override this method if it advertises composition with
-	/// `ProcessGroup` or `ProcessSession`. Other children may retain the default; this contract does not
-	/// require every wrapper to preserve historical identity.
+	/// For this installation path, `try_spawned_id` consults this capability rather than the
+	/// live-facing [`ChildWrapper::id`]. Every self-terminal custom or provider child that advertises
+	/// composition with `ProcessGroup` or `ProcessSession` must override this method and retain the
+	/// original spawned PID. Transparent wrappers may retain the default so traversal can use a lower
+	/// layer's advertised capability. Children and wrappers that do not advertise this supervision
+	/// composition need not retain historical identity.
 	#[doc(hidden)]
 	#[cfg(all(unix, feature = "process-group"))]
 	fn spawned_id_layer(&self) -> Option<u32> {
