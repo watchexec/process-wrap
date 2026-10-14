@@ -26,7 +26,7 @@ fn wrapped_helper(mode: &str) -> Result<ChildGuard> {
 	let filter = helper_test_filter();
 	let mut command = CommandWrap::with_new(executable, |command| {
 		command
-			.args(["--exact", &filter])
+			.args(["--exact", &filter, "--nocapture"])
 			.env("PROCESS_WRAP_ACCOUNTING_HELPER", mode)
 			.stdout(Stdio::piped());
 	});
@@ -101,7 +101,7 @@ fn helper_entrypoint() -> Result<()> {
 			let executable = std::env::current_exe()?;
 			let filter = helper_test_filter();
 			let mut worker = Command::new(executable)
-				.args(["--exact", &filter])
+				.args(["--exact", &filter, "--nocapture"])
 				.env("PROCESS_WRAP_ACCOUNTING_HELPER", "cpu-worker")
 				.stdout(Stdio::null())
 				.spawn()?;
