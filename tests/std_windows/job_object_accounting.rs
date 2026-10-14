@@ -1,7 +1,9 @@
 use std::{
-	io::{BufRead, BufReader, ErrorKind},
+	hint::black_box,
+	io::{BufRead, BufReader, ErrorKind, Write},
 	process::{Command, Stdio},
-	time::Duration,
+	thread,
+	time::{Duration, Instant},
 };
 
 use super::prelude::*;
@@ -15,13 +17,19 @@ impl Drop for ChildGuard {
 	}
 }
 
+fn helper_test_filter() -> String {
+	format!("{}::helper_entrypoint", module_path!())
+}
+
 fn wrapped_helper(mode: &str) -> Result<ChildGuard> {
-	let mut command = CommandWrap::with_new(
-		env!("CARGO_BIN_EXE_job-object-accounting-helper"),
-		|command| {
-			command.arg(mode).stdout(Stdio::piped());
-		},
-	);
+	let executable = std::env::current_exe()?;
+	let filter = helper_test_filter();
+	let mut command = CommandWrap::with_new(executable, |command| {
+		command
+			.args(["--exact", &filter])
+			.env("PROCESS_WRAP_ACCOUNTING_HELPER", mode)
+			.stdout(Stdio::piped());
+	});
 	command.wrap(JobObject);
 	Ok(ChildGuard(command.spawn()?))
 }
@@ -31,14 +39,18 @@ fn read_ready(child: &mut dyn ChildWrapper) -> Result<()> {
 		.stdout()
 		.take()
 		.ok_or_else(|| std::io::Error::other("helper stdout was not piped"))?;
+	let mut reader = BufReader::new(stdout);
 	let mut line = String::new();
-	BufReader::new(stdout).read_line(&mut line)?;
-	if line.trim() == "child-exited" || line.trim() == "ready" {
-		Ok(())
-	} else {
-		Err(std::io::Error::other(
-			"helper returned an unexpected readiness line",
-		))
+	loop {
+		line.clear();
+		if reader.read_line(&mut line)? == 0 {
+			return Err(std::io::Error::other(
+				"helper exited before reporting readiness",
+			));
+		}
+		if line.trim() == "child-exited" || line.trim() == "ready" {
+			return Ok(());
+		}
 	}
 }
 
@@ -76,4 +88,38 @@ fn child_without_job_object_reports_accounting_unavailable() -> Result<()> {
 	assert_eq!(cpu_error.kind(), ErrorKind::Unsupported);
 	assert_eq!(memory_error.kind(), ErrorKind::Unsupported);
 	Ok(())
+}
+
+#[test]
+fn helper_entrypoint() -> Result<()> {
+	let Some(mode) = std::env::var_os("PROCESS_WRAP_ACCOUNTING_HELPER") else {
+		return Ok(());
+	};
+
+	match mode.to_str() {
+		Some("cpu-root") => {
+			let executable = std::env::current_exe()?;
+			let filter = helper_test_filter();
+			let mut worker = Command::new(executable)
+				.args(["--exact", &filter])
+				.env("PROCESS_WRAP_ACCOUNTING_HELPER", "cpu-worker")
+				.stdout(Stdio::null())
+				.spawn()?;
+			worker.wait()?;
+			writeln!(std::io::stdout().lock(), "child-exited")?;
+			loop {
+				thread::sleep(Duration::from_secs(60));
+			}
+		}
+		Some("cpu-worker") => {
+			let deadline = Instant::now() + Duration::from_millis(700);
+			let mut value = 0_u64;
+			while Instant::now() < deadline {
+				value = value.wrapping_mul(6364136223846793005).wrapping_add(1);
+				black_box(value);
+			}
+			Ok(())
+		}
+		_ => Err(std::io::Error::other("expected helper mode").into()),
+	}
 }

@@ -40,12 +40,6 @@ remoteprocess = "0.5.0"
 tempfile = { version = "3.20.0", default-features = false }
 tokio = { version = "1.38.2", features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
 
-[[bin]]
-name = "job-object-accounting-helper"
-path = "tests/support/job_object_accounting_helper.rs"
-test = false
-bench = false
-
 [features]
 default = ["creation-flags", "job-object", "kill-on-drop", "process-group", "process-session", "tracing"]
 
