@@ -1,7 +1,7 @@
 use std::{
 	io::{BufRead, BufReader, Error, ErrorKind, Result, Write},
 	process::{Child, Command},
-	sync::{Arc, mpsc},
+	sync::{Arc, Mutex, mpsc},
 	thread::{self, sleep},
 	time::{Duration, Instant},
 };
@@ -240,8 +240,46 @@ impl Drop for EventHandle {
 	}
 }
 
+#[derive(Debug)]
+struct ObservedProcessHandle(usize);
+
+impl ObservedProcessHandle {
+	fn open(pid: u32) -> Result<Self> {
+		let handle =
+			unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }.map_err(Error::other)?;
+		Ok(Self(handle.0 as usize))
+	}
+
+	fn wait_for_exit(&self) -> Result<()> {
+		let deadline = Instant::now() + EXIT_TIMEOUT;
+		loop {
+			match unsafe { WaitForSingleObject(HANDLE(self.0 as _), 0) } {
+				WAIT_OBJECT_0 => return Ok(()),
+				WAIT_FAILED => return Err(Error::last_os_error()),
+				WAIT_TIMEOUT if Instant::now() < deadline => sleep(Duration::from_millis(10)),
+				WAIT_TIMEOUT => {
+					return Err(Error::new(
+						ErrorKind::TimedOut,
+						"process remained alive after job assignment failed",
+					));
+				}
+				result => return Err(Error::other(format!("unexpected wait result: {result:?}"))),
+			}
+		}
+	}
+}
+
+impl Drop for ObservedProcessHandle {
+	fn drop(&mut self) {
+		unsafe { CloseHandle(HANDLE(self.0 as _)) }.ok();
+	}
+}
+
 #[derive(Clone, Debug)]
-struct EventAsProcessHandle(Arc<EventHandle>);
+struct EventAsProcessHandle {
+	event: Arc<EventHandle>,
+	observed_process: Arc<Mutex<Option<ObservedProcessHandle>>>,
+}
 
 #[derive(Debug)]
 struct MisreportedProcessHandleChild {
@@ -291,9 +329,13 @@ impl CommandWrapper for EventAsProcessHandle {
 	) -> Result<Box<dyn ChildWrapper>> {
 		let child = unsafe { child.try_into_inner_child() }
 			.map_err(|_| Error::other("test expected a native child"))?;
+		*self
+			.observed_process
+			.lock()
+			.expect("process observation lock") = Some(ObservedProcessHandle::open(child.id())?);
 		Ok(Box::new(MisreportedProcessHandleChild {
 			child,
-			event: Arc::clone(&self.0),
+			event: Arc::clone(&self.event),
 		}))
 	}
 }
@@ -311,6 +353,7 @@ fn failed_job_assignment_kills_the_suspended_process_before_its_marker_runs() ->
 	std::fs::remove_file(&marker)?;
 
 	let event = Arc::new(EventHandle::new()?);
+	let observed_process = Arc::new(Mutex::new(None));
 	let mut command = CommandWrap::with_new("cmd.exe", |command| {
 		command.current_dir(directory.path()).args([
 			"/D",
@@ -320,13 +363,22 @@ fn failed_job_assignment_kills_the_suspended_process_before_its_marker_runs() ->
 		]);
 	});
 	command
-		.wrap(EventAsProcessHandle(Arc::clone(&event)))
+		.wrap(EventAsProcessHandle {
+			event: Arc::clone(&event),
+			observed_process: Arc::clone(&observed_process),
+		})
 		.wrap(JobObject);
 
 	let error = command
 		.spawn()
 		.expect_err("an event handle cannot be assigned to a job");
 	assert_eq!(error.kind(), ErrorKind::Other);
+	let observed_process = observed_process
+		.lock()
+		.expect("process observation lock")
+		.take()
+		.expect("test wrapper observed the spawned process");
+	observed_process.wait_for_exit()?;
 	assert!(
 		!marker.exists(),
 		"the suspended command ran before assignment failed"
