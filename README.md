@@ -115,6 +115,19 @@ CommandWrap::with_new("watch", |command| { command.arg("ls"); })
 requested flag, temporarily adds `CREATE_SUSPENDED` while assigning the process, and resumes it
 after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
 
+For the std frontend, add [`KillOnDrop`] to opt in to Windows' kill-on-job-close behavior. Without
+the marker, the existing behavior is preserved and dropping the child wrapper does not terminate
+the job. The marker and `JobObject` may be registered in either order:
+
+```rust
+use process_wrap::std::*;
+
+let mut command = CommandWrap::with_new("watch", |command| { command.arg("ls"); });
+command.wrap(JobObject).wrap(KillOnDrop);
+let child = command.spawn()?;
+drop(child); // terminates every process still in the job
+```
+
 ### Process group
 
 - Platforms: POSIX (Linux, Mac, BSDs...)
@@ -189,11 +202,13 @@ after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
 
 ### Kill on drop
 
-- Platforms: all (Tokio-only)
+- Platforms: all; std opt-in is Windows-only and requires `JobObject`
 - Like command-group.
 - Feature: `kill-on-drop` (default)
 
-This is a shim to allow wrappers to handle the kill-on-drop flag, as it can't be read from Command.
+For Tokio, this shim sets the command's kill-on-drop flag so wrappers can read it. For std on
+Windows, it opts `JobObject` into `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; it has no effect without
+`JobObject`. The std job-object default remains unchanged when the marker is absent.
 
 ```rust
 let child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
@@ -261,7 +276,7 @@ Both can exist at the same time, but generally you should use one or the other.
 
 - `creation-flags`: **default**, enables the [creation flags](#creation-flags) wrapper.
 - `job-object`: **default**, enables the [job object](#job-object) wrapper.
-- `kill-on-drop`: **default**, enables the [kill on drop](#kill-on-drop) wrapper.
+- `kill-on-drop`: **default**, enables the [kill on drop](#kill-on-drop) wrapper (including the std Windows `JobObject` opt-in).
 - `process-group`: **default**, enables the [process group](#process-group) wrapper.
 - `process-session`: **default**, enables the [process session](#process-session) wrapper.
 - `reset-sigmask`: enables the [reset signal mask](#reset-signal-mask) wrapper.

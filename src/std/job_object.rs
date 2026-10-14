@@ -24,6 +24,8 @@ use crate::{
 
 #[cfg(feature = "creation-flags")]
 use super::CreationFlags;
+#[cfg(feature = "kill-on-drop")]
+use super::KillOnDrop;
 use super::{ChildWrapper, CommandWrap, CommandWrapper};
 
 /// Wrapper which creates a job object context for a `Command`.
@@ -82,6 +84,11 @@ impl CommandWrapper for JobObject {
 		mut inner: Box<dyn ChildWrapper>,
 		core: &CommandWrap,
 	) -> Result<Box<dyn ChildWrapper>> {
+		#[cfg(feature = "kill-on-drop")]
+		let kill_on_drop = core.has_wrap::<KillOnDrop>();
+		#[cfg(not(feature = "kill-on-drop"))]
+		let kill_on_drop = false;
+
 		let policy = job_creation_flags(user_creation_flags(core));
 
 		#[cfg(feature = "tracing")]
@@ -103,7 +110,7 @@ impl CommandWrapper for JobObject {
 			}
 		};
 
-		let job_port = match make_job_object(handle, false) {
+		let job_port = match make_job_object(handle, kill_on_drop) {
 			Ok(job_port) => job_port,
 			Err(error) => {
 				terminate_child(&mut *inner);

@@ -16,6 +16,8 @@ mod creation_flags_job_object;
 mod id_same_as_inner;
 mod inner_read_stdout;
 mod into_inner_write_stdin;
+#[cfg(all(feature = "job-object", feature = "kill-on-drop"))]
+mod job_object_kill_on_drop;
 mod kill_and_try_wait;
 #[cfg(feature = "job-object")]
 mod process_handle;

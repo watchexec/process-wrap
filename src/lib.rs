@@ -77,20 +77,28 @@
 //! # KillOnDrop and CreationFlags
 //!
 //! The options set on an underlying `Command` are not queryable from library or user code. In most
-//! cases this is not an issue; however on Windows, the `JobObject` wrapper needs to know the value
-//! of `.kill_on_drop()` and any `.creation_flags()` set. The `KillOnDrop` and `CreationFlags` are
-//! "shims" that _should_ be used instead of the aforementioned methods on `Command`. They will
-//! internally set the values on the `Command` and also store them in the wrapper, so that wrappers
-//! are able to access them.
+//! cases this is not an issue; however on Windows, wrappers may need to know the value of
+//! `.kill_on_drop()` and any `.creation_flags()` set. `KillOnDrop` and `CreationFlags` are shims
+//! that store these options where wrappers can access them. Tokio's `KillOnDrop` also sets the
+//! underlying command's kill-on-drop option. The std `KillOnDrop` is an opt-in for `JobObject`
+//! kill-on-close behavior; without it, std `JobObject` keeps its existing behavior.
 //!
 //! In practice:
 //!
-//! ## Instead of `.kill_on_drop(true)` (Tokio-only):
+//! ## Tokio: instead of `.kill_on_drop(true)`:
 //!
 //! ```rust
 //! use process_wrap::tokio::*;
 //! let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
 //! command.wrap(KillOnDrop);
+//! ```
+//!
+//! ## std: opt in to Windows Job Object termination when the child wrapper is dropped:
+//!
+//! ```rust,ignore
+//! use process_wrap::std::*;
+//! let mut command = CommandWrap::with_new("watch", |command| { command.arg("ls"); });
+//! command.wrap(JobObject).wrap(KillOnDrop);
 //! ```
 //!
 //! ## Instead of `.creation_flags(CREATE_NO_WINDOW)` (Windows-only):
@@ -462,7 +470,7 @@
 //!
 //! - `creation-flags`: **default**, enables the creation flags wrapper (Windows-only).
 //! - `job-object`: **default**, enables the job object wrapper (Windows-only).
-//! - `kill-on-drop`: **default**, enables the kill on drop wrapper (Tokio-only).
+//! - `kill-on-drop`: **default**, enables Tokio kill-on-drop and std Windows JobObject kill-on-close.
 //! - `process-group`: **default**, enables the process group wrapper (Unix-only).
 //! - `process-session`: **default**, enables the process session wrapper (Unix-only).
 //! - `reset-sigmask`: enables the sigmask reset wrapper (Unix-only).
