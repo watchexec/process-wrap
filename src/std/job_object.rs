@@ -161,6 +161,14 @@ impl ChildWrapper for JobObjectChild {
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
 		child_process_handle(self.inner.as_ref())
 	}
+	#[cfg(windows)]
+	fn job_cpu_time(&self) -> Result<Duration> {
+		crate::windows::job_cpu_time(self.job_port.job)
+	}
+	#[cfg(windows)]
+	fn job_resident_bytes(&self) -> Result<u64> {
+		crate::windows::job_resident_bytes(self.job_port.job)
+	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn start_kill(&mut self) -> Result<()> {

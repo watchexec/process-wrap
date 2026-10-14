@@ -1,7 +1,7 @@
 //! Windows API support functions.
 
 use std::{
-	io::{Error, Result},
+	io::{Error, ErrorKind, Result},
 	ops::ControlFlow,
 	time::Duration,
 };
@@ -19,9 +19,10 @@ use windows::{
 			IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED},
 			JobObjects::{
 				AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-				JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-				JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
-				SetInformationJobObject, TerminateJobObject,
+				JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+				JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
+				JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+				QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 			},
 			Threading::{
 				CREATE_SUSPENDED, GetProcessId, INFINITE, OpenThread, PROCESS_CREATION_FLAGS,
@@ -111,6 +112,43 @@ impl Drop for JobPort {
 		unsafe { CloseHandle(self.job.0) }.ok();
 		unsafe { CloseHandle(self.completion_port.0) }.ok();
 	}
+}
+
+fn job_accounting(job: JobHandle) -> Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION> {
+	let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+	let size = u32::try_from(std::mem::size_of_val(&accounting)).map_err(Error::other)?;
+	// SAFETY: `accounting` is a writable, correctly sized instance of the information class.
+	unsafe {
+		QueryInformationJobObject(
+			Some(job.0),
+			JobObjectBasicAccountingInformation,
+			(&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+			size,
+			None,
+		)
+	}
+	.map_err(Error::other)?;
+	Ok(accounting)
+}
+
+pub(crate) fn job_cpu_time(job: JobHandle) -> Result<Duration> {
+	let accounting = job_accounting(job)?;
+	let user = u64::try_from(accounting.TotalUserTime).map_err(Error::other)?;
+	let kernel = u64::try_from(accounting.TotalKernelTime).map_err(Error::other)?;
+	let ticks = user
+		.checked_add(kernel)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "job CPU counter overflowed"))?;
+	let nanos = ticks
+		.checked_mul(100)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "job CPU duration overflowed"))?;
+	Ok(Duration::from_nanos(nanos))
+}
+
+pub(crate) fn job_resident_bytes(_job: JobHandle) -> Result<u64> {
+	Err(Error::new(
+		ErrorKind::Unsupported,
+		"Windows Job Object has no coherent current resident-memory aggregate",
+	))
 }
 
 /// Create a JobObject and an associated completion port.

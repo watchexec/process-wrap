@@ -6,6 +6,8 @@ use std::{
 
 #[cfg(windows)]
 use std::os::windows::io::{AsHandle, BorrowedHandle};
+#[cfg(windows)]
+use std::time::Duration;
 
 #[cfg(unix)]
 use nix::{
@@ -90,6 +92,46 @@ pub trait ChildWrapper: Any + std::fmt::Debug + Send + Sync {
 	#[cfg(windows)]
 	fn process_handle(&self) -> Option<BorrowedHandle<'_>> {
 		None
+	}
+
+	/// Return cumulative user plus kernel CPU time for this child's Windows Job Object.
+	///
+	/// This includes terminated members and is available only when wrapped with `JobObject`.
+	/// Transparent wrappers forward to their child; other children return `Unsupported`.
+	#[cfg(windows)]
+	fn job_cpu_time(&self) -> Result<Duration> {
+		let inner = self.inner();
+		let self_pointer = self as *const Self as *const ();
+		let inner_pointer = inner as *const dyn ChildWrapper as *const ();
+		if self_pointer != inner_pointer {
+			inner.job_cpu_time()
+		} else {
+			Err(std::io::Error::new(
+				std::io::ErrorKind::Unsupported,
+				"child has no Windows Job Object accounting boundary",
+			))
+		}
+	}
+
+	/// Return a coherent current working-set total for this child's Windows Job Object.
+	///
+	/// If a complete aggregate cannot be sampled, this returns an error instead of a partial sum.
+	/// Implementations must not approximate a coherent aggregate by adding separate per-process
+	/// snapshots. Transparent wrappers forward to their child; unsupported children return
+	/// `Unsupported`.
+	#[cfg(windows)]
+	fn job_resident_bytes(&self) -> Result<u64> {
+		let inner = self.inner();
+		let self_pointer = self as *const Self as *const ();
+		let inner_pointer = inner as *const dyn ChildWrapper as *const ();
+		if self_pointer != inner_pointer {
+			inner.job_resident_bytes()
+		} else {
+			Err(std::io::Error::new(
+				std::io::ErrorKind::Unsupported,
+				"child has no Windows Job Object accounting boundary",
+			))
+		}
 	}
 
 	/// Obtain a clone if possible.
