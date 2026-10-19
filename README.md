@@ -178,7 +178,7 @@ This is a shim to allow setting Windows process creation flags with this API, as
 ```rust
 use windows::Win32::System::Threading::*;
 CommandWrap::with_new("watch", |command| { command.arg("ls"); })
-  .wrap(CreationFlags(CREATE_NO_WINDOW | CREATE_DETACHED))
+  .wrap(CreationFlags(CREATE_NO_WINDOW | DETACHED_PROCESS))
   .wrap(JobObject)
   .spawn()?;
 ```
