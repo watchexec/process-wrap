@@ -7,7 +7,8 @@
 //! process-wrap = { version = "10.0.1", features = ["std"] }
 //! ```
 //!
-//! ```rust,no_run
+#![cfg_attr(not(feature = "std"), doc = "```ignore")]
+#![cfg_attr(feature = "std", doc = "```rust,no_run")]
 //! # fn main() -> std::io::Result<()> {
 //! use process_wrap::std::*;
 //!
@@ -39,7 +40,8 @@
 //! The core API is [`CommandWrap`](std::CommandWrap) and [`CommandWrap`](tokio::CommandWrap),
 //! which can be constructed either directly from an existing `process::Command`:
 //!
-//! ```rust
+#![cfg_attr(not(feature = "std"), doc = "```ignore")]
+#![cfg_attr(feature = "std", doc = "```rust")]
 //! use process_wrap::std::*;
 //! use std::process::Command;
 //! let mut command = Command::new("ls");
@@ -51,7 +53,8 @@
 //!
 //! ...or with a somewhat more ergonomic closure pattern:
 //!
-//! ```rust
+#![cfg_attr(not(feature = "std"), doc = "```ignore")]
+#![cfg_attr(feature = "std", doc = "```rust")]
 //! use process_wrap::std::*;
 //! let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
 //! #[cfg(unix)] { command.wrap(ProcessGroup::leader()); }
@@ -60,7 +63,11 @@
 //!
 //! If targetting a single platform, then a fluent style is possible:
 //!
-//! ```rust
+#![cfg_attr(
+	not(all(feature = "std", feature = "process-group")),
+	doc = "```ignore"
+)]
+#![cfg_attr(all(feature = "std", feature = "process-group"), doc = "```rust")]
 //! use process_wrap::std::*;
 //! CommandWrap::with_new("ls", |command| { command.arg("-l"); })
 //!    .wrap(ProcessGroup::leader());
@@ -87,7 +94,11 @@
 //!
 //! ## Instead of `.kill_on_drop(true)` (Tokio-only):
 //!
-//! ```rust
+#![cfg_attr(
+	not(all(feature = "tokio1", feature = "kill-on-drop")),
+	doc = "```ignore"
+)]
+#![cfg_attr(all(feature = "tokio1", feature = "kill-on-drop"), doc = "```rust")]
 //! use process_wrap::tokio::*;
 //! let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
 //! command.wrap(KillOnDrop);
@@ -95,8 +106,16 @@
 //!
 //! ## Instead of `.creation_flags(CREATE_NO_WINDOW)` (Windows-only):
 //!
-//! ```rust,ignore
+#![cfg_attr(
+	not(all(target_os = "windows", feature = "creation-flags", feature = "std")),
+	doc = "```ignore"
+)]
+#![cfg_attr(
+	all(target_os = "windows", feature = "creation-flags", feature = "std"),
+	doc = "```rust,no_run"
+)]
 //! use process_wrap::std::*;
+//! use windows::Win32::System::Threading::*;
 //! let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
 //! command.wrap(CreationFlags(CREATE_NO_WINDOW));
 //! ```
@@ -118,7 +137,8 @@
 //! (and indeed internally are generated using a common macro), but differ in the exact types used.
 //! Here's the most basic impl (shown for Tokio):
 //!
-//! ```rust
+#![cfg_attr(not(feature = "tokio1"), doc = "```ignore")]
+#![cfg_attr(feature = "tokio1", doc = "```rust")]
 //! use process_wrap::tokio::*;
 //! #[derive(Debug)]
 //! pub struct YourWrapper;
@@ -157,7 +177,8 @@
 //! `std::io::copy` in a background thread to non-blockingly stream that data to disk as it comes
 //! in.
 //!
-//! ```rust
+#![cfg_attr(not(feature = "std"), doc = "```ignore")]
+#![cfg_attr(feature = "std", doc = "```rust")]
 //! # use process_wrap::std::{CommandWrap, CommandWrapper};
 //! # use std::{fs::File, io, path::PathBuf, process::Command, thread};
 //! #[derive(Debug)]
@@ -192,7 +213,8 @@
 //! To fix this, we'll need to keep track of the background thread's `ThreadHandle` and `.join()` it
 //! when calling `.wait()` on the `ChildWrapper`.
 //!
-//! ```rust
+#![cfg_attr(not(feature = "std"), doc = "```ignore")]
+#![cfg_attr(feature = "std", doc = "```rust")]
 //! # use process_wrap::std::{ChildWrapper, CommandWrap, CommandWrapper};
 //! # use std::{
 //! #     fs::File,
@@ -290,7 +312,8 @@
 //! dropping `tx` from `Command` should be totally safe. We'll get `Command` to "drop" `tx` by
 //! setting its `stdin` and `stdout` to `Stdio::null()` in `CommandWrapper::post_spawn()`.
 //!
-//! ```rust
+#![cfg_attr(not(feature = "std"), doc = "```ignore")]
+#![cfg_attr(feature = "std", doc = "```rust")]
 //! # use process_wrap::std::{CommandWrap, CommandWrapper};
 //! # use std::{
 //! #     io,
@@ -322,7 +345,8 @@
 //!
 //! Finally, we can test that our new command-wrapper works:
 //!
-//! ```rust
+#![cfg_attr(not(feature = "std"), doc = "```ignore")]
+#![cfg_attr(feature = "std", doc = "```rust")]
 //! # use process_wrap::std::{ChildWrapper, CommandWrap, CommandWrapper};
 //! # use std::{
 //! #     error::Error,
