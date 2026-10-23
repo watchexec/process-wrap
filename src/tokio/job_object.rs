@@ -18,7 +18,7 @@ use windows::Win32::{
 use crate::{
 	ChildExitStatus,
 	windows::{
-		JobPort, job_creation_flags, make_job_object, resume_threads, terminate_job, wait_on_job,
+		JobObjectHandle, JobPort, job_creation_flags, make_job_object, resume_threads, wait_on_job,
 	},
 };
 
@@ -119,7 +119,7 @@ impl CommandWrapper for JobObject {
 
 		if policy.resume_after_assignment {
 			if let Err(error) = resume_threads(handle) {
-				let _ = terminate_job(job_port.job, 1);
+				let _ = job_port.job.terminate(1);
 				terminate_child(&mut *inner);
 				return Err(error);
 			}
@@ -146,6 +146,15 @@ impl JobObjectChild {
 			job_port,
 		}
 	}
+
+	/// Get a handle to the job object this child was assigned to.
+	///
+	/// Unlike the child, the handle can be cloned and used from other threads, for example to
+	/// terminate the job while another thread waits on the child, and it keeps the job open after
+	/// the child is dropped. See [`JobObjectHandle`].
+	pub fn job_handle(&self) -> JobObjectHandle {
+		self.job_port.job.clone()
+	}
 }
 
 impl ChildWrapper for JobObjectChild {
@@ -170,7 +179,7 @@ impl ChildWrapper for JobObjectChild {
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn start_kill(&mut self) -> Result<()> {
-		terminate_job(self.job_port.job, 1)
+		self.job_port.job.terminate(1)
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]

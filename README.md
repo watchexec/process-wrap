@@ -115,6 +115,22 @@ CommandWrap::with_new("watch", |command| { command.arg("ls"); })
 requested flag, temporarily adds `CREATE_SUSPENDED` while assigning the process, and resumes it
 after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
 
+To terminate the job without the child, for example from another thread while the child is being
+waited on, get a `JobObjectHandle` from the `JobObjectChild`. It can be cloned and sent across
+threads, and keeps the job open for as long as it's held, even after the child is dropped:
+
+```rust
+let mut child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
+  .wrap(JobObject)
+  .spawn()?;
+let job = (child.as_ref() as &dyn std::any::Any)
+  .downcast_ref::<JobObjectChild>()
+  .expect("JobObject is the outermost wrapper")
+  .job_handle();
+std::thread::spawn(move || job.terminate(1));
+let status = child.wait().await?;
+```
+
 ### Process group
 
 - Platforms: POSIX (Linux, Mac, BSDs...)

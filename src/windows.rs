@@ -3,6 +3,10 @@
 use std::{
 	io::{Error, Result},
 	ops::ControlFlow,
+	os::windows::io::{
+		AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle as OwnedJobHandle,
+	},
+	sync::Arc,
 	time::Duration,
 };
 
@@ -85,11 +89,37 @@ mod creation_flag_tests {
 	}
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct JobHandle(pub HANDLE);
+/// A handle to the job object of a `JobObjectChild`, shared with it.
+///
+/// Get one with `JobObjectChild::job_handle()`. Unlike the child, it can be cloned and sent to other
+/// threads, so the job can be terminated without the child: for example while another thread waits
+/// on it.
+///
+/// The job is closed once the child and every handle to it have been dropped. With `KillOnDrop`
+/// (Tokio-only), that's when the processes still in it are killed, so holding a handle keeps them
+/// running after the child is dropped. A child unwrapped with `into_inner()` leaves the job open.
+///
+/// [`AsHandle`] borrows the job's handle, to use it with other job object APIs.
+#[derive(Clone, Debug)]
+pub struct JobObjectHandle(Arc<OwnedJobHandle>);
 
-unsafe impl Send for JobHandle {}
-unsafe impl Sync for JobHandle {}
+impl JobObjectHandle {
+	/// Terminate every process in the job, without waiting for them to exit.
+	///
+	/// This is what `start_kill()` does on the child, but it doesn't need the child. Each process
+	/// exits with `exit_code`. See [TerminateJobObject](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject).
+	#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
+	pub fn terminate(&self, exit_code: u32) -> Result<()> {
+		unsafe { TerminateJobObject(HANDLE(self.0.as_raw_handle()), exit_code) }
+			.map_err(Error::other)
+	}
+}
+
+impl AsHandle for JobObjectHandle {
+	fn as_handle(&self) -> BorrowedHandle<'_> {
+		self.0.as_handle()
+	}
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct PortHandle(pub HANDLE);
@@ -99,16 +129,16 @@ unsafe impl Sync for PortHandle {}
 
 /// A JobObject and its associated completion port.
 ///
-/// This struct closes the handles when dropped.
+/// This struct closes the completion port when dropped; the job is closed when the last
+/// `JobObjectHandle` to it is.
 #[derive(Debug)]
 pub(crate) struct JobPort {
-	pub job: JobHandle,
+	pub job: JobObjectHandle,
 	pub completion_port: PortHandle,
 }
 
 impl Drop for JobPort {
 	fn drop(&mut self) {
-		unsafe { CloseHandle(self.job.0) }.ok();
 		unsafe { CloseHandle(self.completion_port.0) }.ok();
 	}
 }
@@ -173,7 +203,9 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 	debug!(?job, ?process_handle, "done AssignProcessToJobObject");
 
 	Ok(JobPort {
-		job: JobHandle(job.into_raw()),
+		job: JobObjectHandle(Arc::new(unsafe {
+			OwnedJobHandle::from_raw_handle(job.into_raw().0)
+		})),
 		completion_port: PortHandle(completion_port.into_raw()),
 	})
 }
@@ -232,12 +264,6 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 
 	let tool_handle = OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }?);
 	unsafe { inner(child_id, tool_handle.0) }
-}
-
-/// Terminate a job object without waiting for the processes to exit.
-#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
-pub(crate) fn terminate_job(job: JobHandle, exit_code: u32) -> Result<()> {
-	unsafe { TerminateJobObject(job.0, exit_code) }.map_err(Error::other)
 }
 
 /// Wait for a job to complete.
