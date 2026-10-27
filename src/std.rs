@@ -8,6 +8,9 @@
 //! use process_wrap::std::*;
 //! ```
 
+#[cfg(all(windows, feature = "job-object"))]
+#[doc(inline)]
+pub use crate::windows::JobObjectHandle;
 #[doc(inline)]
 pub use core::{ChildWrapper, CommandWrap, CommandWrapper};
 #[cfg(all(windows, feature = "creation-flags"))]
