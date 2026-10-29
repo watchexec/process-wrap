@@ -9,7 +9,6 @@
 //!
 #![cfg_attr(not(feature = "std"), doc = "```ignore")]
 #![cfg_attr(feature = "std", doc = "```rust,no_run")]
-//! # fn main() -> std::io::Result<()> {
 //! use process_wrap::std::*;
 //!
 //! let mut command = CommandWrap::with_new("watch", |command| { command.arg("ls"); });
@@ -18,7 +17,7 @@
 //! let mut child = command.spawn()?;
 //! let status = child.wait()?;
 //! dbg!(status);
-//! # Ok(()) }
+//! # Ok::<(), std::io::Error>(())
 //! ```
 //!
 //! ## Migrating from command-group
@@ -92,7 +91,7 @@
 //!
 //! In practice:
 //!
-//! ## Instead of `.kill_on_drop(true)` (Tokio-only):
+//! ## Instead of the tokio-only `.kill_on_drop(true)`:
 //!
 #![cfg_attr(
 	not(all(feature = "tokio1", feature = "kill-on-drop")),
@@ -486,10 +485,11 @@
 //!
 //! - `creation-flags`: **default**, enables the creation flags wrapper (Windows-only).
 //! - `job-object`: **default**, enables the job object wrapper (Windows-only).
-//! - `kill-on-drop`: **default**, enables the kill on drop wrapper (Tokio-only).
+//! - `kill-on-drop`: **default**, enables the kill on drop wrapper.
 //! - `process-group`: **default**, enables the process group wrapper (Unix-only).
 //! - `process-session`: **default**, enables the process session wrapper (Unix-only).
 //! - `reset-sigmask`: enables the sigmask reset wrapper (Unix-only).
+//! - `propagate-thread-death`: enables the propagate thread death wrapper (Linux-only).
 //!
 #![doc(html_favicon_url = "https://watchexec.github.io/logo:command-group.svg")]
 #![doc(html_logo_url = "https://watchexec.github.io/logo:command-group.svg")]

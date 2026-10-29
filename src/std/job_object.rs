@@ -24,9 +24,11 @@ use crate::{
 
 #[cfg(feature = "creation-flags")]
 use super::CreationFlags;
+#[cfg(feature = "kill-on-drop")]
+use super::KillOnDrop;
 use super::{ChildWrapper, CommandWrap, CommandWrapper};
 
-/// Wrapper which creates a job object context for a `Command`.
+/// Wrapper which creates a job object context for a [`Command`].
 ///
 /// This wrapper is only available on Windows.
 ///
@@ -34,10 +36,19 @@ use super::{ChildWrapper, CommandWrap, CommandWrapper};
 /// to process groups on Unix or even cgroups on Linux, with the ability to restrict resource use.
 /// See [Job Objects](https://docs.microsoft.com/en-us/windows/win32/procthread/job-objects).
 ///
+/// [`CreationFlags`] may be registered before or after [`JobObject`]; process-wrap preserves its flags
+/// and distinguishes explicit suspension from the temporary suspension needed for assignment.
+///
 /// This wrapper provides a child wrapper: [`JobObjectChild`].
 ///
-/// [`CreationFlags`] may be registered before or after `JobObject`; process-wrap preserves its flags
-/// and distinguishes explicit suspension from the temporary suspension needed for assignment.
+/// # Example
+///
+/// ```rust
+/// use process_wrap::std::{CommandWrap, JobObject};
+///
+/// let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
+/// command.wrap(JobObject);
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct JobObject;
 
@@ -45,7 +56,9 @@ fn user_creation_flags(core: &CommandWrap) -> PROCESS_CREATION_FLAGS {
 	#[cfg(feature = "creation-flags")]
 	{
 		core.get_wrap::<CreationFlags>()
-			.map_or(PROCESS_CREATION_FLAGS(0), |flags| flags.0)
+			.map_or(PROCESS_CREATION_FLAGS(0), |flags| {
+				PROCESS_CREATION_FLAGS(flags.0)
+			})
 	}
 	#[cfg(not(feature = "creation-flags"))]
 	{
@@ -82,10 +95,16 @@ impl CommandWrapper for JobObject {
 		mut inner: Box<dyn ChildWrapper>,
 		core: &CommandWrap,
 	) -> Result<Box<dyn ChildWrapper>> {
+		#[cfg(feature = "kill-on-drop")]
+		let kill_on_drop = core.has_wrap::<KillOnDrop>();
+		#[cfg(not(feature = "kill-on-drop"))]
+		let kill_on_drop = false;
+
 		let policy = job_creation_flags(user_creation_flags(core));
 
 		#[cfg(feature = "tracing")]
 		debug!(
+			?kill_on_drop,
 			resume_after_assignment = policy.resume_after_assignment,
 			"options from other wrappers"
 		);
@@ -103,7 +122,7 @@ impl CommandWrapper for JobObject {
 			}
 		};
 
-		let job_port = match make_job_object(handle, false) {
+		let job_port = match make_job_object(handle, kill_on_drop) {
 			Ok(job_port) => job_port,
 			Err(error) => {
 				terminate_child(&mut *inner);
@@ -146,8 +165,8 @@ impl JobObjectChild {
 	/// Unlike the child, the handle can be cloned and used from other threads, for example to
 	/// terminate the job while another thread waits on the child, and it keeps the job open after
 	/// the child is dropped. See [`JobObjectHandle`].
-	pub fn job_handle(&self) -> JobObjectHandle {
-		self.job_port.job.clone()
+	pub fn job_handle(&self) -> &JobObjectHandle {
+		&self.job_port.job
 	}
 }
 
