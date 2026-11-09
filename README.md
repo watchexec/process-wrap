@@ -219,7 +219,7 @@ let child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
 drop(child);
 ```
 
-### PropagateThreadDeath
+### Propagate Thread Death
 
 - Platforms: Linux only
 - Feature: `propagate-thread-death`
@@ -306,3 +306,4 @@ Both can exist at the same time, but generally you should use one or the other.
 - `process-group`: **default**, enables the [process group](#process-group) wrapper.
 - `process-session`: **default**, enables the [process session](#process-session) wrapper.
 - `reset-sigmask`: enables the [reset signal mask](#reset-signal-mask) wrapper.
+- `propagate-thread-death`: enables the [propagate thread death](#propagate-thread-death) wrapper.
