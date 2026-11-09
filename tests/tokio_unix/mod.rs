@@ -10,16 +10,7 @@ mod prelude {
 
 	pub const DIE_TIME: Duration = Duration::from_millis(100);
 
-	#[track_caller]
-	pub fn pid_alive(pid: i32) -> bool {
-		#[inline]
-		#[track_caller]
-		fn inner(pid: i32) -> std::result::Result<bool, remoteprocess::Error> {
-			Ok(!remoteprocess::Process::new(pid)?.threads()?.is_empty())
-		}
-
-		inner(pid).unwrap_or(false)
-	}
+	pub use crate::common::*;
 }
 
 mod id_same_as_inner;

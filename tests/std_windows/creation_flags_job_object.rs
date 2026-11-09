@@ -24,10 +24,10 @@ fn command(flags: PROCESS_CREATION_FLAGS, order: Order) -> CommandWrap {
 	});
 	match order {
 		Order::CreationFlagsFirst => {
-			command.wrap(CreationFlags(flags)).wrap(JobObject);
+			command.wrap(CreationFlags(flags.0)).wrap(JobObject);
 		}
 		Order::JobObjectFirst => {
-			command.wrap(JobObject).wrap(CreationFlags(flags));
+			command.wrap(JobObject).wrap(CreationFlags(flags.0));
 		}
 	}
 	command
@@ -52,7 +52,7 @@ fn preserves_flags_and_resumes_in_both_orders() -> Result<()> {
 	let flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
 	for order in [Order::CreationFlagsFirst, Order::JobObjectFirst] {
 		let mut command = command(flags, order);
-		assert_eq!(command.get_wrap::<CreationFlags>().unwrap().0, flags);
+		assert_eq!(command.get_wrap::<CreationFlags>().unwrap().0, flags.0);
 		let mut child = command.spawn_with(|command| {
 			let mut child = command.spawn()?;
 			let suspended = match process_has_suspended_thread(child.id()) {
@@ -69,7 +69,7 @@ fn preserves_flags_and_resumes_in_both_orders() -> Result<()> {
 				Err(Error::other("child was not created suspended"))
 			}
 		})?;
-		assert_eq!(command.get_wrap::<CreationFlags>().unwrap().0, flags);
+		assert_eq!(command.get_wrap::<CreationFlags>().unwrap().0, flags.0);
 		assert!(wait_for_exit(&mut *child)?.success());
 	}
 	Ok(())
@@ -91,7 +91,7 @@ fn leaves_explicit_suspension_in_both_orders() -> Result<()> {
 		child.start_kill()?;
 		let _ = wait_for_exit(&mut *child)?;
 		assert!(remained_suspended);
-		assert_eq!(command.get_wrap::<CreationFlags>().unwrap().0, flags);
+		assert_eq!(command.get_wrap::<CreationFlags>().unwrap().0, flags.0);
 	}
 	Ok(())
 }

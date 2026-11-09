@@ -95,8 +95,8 @@ mod creation_flag_tests {
 /// threads, so the job can be terminated without the child: for example while another thread waits
 /// on it.
 ///
-/// The job is closed once the child and every handle to it have been dropped. With `KillOnDrop`
-/// (Tokio-only), that's when the processes still in it are killed, so holding a handle keeps them
+/// The job is closed once the child and every handle to it have been dropped. With `KillOnDrop`,
+/// that's when the processes still in it are killed, so holding a handle keeps them
 /// running after the child is dropped. A child unwrapped with `into_inner()` leaves the job open.
 ///
 /// [`AsHandle`] borrows the job's handle, to use it with other job object APIs.

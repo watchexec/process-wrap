@@ -24,17 +24,26 @@ use crate::ChildExitStatus;
 
 use super::{ChildWrapper, CommandWrap, CommandWrapper};
 
-/// Wrapper which sets the process group of a `Command`.
+/// Wrapper which sets the process group of a [`Command`].
 ///
 /// This wrapper is only available on Unix.
 ///
 /// It sets the process group of a [`Command`], either to itself as the leader of a new group, or to
-/// an existing one by its PGID. See [setpgid(2)](https://pubs.opengroup.org/onlinepubs/9699919799/functions/setpgid.html).
+/// an existing one by its PGID. See [setpgid(2)](https://pubs.opengroup.org/onlinepubs/9799919799/functions/setpgid.html).
 ///
 /// Process groups direct signals to all members of the group, and also serve to control job
 /// placement in foreground or background, among other actions.
 ///
 /// This wrapper provides a child wrapper: [`ProcessGroupChild`].
+///
+/// # Example
+///
+/// ```rust
+/// use process_wrap::tokio::{CommandWrap, ProcessGroup};
+///
+/// let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
+/// command.wrap(ProcessGroup::leader());
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessGroup {
 	leader: Pid,

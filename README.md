@@ -192,9 +192,9 @@ CommandWrap::with_new("watch", |command| { command.arg("ls"); })
 This is a shim to allow setting Windows process creation flags with this API, as otherwise they'd be overwritten.
 
 ```rust
-use windows::Win32::System::Threading::*;
-CommandWrap::with_new("watch", |command| { command.arg("ls"); })
-  .wrap(CreationFlags(CREATE_NO_WINDOW | DETACHED_PROCESS))
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+let child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
+  .wrap(CreationFlags(CREATE_NO_WINDOW.0))
   .wrap(JobObject)
   .spawn()?;
 ```
@@ -205,7 +205,7 @@ after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
 
 ### Kill on drop
 
-- Platforms: all (Tokio-only)
+- Platforms: all
 - Like command-group.
 - Feature: `kill-on-drop` (default)
 
@@ -217,6 +217,31 @@ let child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessGroup::leader())
   .spawn()?;
 drop(child);
+```
+
+### PropagateThreadDeath
+
+- Platforms: Linux only
+- Feature: `propagate-thread-death`
+
+This sets [parent-death signal] on the child process.
+
+[parent-death signal]: https://www.man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html
+
+```rust
+use std::{io, thread, process::{Stdio, Command}};
+// PropagateThreadDeath ties the subprocess lifetime to the spawning thread.
+let handle = thread::spawn(|| {
+	let child = CommandWrap::from(Command::new("yes"))
+	.wrap(PropagateThreadDeath::default())
+	.spawn()?;
+	Ok::<_, io::Error>(child.id())
+});
+let dead_pid = handle
+	.join()
+	.expect("Thread panicked")
+	.expect("Thread failed to spawn");
+// The `yes` subprocess was killed by the kernel.
 ```
 
 ### Your own

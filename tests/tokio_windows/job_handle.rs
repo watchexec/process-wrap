@@ -88,6 +88,7 @@ fn job_handle(child: &dyn ChildWrapper) -> JobObjectHandle {
 		.downcast_ref::<JobObjectChild>()
 		.expect("JobObject is the outermost wrapper")
 		.job_handle()
+		.clone()
 }
 
 #[test]

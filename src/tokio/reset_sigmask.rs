@@ -7,8 +7,17 @@ use super::{CommandWrap, CommandWrapper};
 
 /// Wrapper which resets the process signal mask.
 ///
-/// By default a Command on Unix inherits its parent's [signal mask]. However, in some cases this
+/// By default a [`Command`] on Unix inherits its parent's [signal mask]. However, in some cases this
 /// is not what you want. This wrapper resets the command's sigmask by unblocking all signals.
+///
+/// # Example
+///
+/// ```rust
+/// use process_wrap::tokio::{CommandWrap, ResetSigmask};
+///
+/// let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
+/// command.wrap(ResetSigmask);
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct ResetSigmask;
 
