@@ -27,3 +27,10 @@ The job_object() and resume_threads() methods in src/windows.rs are
 adapted from the Windows™ version of the new() method in watchexec at
 src/process.rs, copyright Matt Green, licensed under Apache 2.0 only.
 <https://github.com/watchexec/watchexec/blob/07974e0d1411e79e653a5a5f610f923834628038/lib/src/process.rs#L305-L393>
+
+
+The job completion tracking in src/windows.rs and the std/Tokio job-object
+waiters is adapted from glendigity (glen)'s process-wrap PR #55, licensed under
+Apache 2.0 and MIT. It is adapted here to the current shared job-handle API.
+<https://github.com/watchexec/process-wrap/pull/55>
+<https://github.com/watchexec/process-wrap/commit/699d18b6c6e6a926f27c807a87b9fb1fa3bc8dc4>
