@@ -27,3 +27,10 @@ Reviewed IR-783 PR #75's test-only diff. The new tests exercise the opt-in close
 - Reviewed ticket acceptance checks 1–4. AC-1 is exercised by the opt-in descendant test; AC-2 is exercised by the suspended marker and setup-failure tests. The test diff does not establish AC-3's unchanged default behavior or AC-4's published release and downstream consumption.
 - The repository has no `spec/` tree or local `AGENTS.md`, `CLAUDE.md`, or `CONTRIBUTING.md`; the Linear ticket is the acceptance source for this review. No source or CI workflow file changed.
 - The Rust lane reviewed test determinism, ownership of Windows handles, suspended assignment ordering, setup-failure cleanup, and the assertions' relation to the ticket acceptance checks. No aggregate gate was run in this review pass.
+
+## Dispositions
+
+| FND | Outcome | Reason |
+| --- | --- | --- |
+| FND-001 | fixed | `default_job_object_does_not_kill_processes_when_its_handle_closes` drops the child and final Job Object handle, proves the leader and descendant remain alive, then explicitly cleans them up. |
+| FND-002 | fixed | `wait_for_marker` now reads until the complete `started` payload is present, retries `NotFound` and partial content, and returns other I/O errors. |
