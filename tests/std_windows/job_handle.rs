@@ -55,6 +55,10 @@ impl ProcessGuard {
 		Ok(())
 	}
 
+	fn terminate(&self) -> Result<()> {
+		unsafe { TerminateProcess(self.handle(), 1) }.map_err(Error::other)
+	}
+
 	fn borrowed_handle(&self) -> BorrowedHandle<'_> {
 		self.0.as_handle()
 	}
@@ -113,16 +117,21 @@ fn marker_writer(marker: &Path) -> CommandWrap {
 #[cfg(all(feature = "kill-on-drop", feature = "creation-flags"))]
 fn wait_for_marker(marker: &Path) -> Result<()> {
 	let deadline = Instant::now() + EXIT_TIMEOUT;
-	while !marker.exists() {
+	loop {
+		match fs::read(marker) {
+			Ok(content) if content == b"started" => return Ok(()),
+			Ok(_) => {}
+			Err(error) if error.kind() == ErrorKind::NotFound => {}
+			Err(error) => return Err(error),
+		}
 		if Instant::now() >= deadline {
 			return Err(Error::new(
 				ErrorKind::TimedOut,
-				"child did not write its execution marker",
+				"child did not write the complete execution marker",
 			));
 		}
 		sleep(Duration::from_millis(10));
 	}
-	Ok(())
 }
 
 #[cfg(all(feature = "kill-on-drop", feature = "creation-flags"))]
@@ -228,6 +237,28 @@ fn terminates_the_job_after_the_child_is_dropped() -> Result<()> {
 }
 
 #[test]
+fn default_job_object_does_not_kill_processes_when_its_handle_closes() -> Result<()> {
+	let mut child = tree().wrap(JobObject).spawn()?;
+	let leader = ProcessGuard::open(child.id())?;
+	let descendant = ProcessGuard::open(descendant_pid(child.as_mut())?)?;
+
+	drop(child);
+	assert!(
+		!leader.has_exited()?,
+		"the default Job Object must not enable kill-on-close"
+	);
+	assert!(
+		!descendant.has_exited()?,
+		"the default Job Object must leave descendants running"
+	);
+
+	descendant.terminate()?;
+	descendant.wait_for_exit()?;
+	leader.wait_for_exit()?;
+	Ok(())
+}
+
+#[test]
 #[cfg(all(feature = "kill-on-drop", feature = "creation-flags"))]
 fn kill_on_drop_closes_the_job_and_terminates_its_descendants() -> Result<()> {
 	let mut command = tree();
@@ -272,7 +303,6 @@ fn child_does_not_execute_until_job_assignment_succeeds() -> Result<()> {
 	})?;
 	let leader = ProcessGuard::open(child.id())?;
 	wait_for_marker(&marker)?;
-	assert_eq!(fs::read(&marker)?, b"started");
 
 	child.start_kill()?;
 	let _ = child.wait()?;
