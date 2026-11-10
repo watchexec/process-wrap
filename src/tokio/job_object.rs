@@ -10,10 +10,7 @@ use std::{
 use tokio::{process::Command, task::spawn_blocking};
 #[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
-use windows::Win32::{
-	Foundation::{CloseHandle, HANDLE},
-	System::Threading::PROCESS_CREATION_FLAGS,
-};
+use windows::Win32::{Foundation::HANDLE, System::Threading::PROCESS_CREATION_FLAGS};
 
 use crate::{
 	ChildExitStatus,
@@ -141,6 +138,11 @@ impl CommandWrapper for JobObject {
 }
 
 /// Wrapper for `Child` which waits on all processes within the job.
+///
+/// Completion uses the private job notification port and retained process handles. If process
+/// notifications are lost, waiting returns an error rather than claiming completion. Replacing the
+/// port association, externally adding processes, or enabling breakaway through the job handle is
+/// outside this wait contract.
 #[derive(Debug)]
 pub struct JobObjectChild {
 	inner: Box<dyn ChildWrapper>,
@@ -176,11 +178,7 @@ impl ChildWrapper for JobObjectChild {
 		self.inner.as_mut()
 	}
 	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-		// manually drop the completion port
-		let its = std::mem::ManuallyDrop::new(self.job_port);
-		unsafe { CloseHandle(its.completion_port.0) }.ok();
-		// we leave the job handle unclosed, otherwise the Child is useless
-		// (as closing it will terminate the job)
+		self.job_port.detach();
 
 		self.inner
 	}
@@ -200,33 +198,40 @@ impl ChildWrapper for JobObjectChild {
 				return Ok(*status);
 			}
 
-			const MAX_RETRY_ATTEMPT: usize = 10;
-
 			// always wait for parent to exit first, as by the time it does,
 			// it's likely that all its children have already exited.
 			let status = self.inner.wait().await?;
-			self.exit_status = ChildExitStatus::Exited(status);
-
-			// nevertheless, now try reaping all children a few times...
-			for _ in 1..MAX_RETRY_ATTEMPT {
-				if wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?.is_break() {
-					return Ok(status);
+			loop {
+				if wait_on_job(&self.job_port, Some(Duration::ZERO))?.is_break() {
+					break;
+				}
+				// Cancellation must not leave an indefinite waiter borrowing closed handles or
+				// keeping the last kill-on-close job handle alive. Each owned poll is bounded.
+				let owned = self.job_port.try_clone()?;
+				if spawn_blocking(move || wait_on_job(&owned, Some(Duration::from_millis(10))))
+					.await??
+					.is_break()
+				{
+					break;
 				}
 			}
-
-			// ...finally, if there are some that are still alive,
-			// block in the background to reap them fully.
-			let JobPort {
-				completion_port, ..
-			} = self.job_port;
-			let _ = spawn_blocking(move || wait_on_job(completion_port, None)).await??;
+			self.exit_status = ChildExitStatus::Exited(status);
 			Ok(status)
 		})
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		let _ = wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?;
-		self.inner.try_wait()
+		if let ChildExitStatus::Exited(status) = self.exit_status {
+			return Ok(Some(status));
+		}
+		if wait_on_job(&self.job_port, Some(Duration::ZERO))?.is_continue() {
+			return Ok(None);
+		}
+		let status = self.inner.try_wait()?;
+		if let Some(status) = status {
+			self.exit_status = ChildExitStatus::Exited(status);
+		}
+		Ok(status)
 	}
 }

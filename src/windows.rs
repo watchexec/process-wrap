@@ -6,15 +6,18 @@ use std::{
 	os::windows::io::{
 		AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle as OwnedJobHandle,
 	},
-	sync::Arc,
-	time::Duration,
+	sync::{Arc, Mutex, TryLockError},
+	time::{Duration, Instant},
 };
 
 #[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
 use windows::{
 	Win32::{
-		Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE},
+		Foundation::{
+			CloseHandle, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, HANDLE,
+			INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+		},
 		System::{
 			Diagnostics::ToolHelp::{
 				CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
@@ -22,14 +25,25 @@ use windows::{
 			},
 			IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED},
 			JobObjects::{
-				AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-				JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-				JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
+				AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+				JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
+				JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+				JobObjectAssociateCompletionPortInformation, JobObjectBasicAccountingInformation,
+				JobObjectExtendedLimitInformation, QueryInformationJobObject,
 				SetInformationJobObject, TerminateJobObject,
 			},
+			SystemServices::{
+				JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS, JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT,
+				JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, JOB_OBJECT_MSG_END_OF_JOB_TIME,
+				JOB_OBJECT_MSG_END_OF_PROCESS_TIME, JOB_OBJECT_MSG_EXIT_PROCESS,
+				JOB_OBJECT_MSG_JOB_CYCLE_TIME_LIMIT, JOB_OBJECT_MSG_JOB_MEMORY_LIMIT,
+				JOB_OBJECT_MSG_NEW_PROCESS, JOB_OBJECT_MSG_NOTIFICATION_LIMIT,
+				JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT, JOB_OBJECT_MSG_SILO_TERMINATED,
+			},
 			Threading::{
-				CREATE_SUSPENDED, GetProcessId, INFINITE, OpenThread, PROCESS_CREATION_FLAGS,
-				ResumeThread, THREAD_SUSPEND_RESUME,
+				CREATE_SUSPENDED, GetProcessId, OpenProcess, OpenThread, PROCESS_CREATION_FLAGS,
+				PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResumeThread,
+				THREAD_SUSPEND_RESUME, WaitForSingleObject,
 			},
 		},
 	},
@@ -135,6 +149,30 @@ unsafe impl Sync for PortHandle {}
 pub(crate) struct JobPort {
 	pub job: JobObjectHandle,
 	pub completion_port: PortHandle,
+	completion: Arc<Mutex<JobCompletion>>,
+}
+
+impl JobPort {
+	pub(crate) fn detach(self) {
+		// Preserve into_inner's existing job lifetime, but release the port and completion state.
+		std::mem::forget(self.job.clone());
+	}
+}
+
+#[cfg(feature = "tokio1")]
+impl JobPort {
+	/// A bounded blocking poll must own every handle it uses if its async caller is cancelled.
+	pub(crate) fn try_clone(&self) -> Result<Self> {
+		use std::os::windows::io::IntoRawHandle;
+		// SAFETY: self owns the port for this borrow; duplication creates an independent owner.
+		let port =
+			unsafe { BorrowedHandle::borrow_raw(self.completion_port.0.0) }.try_clone_to_owned()?;
+		Ok(Self {
+			job: self.job.clone(),
+			completion_port: PortHandle(HANDLE(port.into_raw_handle())),
+			completion: Arc::clone(&self.completion),
+		})
+	}
 }
 
 impl Drop for JobPort {
@@ -203,6 +241,7 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 	debug!(?job, ?process_handle, "done AssignProcessToJobObject");
 
 	Ok(JobPort {
+		completion: Arc::new(Mutex::new(JobCompletion::default())),
 		job: JobObjectHandle(Arc::new(unsafe {
 			OwnedJobHandle::from_raw_handle(job.into_raw().0)
 		})),
@@ -266,32 +305,338 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 	unsafe { inner(child_id, tool_handle.0) }
 }
 
-/// Wait for a job to complete.
-#[cfg_attr(feature = "tracing", instrument(level = "debug"))]
-pub(crate) fn wait_on_job(
-	completion_port: PortHandle,
-	timeout: Option<Duration>,
-) -> Result<ControlFlow<()>> {
-	let mut code: u32 = 0;
-	let mut key: usize = 0;
-	let mut overlapped = OVERLAPPED::default();
-	let mut lp_overlapped = &mut overlapped as *mut OVERLAPPED;
+/// Completion notifications are hints, not process-exit fences. Retain handles from NEW_PROCESS
+/// packets and reconcile the notification census with job accounting before reporting completion.
+/// This assumes our private port has one logical consumer and nobody externally adds processes,
+/// changes the port association, or enables breakaway via a borrowed job handle.
+#[derive(Debug, Default)]
+struct JobCompletion {
+	observed: u32,
+	pending: Vec<OwnedJobHandle>,
+}
 
-	let result = unsafe {
-		GetQueuedCompletionStatus(
-			completion_port.0,
-			&mut code,
-			&mut key,
-			&mut lp_overlapped as *mut _,
-			timeout.map_or(INFINITE, |d| d.as_millis().try_into().unwrap_or(INFINITE)),
-		)
-	};
-
-	// ignore timing out errors unless the timeout was specified to INFINITE
-	// https://docs.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getqueuedcompletionstatus
-	if timeout.is_some() && result.is_err() && lp_overlapped.is_null() {
-		return Ok(ControlFlow::Continue(()));
+impl JobCompletion {
+	fn observe_process(&mut self, job: HANDLE, pid: usize) -> Result<()> {
+		let observed = self
+			.observed
+			.checked_add(1)
+			.ok_or_else(|| Error::other("job process census overflow"))?;
+		let pid = u32::try_from(pid).map_err(Error::other)?;
+		if pid == 0 {
+			return Err(Error::other("invalid job process notification"));
+		}
+		// SAFETY: no borrowed memory crosses the call; a successful open returns a new owner.
+		let handle = match unsafe {
+			OpenProcess(
+				PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+				false,
+				pid,
+			)
+		} {
+			Ok(handle) => {
+				// SAFETY: transfer the newly opened handle exactly once.
+				unsafe { OwnedJobHandle::from_raw_handle(handle.0) }
+			}
+			Err(error) if error.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) => {
+				// The process object no longer exists; it cannot still be executing.
+				self.observed = observed;
+				return Ok(());
+			}
+			Err(error) => return Err(Error::other(error)),
+		};
+		let mut belongs = Default::default();
+		// SAFETY: both handles are owned throughout the call; belongs is writable BOOL storage.
+		unsafe { IsProcessInJob(HANDLE(handle.as_raw_handle()), Some(job), &mut belongs) }?;
+		if belongs.as_bool() {
+			self.pending.push(handle);
+		}
+		// If the PID was recycled outside this job, the originally notified process has exited.
+		self.observed = observed;
+		Ok(())
 	}
 
-	Ok(ControlFlow::Break(()))
+	fn poll(&mut self, job_port: &JobPort) -> Result<ControlFlow<()>> {
+		let job = HANDLE(job_port.job.as_handle().as_raw_handle());
+		let mut drained = false;
+		// Bound each nonblocking poll even while a job is continually creating processes.
+		for _ in 0..64 {
+			let mut code = 0;
+			let mut key = 0;
+			let mut overlapped = std::ptr::null_mut::<OVERLAPPED>();
+			// SAFETY: JobPort owns the port; outputs are valid local storage. The returned
+			// overlapped value is a numeric PID for job packets and is never dereferenced.
+			match unsafe {
+				GetQueuedCompletionStatus(
+					job_port.completion_port.0,
+					&mut code,
+					&mut key,
+					&mut overlapped,
+					0,
+				)
+			} {
+				Ok(()) => {
+					if key != job.0 as usize {
+						return Err(Error::other("unexpected job completion key"));
+					}
+					match code {
+						JOB_OBJECT_MSG_NEW_PROCESS => {
+							self.observe_process(job, overlapped as usize)?
+						}
+						JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO
+						| JOB_OBJECT_MSG_EXIT_PROCESS
+						| JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS
+						| JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT
+						| JOB_OBJECT_MSG_END_OF_JOB_TIME
+						| JOB_OBJECT_MSG_END_OF_PROCESS_TIME
+						| JOB_OBJECT_MSG_JOB_CYCLE_TIME_LIMIT
+						| JOB_OBJECT_MSG_JOB_MEMORY_LIMIT
+						| JOB_OBJECT_MSG_NOTIFICATION_LIMIT
+						| JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT
+						| JOB_OBJECT_MSG_SILO_TERMINATED => {}
+						// No individual notification is a completion fence. Unknown packets are errors.
+						_ => return Err(Error::other("unexpected job completion message")),
+					}
+				}
+				Err(error) if error.code() == HRESULT::from_win32(WAIT_TIMEOUT.0) => {
+					drained = true;
+					break;
+				}
+				Err(error) => return Err(Error::other(error)),
+			}
+		}
+		if !drained {
+			return Ok(ControlFlow::Continue(()));
+		}
+		let mut index = 0;
+		while index < self.pending.len() {
+			// SAFETY: pending owns each process handle until its signalled state is observed.
+			match unsafe { WaitForSingleObject(HANDLE(self.pending[index].as_raw_handle()), 0) } {
+				WAIT_OBJECT_0 => {
+					self.pending.swap_remove(index);
+				}
+				WAIT_TIMEOUT => {
+					index += 1;
+				}
+				_ => return Err(Error::last_os_error()),
+			}
+		}
+		let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+		// SAFETY: JobPort owns the job; the output pointer and length describe this exact struct.
+		unsafe {
+			QueryInformationJobObject(
+				Some(job),
+				JobObjectBasicAccountingInformation,
+				&mut accounting as *mut _ as _,
+				std::mem::size_of_val(&accounting)
+					.try_into()
+					.map_err(Error::other)?,
+				None,
+			)
+		}?;
+		if accounting.ActiveProcesses != 0 {
+			return Ok(ControlFlow::Continue(()));
+		}
+		// Accounting can reach zero before termination finishes. Notification delivery is not
+		// guaranteed either: a missing NEW_PROCESS packet must be an error, not a completion claim.
+		if self.observed != accounting.TotalProcesses {
+			return Err(Error::other(
+				"cannot confirm job completion: process notification census is incomplete",
+			));
+		}
+		Ok(if self.pending.is_empty() {
+			ControlFlow::Break(())
+		} else {
+			ControlFlow::Continue(())
+		})
+	}
+}
+
+/// Wait for the job and every retained process object, not merely the next port packet.
+#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(job_port)))]
+pub(crate) fn wait_on_job(
+	job_port: &JobPort,
+	timeout: Option<Duration>,
+) -> Result<ControlFlow<()>> {
+	let started = Instant::now();
+	loop {
+		match job_port.completion.try_lock() {
+			Ok(mut completion) => {
+				if completion.poll(job_port)?.is_break() {
+					return Ok(ControlFlow::Break(()));
+				}
+			}
+			Err(TryLockError::WouldBlock) => {}
+			Err(TryLockError::Poisoned(_)) => {
+				return Err(Error::other("job completion state is poisoned"));
+			}
+		}
+		let remaining = timeout.map(|timeout| timeout.saturating_sub(started.elapsed()));
+		if remaining == Some(Duration::ZERO) {
+			return Ok(ControlFlow::Continue(()));
+		}
+		std::thread::sleep(
+			remaining
+				.unwrap_or(Duration::from_millis(10))
+				.min(Duration::from_millis(10)),
+		);
+	}
+}
+
+#[cfg(test)]
+mod completion_tests {
+	use super::*;
+	use std::{
+		os::windows::process::CommandExt,
+		process::{Child, Command, Stdio},
+	};
+	use windows::Win32::System::{IO::PostQueuedCompletionStatus, Threading::CREATE_NO_WINDOW};
+
+	struct Fixture {
+		child: Child,
+		port: JobPort,
+	}
+
+	impl Fixture {
+		fn new() -> Self {
+			let mut child = Command::new("cmd.exe")
+				.args(["/D", "/C", "exit 0"])
+				.creation_flags((CREATE_NO_WINDOW | CREATE_SUSPENDED).0)
+				.stdin(Stdio::null())
+				.stdout(Stdio::null())
+				.stderr(Stdio::null())
+				.spawn()
+				.unwrap();
+			let port = match make_job_object(HANDLE(child.as_raw_handle()), true) {
+				Ok(port) => port,
+				Err(error) => {
+					child.kill().unwrap();
+					child.wait().unwrap();
+					panic!("{error}");
+				}
+			};
+			Self { child, port }
+		}
+
+		fn post(&self, code: u32, key: usize) {
+			// SAFETY: the fixture owns this live port. Null overlapped is a deliberately invalid
+			// process ID for NEW_PROCESS, or an unused value for other notification types.
+			unsafe { PostQueuedCompletionStatus(self.port.completion_port.0, code, key, None) }
+				.unwrap();
+		}
+	}
+
+	impl Drop for Fixture {
+		fn drop(&mut self) {
+			self.port.job.terminate(1).unwrap();
+			// SAFETY: Child owns the exact process handle and remains alive during the bounded wait.
+			assert_eq!(
+				unsafe { WaitForSingleObject(HANDLE(self.child.as_raw_handle()), 5_000) },
+				WAIT_OBJECT_0
+			);
+			self.child.wait().unwrap();
+		}
+	}
+
+	#[test]
+	fn new_process_notification_does_not_complete_a_live_job() {
+		let fixture = Fixture::new();
+		assert!(
+			wait_on_job(&fixture.port, Some(Duration::ZERO))
+				.unwrap()
+				.is_continue()
+		);
+		fixture.port.job.terminate(1).unwrap();
+		assert!(
+			wait_on_job(&fixture.port, Some(Duration::from_secs(5)))
+				.unwrap()
+				.is_break()
+		);
+	}
+
+	#[test]
+	fn unexpected_completion_key_is_an_error() {
+		let fixture = Fixture::new();
+		fixture.post(JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, 0);
+		assert!(
+			wait_on_job(&fixture.port, Some(Duration::ZERO))
+				.unwrap_err()
+				.to_string()
+				.contains("completion key")
+		);
+	}
+
+	#[test]
+	fn unknown_completion_message_is_an_error() {
+		let fixture = Fixture::new();
+		fixture.post(
+			u32::MAX,
+			fixture.port.job.as_handle().as_raw_handle() as usize,
+		);
+		assert!(
+			wait_on_job(&fixture.port, Some(Duration::ZERO))
+				.unwrap_err()
+				.to_string()
+				.contains("completion message")
+		);
+	}
+
+	#[test]
+	fn invalid_process_notification_is_an_error() {
+		let fixture = Fixture::new();
+		fixture.post(
+			JOB_OBJECT_MSG_NEW_PROCESS,
+			fixture.port.job.as_handle().as_raw_handle() as usize,
+		);
+		assert!(
+			wait_on_job(&fixture.port, Some(Duration::ZERO))
+				.unwrap_err()
+				.to_string()
+				.contains("invalid job process")
+		);
+	}
+
+	#[test]
+	fn missing_process_notification_is_not_successful_completion() {
+		let fixture = Fixture::new();
+		let mut code = 0;
+		let mut key = 0;
+		let mut overlapped = std::ptr::null_mut::<OVERLAPPED>();
+		// SAFETY: all outputs are valid and the fixture owns the port. Deliberately consume
+		// the real NEW_PROCESS packet to model an incomplete notification census.
+		unsafe {
+			GetQueuedCompletionStatus(
+				fixture.port.completion_port.0,
+				&mut code,
+				&mut key,
+				&mut overlapped,
+				5_000,
+			)
+		}
+		.unwrap();
+		assert_eq!(code, JOB_OBJECT_MSG_NEW_PROCESS);
+		fixture.port.job.terminate(1).unwrap();
+		// SAFETY: the child owns this live process handle throughout the bounded wait.
+		assert_eq!(
+			unsafe { WaitForSingleObject(HANDLE(fixture.child.as_raw_handle()), 5_000) },
+			WAIT_OBJECT_0
+		);
+		assert!(
+			wait_on_job(&fixture.port, Some(Duration::ZERO))
+				.unwrap_err()
+				.to_string()
+				.contains("census is incomplete")
+		);
+	}
+
+	#[test]
+	fn invalid_completion_port_is_not_a_timeout() {
+		let fixture = Fixture::new();
+		// The invalid port is never used as an owned handle and the real port stays open.
+		let invalid = JobPort {
+			job: fixture.port.job.clone(),
+			completion_port: PortHandle(INVALID_HANDLE_VALUE),
+			completion: Arc::clone(&fixture.port.completion),
+		};
+		assert!(wait_on_job(&invalid, Some(Duration::ZERO)).is_err());
+	}
 }
