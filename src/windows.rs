@@ -355,11 +355,9 @@ impl JobCompletion {
 		Ok(())
 	}
 
-	fn poll(&mut self, job_port: &JobPort) -> Result<ControlFlow<()>> {
-		let job = HANDLE(job_port.job.as_handle().as_raw_handle());
-		let mut drained = false;
-		// Bound each nonblocking poll even while a job is continually creating processes.
-		for _ in 0..64 {
+	fn drain_port(&mut self, job_port: &JobPort, job: HANDLE, budget: &mut usize) -> Result<bool> {
+		while *budget > 0 {
+			*budget -= 1;
 			let mut code = 0;
 			let mut key = 0;
 			let mut overlapped = std::ptr::null_mut::<OVERLAPPED>();
@@ -398,15 +396,15 @@ impl JobCompletion {
 					}
 				}
 				Err(error) if error.code() == HRESULT::from_win32(WAIT_TIMEOUT.0) => {
-					drained = true;
-					break;
+					return Ok(true);
 				}
 				Err(error) => return Err(Error::other(error)),
 			}
 		}
-		if !drained {
-			return Ok(ControlFlow::Continue(()));
-		}
+		Ok(false)
+	}
+
+	fn reap_pending(&mut self) -> Result<()> {
 		let mut index = 0;
 		while index < self.pending.len() {
 			// SAFETY: pending owns each process handle until its signalled state is observed.
@@ -420,6 +418,24 @@ impl JobCompletion {
 				_ => return Err(Error::last_os_error()),
 			}
 		}
+		Ok(())
+	}
+
+	fn poll(
+		&mut self,
+		job_port: &JobPort,
+		#[cfg(test)] after_initial_drain: impl FnOnce(),
+	) -> Result<ControlFlow<()>> {
+		let job = HANDLE(job_port.job.as_handle().as_raw_handle());
+		// Both drains share this budget, including empty probes, to bound nonblocking polls.
+		let mut budget = 64;
+		if !self.drain_port(job_port, job, &mut budget)? {
+			return Ok(ControlFlow::Continue(()));
+		}
+		// Tests schedule native packet delivery in the real drain/accounting window.
+		#[cfg(test)]
+		after_initial_drain();
+		self.reap_pending()?;
 		let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
 		// SAFETY: JobPort owns the job; the output pointer and length describe this exact struct.
 		unsafe {
@@ -436,8 +452,17 @@ impl JobCompletion {
 		if accounting.ActiveProcesses != 0 {
 			return Ok(ControlFlow::Continue(()));
 		}
-		// Accounting can reach zero before termination finishes. Notification delivery is not
-		// guaranteed either: a missing NEW_PROCESS packet must be an error, not a completion claim.
+		if self.observed < accounting.TotalProcesses {
+			// A notification can arrive after the first empty probe but before this accounting
+			// snapshot. Recheck the queue before rejecting its census, within the same budget.
+			// Zero accounting is not a fence for notification posting or process-handle signalling.
+			if !self.drain_port(job_port, job, &mut budget)? {
+				return Ok(ControlFlow::Continue(()));
+			}
+			self.reap_pending()?;
+		}
+		// Delivery is not guaranteed. An incomplete census after the recheck is an error, not
+		// a completion claim; every retained handle must also have been observed signalled.
 		if self.observed != accounting.TotalProcesses {
 			return Err(Error::other(
 				"cannot confirm job completion: process notification census is incomplete",
@@ -461,7 +486,14 @@ pub(crate) fn wait_on_job(
 	loop {
 		match job_port.completion.try_lock() {
 			Ok(mut completion) => {
-				if completion.poll(job_port)?.is_break() {
+				if completion
+					.poll(
+						job_port,
+						#[cfg(test)]
+						|| {},
+					)?
+					.is_break()
+				{
 					return Ok(ControlFlow::Break(()));
 				}
 			}
@@ -523,6 +555,48 @@ mod completion_tests {
 			unsafe { PostQueuedCompletionStatus(self.port.completion_port.0, code, key, None) }
 				.unwrap();
 		}
+
+		fn take_packet(&self) -> (u32, usize, *mut OVERLAPPED) {
+			let mut code = 0;
+			let mut key = 0;
+			let mut overlapped = std::ptr::null_mut();
+			// SAFETY: this fixture owns the port and all output storage. The job's numeric
+			// process-ID payload is retained as an opaque value, never dereferenced.
+			unsafe {
+				GetQueuedCompletionStatus(
+					self.port.completion_port.0,
+					&mut code,
+					&mut key,
+					&mut overlapped,
+					5_000,
+				)
+			}
+			.unwrap();
+			(code, key, overlapped)
+		}
+
+		fn repost(&self, packet: (u32, usize, *mut OVERLAPPED)) {
+			// SAFETY: the fixture owns the port; replay exactly the native notification's opaque
+			// payload. PostQueuedCompletionStatus stores the value without dereferencing it.
+			unsafe {
+				PostQueuedCompletionStatus(
+					self.port.completion_port.0,
+					packet.0,
+					packet.1,
+					Some(packet.2.cast_const()),
+				)
+			}
+			.unwrap();
+		}
+
+		fn terminate_and_wait(&self) {
+			self.port.job.terminate(1).unwrap();
+			// SAFETY: Child retains this exact process object throughout the bounded native wait.
+			assert_eq!(
+				unsafe { WaitForSingleObject(HANDLE(self.child.as_raw_handle()), 5_000) },
+				WAIT_OBJECT_0
+			);
+		}
 	}
 
 	impl Drop for Fixture {
@@ -551,6 +625,100 @@ mod completion_tests {
 				.unwrap()
 				.is_break()
 		);
+	}
+
+	#[test]
+	fn packet_arriving_between_drain_and_zero_accounting_is_not_lost() {
+		let fixture = Fixture::new();
+		let packet = fixture.take_packet();
+		assert_eq!(packet.0, JOB_OBJECT_MSG_NEW_PROCESS);
+		assert_eq!(packet.2 as usize, fixture.child.id() as usize);
+		let mut completion = fixture.port.completion.lock().unwrap();
+		let called = std::cell::Cell::new(false);
+		let result = completion.poll(&fixture.port, || {
+			called.set(true);
+			// The initial drain has already observed WAIT_TIMEOUT. Deliver the held native
+			// NEW_PROCESS now, then make real accounting reach zero before poll queries it.
+			fixture.repost(packet);
+			fixture.terminate_and_wait();
+		});
+		assert!(called.get(), "native delivery seam was not exercised");
+		assert!(
+			result.is_ok(),
+			"queued NEW_PROCESS was mistaken for loss: {result:?}"
+		);
+		assert!(result.unwrap().is_break());
+		assert_eq!(completion.observed, 1);
+		assert!(completion.pending.is_empty());
+	}
+
+	#[test]
+	fn both_drains_share_one_budget_including_the_initial_empty_probe() {
+		let fixture = Fixture::new();
+		let packet = fixture.take_packet();
+		assert_eq!(packet.0, JOB_OBJECT_MSG_NEW_PROCESS);
+		// 63 native IOCP packets plus the first empty probe exhaust the 64-dequeue budget.
+		for _ in 0..63 {
+			fixture.post(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT, packet.1);
+		}
+		let mut completion = fixture.port.completion.lock().unwrap();
+		let result = completion.poll(&fixture.port, || {
+			fixture.repost(packet);
+			fixture.terminate_and_wait();
+		});
+		assert!(
+			matches!(result, Ok(ControlFlow::Continue(()))),
+			"budget exhausted before post-zero drain: {result:?}"
+		);
+		assert_eq!(
+			completion.observed, 0,
+			"a fresh second budget consumed the late packet"
+		);
+		let queued = fixture.take_packet();
+		assert_eq!(
+			queued, packet,
+			"late NEW_PROCESS must remain queued for the next poll"
+		);
+		fixture.repost(queued);
+		assert!(completion.poll(&fixture.port, || {}).unwrap().is_break());
+		assert_eq!(completion.observed, 1);
+	}
+
+	#[test]
+	fn more_than_one_budget_defers_the_packet_and_retains_the_live_handle() {
+		let fixture = Fixture::new();
+		let packet = fixture.take_packet();
+		assert_eq!(packet.0, JOB_OBJECT_MSG_NEW_PROCESS);
+		for _ in 0..65 {
+			fixture.post(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT, packet.1);
+		}
+		fixture.repost(packet);
+		let mut completion = fixture.port.completion.lock().unwrap();
+		let called = std::cell::Cell::new(false);
+		assert!(
+			completion
+				.poll(&fixture.port, || {
+					called.set(true);
+				})
+				.unwrap()
+				.is_continue()
+		);
+		assert!(
+			!called.get(),
+			"a full first drain must yield before accounting"
+		);
+		assert_eq!(completion.observed, 0);
+		assert!(completion.poll(&fixture.port, || {}).unwrap().is_continue());
+		assert_eq!(completion.observed, 1);
+		assert_eq!(completion.pending.len(), 1);
+		// SAFETY: completion owns this newly observed process handle. It is still suspended/live.
+		assert_eq!(
+			unsafe { WaitForSingleObject(HANDLE(completion.pending[0].as_raw_handle()), 0) },
+			WAIT_TIMEOUT
+		);
+		fixture.terminate_and_wait();
+		assert!(completion.poll(&fixture.port, || {}).unwrap().is_break());
+		assert!(completion.pending.is_empty());
 	}
 
 	#[test]
