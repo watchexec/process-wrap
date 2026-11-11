@@ -19,6 +19,7 @@ mod into_inner_write_stdin;
 mod kill_and_try_wait;
 mod multiproc_linux;
 mod propagate_thread_death;
+mod reset_sigmask;
 mod signals;
 mod spawn_twice;
 mod try_wait_after_die;
