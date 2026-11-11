@@ -9,11 +9,14 @@ fn kill_on_drop() -> Result<()> {
 	})
 	.wrap(KillOnDrop)
 	.spawn()?;
-	let dead_pid = Pid::try_from(child.id()).expect("Failed to fit pid");
+	let dead_pid = nix::unistd::Pid::from_raw(child.id() as _);
 	drop(child);
-	if pid_alive(dead_pid) {
-		panic!("Subprocess is still alive!")
-	}
+	// Dropping kills and reaps the child, so its PID no longer exists.
+	assert_eq!(
+		nix::sys::signal::kill(dead_pid, None),
+		Err(nix::errno::Errno::ESRCH),
+		"Subprocess is still alive!"
+	);
 	Ok(())
 }
 
