@@ -6,7 +6,7 @@ use super::{CommandWrap, CommandWrapper};
 use crate::linux::thread_death_hook;
 
 /// Asks the kernel to send `SIGTERM` to the child process when the *thread* that spawned it exits.
-/// See [prctrl](https://www.man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html).
+/// See [prctl](https://www.man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html).
 ///
 /// This wrapper is only available on Linux.
 ///
