@@ -10,10 +10,7 @@ use std::{
 
 #[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
-use windows::Win32::{
-	Foundation::{CloseHandle, HANDLE},
-	System::Threading::PROCESS_CREATION_FLAGS,
-};
+use windows::Win32::{Foundation::HANDLE, System::Threading::PROCESS_CREATION_FLAGS};
 
 use crate::{
 	ChildExitStatus,
@@ -178,11 +175,14 @@ impl ChildWrapper for JobObjectChild {
 		self.inner.as_mut()
 	}
 	fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
-		// manually drop the completion port
-		let its = std::mem::ManuallyDrop::new(self.job_port);
-		unsafe { CloseHandle(its.completion_port.0) }.ok();
-		// we leave the job handle unclosed, otherwise the Child is useless
-		// (as closing it will terminate the job)
+		let JobPort {
+			job,
+			completion_port,
+		} = self.job_port;
+		drop(completion_port);
+		// Leak our handle to the job, so it stays open: closing the last one would kill the
+		// processes in it if `KillOnDrop` was used, and leave the unwrapped child useless.
+		std::mem::forget(job);
 
 		self.inner
 	}
@@ -201,22 +201,32 @@ impl ChildWrapper for JobObjectChild {
 			return Ok(*status);
 		}
 
-		// always wait for parent to exit first, as by the time it does,
-		// it's likely that all its children have already exited.
+		// Wait for the leader first: by the time it exits, its descendants usually have too.
 		let status = self.inner.wait()?;
+		wait_on_job(&self.job_port.job, &self.job_port.completion_port, None)?;
 		self.exit_status = ChildExitStatus::Exited(status);
-
-		// nevertheless, now wait and make sure we reap all children.
-		let JobPort {
-			completion_port, ..
-		} = self.job_port;
-		let _ = wait_on_job(completion_port, None)?;
 		Ok(status)
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-		let _ = wait_on_job(self.job_port.completion_port, Some(Duration::ZERO))?;
-		self.inner.try_wait()
+		if let ChildExitStatus::Exited(status) = &self.exit_status {
+			return Ok(Some(*status));
+		}
+
+		let job_is_empty = wait_on_job(
+			&self.job_port.job,
+			&self.job_port.completion_port,
+			Some(Duration::ZERO),
+		)?;
+		let Some(status) = self.inner.try_wait()? else {
+			return Ok(None);
+		};
+		if !job_is_empty {
+			return Ok(None);
+		}
+
+		self.exit_status = ChildExitStatus::Exited(status);
+		Ok(Some(status))
 	}
 }

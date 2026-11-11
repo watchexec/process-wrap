@@ -2,19 +2,18 @@
 
 use std::{
 	io::{Error, Result},
-	ops::ControlFlow,
 	os::windows::io::{
 		AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle as OwnedJobHandle,
 	},
 	sync::Arc,
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 #[cfg(feature = "tracing")]
 use tracing::{debug, instrument};
 use windows::{
 	Win32::{
-		Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE},
+		Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
 		System::{
 			Diagnostics::ToolHelp::{
 				CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
@@ -23,9 +22,10 @@ use windows::{
 			IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED},
 			JobObjects::{
 				AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-				JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-				JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
-				SetInformationJobObject, TerminateJobObject,
+				JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+				JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
+				JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+				QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 			},
 			Threading::{
 				CREATE_SUSPENDED, GetProcessId, INFINITE, OpenThread, PROCESS_CREATION_FLAGS,
@@ -113,6 +113,24 @@ impl JobObjectHandle {
 		unsafe { TerminateJobObject(HANDLE(self.0.as_raw_handle()), exit_code) }
 			.map_err(Error::other)
 	}
+
+	/// Whether every process in the job has exited.
+	pub(crate) fn is_empty(&self) -> Result<bool> {
+		let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+		unsafe {
+			QueryInformationJobObject(
+				Some(HANDLE(self.0.as_raw_handle())),
+				JobObjectBasicAccountingInformation,
+				(&mut info) as *mut _ as _,
+				std::mem::size_of_val(&info)
+					.try_into()
+					.expect("cannot safely cast to DWORD"),
+				None,
+			)
+		}
+		.map_err(Error::other)?;
+		Ok(info.ActiveProcesses == 0)
+	}
 }
 
 impl AsHandle for JobObjectHandle {
@@ -121,26 +139,65 @@ impl AsHandle for JobObjectHandle {
 	}
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct PortHandle(pub HANDLE);
+/// The completion port a job posts its notifications to.
+///
+/// Clones share the port, which is closed when the last one is dropped, so a thread blocked on it
+/// can't outlive it.
+#[derive(Clone, Debug)]
+pub(crate) struct CompletionPort(Arc<OwnedJobHandle>);
 
-unsafe impl Send for PortHandle {}
-unsafe impl Sync for PortHandle {}
+impl CompletionPort {
+	/// Block until a notification arrives or `timeout` elapses, then discard every queued one.
+	///
+	/// Notifications are only a cue to look at the job again: they aren't guaranteed to be
+	/// delivered, and the job's process count is what says whether it's done. Draining them all
+	/// keeps the queue from growing while nothing waits on it.
+	pub(crate) fn wait(&self, timeout: Duration) -> Result<()> {
+		let mut timeout = timeout;
+		loop {
+			if !self.dequeue(timeout)? {
+				return Ok(());
+			}
+			timeout = Duration::ZERO;
+		}
+	}
+
+	/// Take one notification off the port, returning false if `timeout` elapsed first.
+	fn dequeue(&self, timeout: Duration) -> Result<bool> {
+		let mut code: u32 = 0;
+		let mut key: usize = 0;
+		let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
+
+		// Round up, so a short timeout still blocks, and stay below INFINITE.
+		let millis = timeout
+			.as_nanos()
+			.div_ceil(1_000_000)
+			.min(u128::from(INFINITE - 1)) as u32;
+
+		match unsafe {
+			GetQueuedCompletionStatus(
+				HANDLE(self.0.as_raw_handle()),
+				&mut code,
+				&mut key,
+				&mut overlapped,
+				millis,
+			)
+		} {
+			Ok(()) => Ok(true),
+			Err(error) if error.code() == HRESULT::from_win32(WAIT_TIMEOUT.0) => Ok(false),
+			Err(error) => Err(Error::other(error)),
+		}
+	}
+}
 
 /// A JobObject and its associated completion port.
 ///
-/// This struct closes the completion port when dropped; the job is closed when the last
-/// `JobObjectHandle` to it is.
+/// The completion port is closed when the last clone of it is dropped; the job is closed when the
+/// last `JobObjectHandle` to it is.
 #[derive(Debug)]
 pub(crate) struct JobPort {
 	pub job: JobObjectHandle,
-	pub completion_port: PortHandle,
-}
-
-impl Drop for JobPort {
-	fn drop(&mut self) {
-		unsafe { CloseHandle(self.completion_port.0) }.ok();
-	}
+	pub completion_port: CompletionPort,
 }
 
 /// Create a JobObject and an associated completion port.
@@ -206,7 +263,9 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 		job: JobObjectHandle(Arc::new(unsafe {
 			OwnedJobHandle::from_raw_handle(job.into_raw().0)
 		})),
-		completion_port: PortHandle(completion_port.into_raw()),
+		completion_port: CompletionPort(Arc::new(unsafe {
+			OwnedJobHandle::from_raw_handle(completion_port.into_raw().0)
+		})),
 	})
 }
 
@@ -266,32 +325,30 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 	unsafe { inner(child_id, tool_handle.0) }
 }
 
-/// Wait for a job to complete.
+/// How long to block on the completion port before looking at the job again.
+///
+/// Notifications aren't guaranteed to be delivered, so a wait can't block on the port alone.
+pub(crate) const RECHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Wait for every process in the job to exit, for up to `timeout`, or forever if it's `None`.
+///
+/// Returns whether the job is empty.
 #[cfg_attr(feature = "tracing", instrument(level = "debug"))]
 pub(crate) fn wait_on_job(
-	completion_port: PortHandle,
+	job: &JobObjectHandle,
+	completion_port: &CompletionPort,
 	timeout: Option<Duration>,
-) -> Result<ControlFlow<()>> {
-	let mut code: u32 = 0;
-	let mut key: usize = 0;
-	let mut overlapped = OVERLAPPED::default();
-	let mut lp_overlapped = &mut overlapped as *mut OVERLAPPED;
+) -> Result<bool> {
+	let deadline = timeout.map(|timeout| Instant::now() + timeout);
+	loop {
+		if job.is_empty()? {
+			return Ok(true);
+		}
 
-	let result = unsafe {
-		GetQueuedCompletionStatus(
-			completion_port.0,
-			&mut code,
-			&mut key,
-			&mut lp_overlapped as *mut _,
-			timeout.map_or(INFINITE, |d| d.as_millis().try_into().unwrap_or(INFINITE)),
-		)
-	};
-
-	// ignore timing out errors unless the timeout was specified to INFINITE
-	// https://docs.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getqueuedcompletionstatus
-	if timeout.is_some() && result.is_err() && lp_overlapped.is_null() {
-		return Ok(ControlFlow::Continue(()));
+		let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+		completion_port.wait(left.map_or(RECHECK_INTERVAL, |left| left.min(RECHECK_INTERVAL)))?;
+		if left.is_some_and(|left| left.is_zero()) {
+			return job.is_empty();
+		}
 	}
-
-	Ok(ControlFlow::Break(()))
 }
