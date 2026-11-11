@@ -105,6 +105,8 @@ fn job_wait_parent() {
 		.unwrap();
 	println!("{DESCENDANT_MARKER}{}", descendant.id());
 	std::io::stdout().flush().unwrap();
+	// Exit before the harness writes more, as the test stops reading at the marker.
+	std::process::exit(0);
 }
 
 #[test]
