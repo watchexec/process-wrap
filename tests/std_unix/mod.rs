@@ -22,6 +22,7 @@ mod into_inner_write_stdin;
 mod kill_and_try_wait;
 mod kill_on_drop;
 mod multiproc_linux;
+mod process_group_attach;
 mod propagate_thread_death;
 mod reset_sigmask;
 mod signals;
