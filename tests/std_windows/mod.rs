@@ -18,6 +18,8 @@ mod inner_read_stdout;
 mod into_inner_write_stdin;
 #[cfg(feature = "job-object")]
 mod job_handle;
+#[cfg(feature = "job-object")]
+mod job_wait;
 mod kill_and_try_wait;
 #[cfg(feature = "job-object")]
 mod process_handle;
