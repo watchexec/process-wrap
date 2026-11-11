@@ -95,3 +95,33 @@ fn reuse_from_another_thread() -> std::result::Result<(), Box<dyn Error>> {
 	})?;
 	Ok(())
 }
+
+#[test]
+fn custom_signal() -> std::result::Result<(), Box<dyn Error>> {
+	// The child ignores SIGTERM, the default, so only the requested SIGKILL ends it.
+	let handle = thread::spawn(|| {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()?;
+		runtime.block_on(async {
+			let mut child = CommandWrap::with_new("sh", |cmd| {
+				cmd.args(["-c", "trap '' TERM; echo ready; exec sleep 30"])
+					.stdout(Stdio::piped());
+			})
+			.wrap(PropagateThreadDeath::new(Signal::SIGKILL as _)?)
+			.spawn()?;
+			let mut line = String::new();
+			BufReader::new(child.stdout().take().expect("stdout is piped"))
+				.read_line(&mut line)
+				.await?;
+			assert_eq!(line, "ready\n");
+			Ok::<_, io::Error>(child.id().expect("the child is running"))
+		})
+	});
+	let dead_pid = handle
+		.join()
+		.expect("Thread panicked")
+		.expect("Thread failed to spawn");
+	wait_for_exit(i32::try_from(dead_pid).expect("Failed to fit pid into i32"))?;
+	Ok(())
+}
