@@ -62,3 +62,36 @@ fn propagate_thread_death() -> std::result::Result<(), Box<dyn Error>> {
 	wait_for_exit(dead_pid)?;
 	Ok(())
 }
+
+#[test]
+fn reuse_from_another_thread() -> std::result::Result<(), Box<dyn Error>> {
+	let mut command = CommandWrap::with_new("yes", |cmd| {
+		cmd.stderr(Stdio::null()).stdout(Stdio::null());
+	});
+	command.wrap(PropagateThreadDeath::default());
+
+	let (command, first_pid) = thread::spawn(move || {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()?;
+		let pid = runtime.block_on(async {
+			let child = command.spawn()?;
+			Ok::<_, io::Error>(child.id().expect("the child is running"))
+		})?;
+		Ok::<_, io::Error>((command, pid))
+	})
+	.join()
+	.expect("Thread panicked")?;
+	wait_for_exit(i32::try_from(first_pid).expect("Failed to fit pid into i32"))?;
+
+	// The first spawning thread has exited: a check left over from it would fail this spawn.
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()?;
+	runtime.block_on(async {
+		let mut command = command;
+		let mut child = command.spawn()?;
+		Box::into_pin(child.kill()).await
+	})?;
+	Ok(())
+}
