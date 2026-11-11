@@ -295,7 +295,8 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 				if previous_count == u32::MAX {
 					return Err(Error::last_os_error());
 				}
-				if previous_count > 0 {
+				// Only a count of one means this undid the last suspension and the thread now runs.
+				if previous_count == 1 {
 					resumed = true;
 				}
 			}
@@ -312,7 +313,7 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 		if resumed {
 			Ok(())
 		} else {
-			Err(Error::other("no thread belonging to the child was found"))
+			Err(Error::other("no suspended thread belonging to the child was resumed"))
 		}
 	}
 
