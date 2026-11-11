@@ -103,3 +103,17 @@ async fn leaves_explicit_suspension_in_both_orders() -> Result<()> {
 	}
 	Ok(())
 }
+
+#[tokio::test]
+async fn creation_flags_alone_reach_the_process() -> Result<()> {
+	// Without JobObject, nothing resumes the child, so it stays suspended.
+	let mut command = CommandWrap::with_new("cmd.exe", |command| {
+		command.args(["/D", "/S", "/C", "exit /b 0"]);
+	});
+	command.wrap(CreationFlags((CREATE_NO_WINDOW | CREATE_SUSPENDED).0));
+	let mut child = command.spawn()?;
+	let suspended = process_has_suspended_thread(child.id().expect("the child is running"));
+	child.start_kill()?;
+	assert!(suspended?, "child was not created suspended");
+	Ok(())
+}
