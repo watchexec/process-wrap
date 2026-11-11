@@ -4,7 +4,7 @@ use nix::sys::signal::Signal;
 use tokio::process::Command;
 
 use super::{CommandWrap, CommandWrapper};
-use crate::linux::thread_death_hook;
+use crate::linux::SpawningThread;
 
 /// Asks the kernel to send `SIGTERM` to the child process when the *thread* that spawned it exits.
 /// See [prctl](https://www.man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html).
@@ -65,15 +65,17 @@ use crate::linux::thread_death_hook;
 /// command.wrap(PropagateThreadDeath::new(SIGKILL as _)?);
 /// # Ok::<(), std::io::Error>(())
 /// ```
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PropagateThreadDeath {
 	death_signal: Signal,
+	spawning_thread: SpawningThread,
 }
 
 impl Default for PropagateThreadDeath {
 	fn default() -> Self {
 		Self {
 			death_signal: Signal::SIGTERM,
+			spawning_thread: SpawningThread::default(),
 		}
 	}
 }
@@ -86,19 +88,21 @@ impl PropagateThreadDeath {
 	pub fn new(death_signal: i32) -> Result<Self> {
 		Ok(Self {
 			death_signal: Signal::try_from(death_signal)?,
+			spawning_thread: SpawningThread::default(),
 		})
 	}
 }
 
 impl CommandWrapper for PropagateThreadDeath {
 	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
-		// Built here, on the thread which spawns the child.
-		let hook = thread_death_hook(self.death_signal);
-
-		#[expect(unsafe_code)]
-		// SAFETY: the hook is sound to run between `fork()` and `exec()`; see `thread_death_hook`.
-		unsafe {
-			command.pre_exec(hook);
+		// Called on the thread which spawns the child, as `spawn()` forks right after this.
+		if let Some(hook) = self.spawning_thread.prepare(self.death_signal) {
+			#[expect(unsafe_code)]
+			// SAFETY: the hook is sound to run between `fork()` and `exec()`; see
+			// `thread_death_hook`.
+			unsafe {
+				command.pre_exec(hook);
+			}
 		}
 
 		Ok(())
