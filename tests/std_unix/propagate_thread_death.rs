@@ -53,3 +53,48 @@ fn propagate_thread_death() -> std::result::Result<(), Box<dyn Error>> {
 	wait_for_exit(dead_pid)?;
 	Ok(())
 }
+
+#[test]
+fn reuse_from_another_thread() -> std::result::Result<(), Box<dyn Error>> {
+	let mut command = CommandWrap::with_new("yes", |cmd| {
+		cmd.stderr(Stdio::null()).stdout(Stdio::null());
+	});
+	command.wrap(PropagateThreadDeath::default());
+
+	let (command, first_pid) = thread::spawn(move || {
+		let child = command.spawn()?;
+		Ok::<_, io::Error>((command, child.id()))
+	})
+	.join()
+	.expect("Thread panicked")?;
+	wait_for_exit(i32::try_from(first_pid).expect("Failed to fit pid into i32"))?;
+
+	// The first spawning thread has exited: a check left over from it would fail this spawn.
+	let mut command = command;
+	let mut child = command.spawn()?;
+	child.kill()?;
+	Ok(())
+}
+
+#[test]
+fn custom_signal() -> std::result::Result<(), Box<dyn Error>> {
+	// The child ignores SIGTERM, the default, so only the requested SIGKILL ends it.
+	let handle = thread::spawn(|| {
+		let mut child = CommandWrap::with_new("sh", |cmd| {
+			cmd.args(["-c", "trap '' TERM; echo ready; exec sleep 30"])
+				.stdout(Stdio::piped());
+		})
+		.wrap(PropagateThreadDeath::new(Signal::SIGKILL as _)?)
+		.spawn()?;
+		let mut line = String::new();
+		BufReader::new(child.stdout().take().expect("stdout is piped")).read_line(&mut line)?;
+		assert_eq!(line, "ready\n");
+		Ok::<_, io::Error>(child.id())
+	});
+	let dead_pid = handle
+		.join()
+		.expect("Thread panicked")
+		.expect("Thread failed to spawn");
+	wait_for_exit(i32::try_from(dead_pid).expect("Failed to fit pid into i32"))?;
+	Ok(())
+}

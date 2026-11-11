@@ -28,6 +28,9 @@ pub use process_group::{ProcessGroup, ProcessGroupChild};
 #[cfg(all(unix, feature = "process-session"))]
 #[doc(inline)]
 pub use process_session::ProcessSession;
+#[cfg(all(feature = "propagate-thread-death", target_os = "linux"))]
+#[doc(inline)]
+pub use propagate_thread_death::PropagateThreadDeath;
 #[cfg(all(unix, feature = "reset-sigmask"))]
 #[doc(inline)]
 pub use reset_sigmask::ResetSigmask;
@@ -43,5 +46,7 @@ mod kill_on_drop;
 mod process_group;
 #[cfg(all(unix, feature = "process-session"))]
 mod process_session;
+#[cfg(all(feature = "propagate-thread-death", target_os = "linux"))]
+mod propagate_thread_death;
 #[cfg(all(unix, feature = "reset-sigmask"))]
 mod reset_sigmask;

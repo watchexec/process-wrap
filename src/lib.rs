@@ -552,6 +552,13 @@ pub mod std;
 pub mod tokio;
 
 #[cfg(all(
+	target_os = "linux",
+	feature = "propagate-thread-death",
+	any(feature = "std", feature = "tokio1")
+))]
+mod linux;
+
+#[cfg(all(
 	windows,
 	feature = "job-object",
 	any(feature = "std", feature = "tokio1")

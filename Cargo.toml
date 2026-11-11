@@ -34,6 +34,7 @@ tracing = { version = "0.1.40", optional = true }
 nix = { version = "0.31.3", default-features = false, features = [
 	"fs",
 	"poll",
+	"process",
 	"signal",
 ], optional = true }
 # note: bumping the nix version doesn't require a breaking change,
