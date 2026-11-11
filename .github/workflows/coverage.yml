@@ -6,12 +6,12 @@ on:
     branches:
       - main
 
-# GitHub code coverage: each job writes a Cobertura report and uploads it, and the
-# github-code-quality bot posts a summary on the pull request. This needs Code Quality enabled for
-# the repository.
+# Each platform uploads its report to Codecov under its own flag, and Codecov merges them: much of
+# the crate only runs on one platform. Uploads authenticate with OIDC, so there's no token secret;
+# this needs the Codecov app installed for the repository.
 permissions:
   contents: read
-  code-quality: write
+  id-token: write
 
 concurrency:
   group: coverage-${{ github.ref || github.run_id }}
@@ -49,13 +49,11 @@ jobs:
       - run: tests/multiproc_helper.rs 1 1
 
       - name: Measure coverage
-        run: cargo llvm-cov --locked --all-features --all-targets --cobertura --output-path cobertura.xml
+        run: cargo llvm-cov --locked --all-features --all-targets --lcov --output-path lcov.info
 
-      - uses: actions/upload-code-coverage@2b21a77928be8d5168c2b9581a67f2adbebacc52 # v1.4.4
-        # Reporting coverage doesn't gate the change, and the upload can fail after its work is
-        # done: it polls for processing with no retry, so a dropped connection fails the step.
-        continue-on-error: true
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
-          file: cobertura.xml
-          language: Rust
-          label: code-coverage/${{ matrix.platform }}
+          files: lcov.info
+          disable_search: true
+          flags: ${{ matrix.platform }}
+          use_oidc: true

@@ -1,0 +1,5 @@
+# Each platform's report carries a flag; keep a platform's last report when a run lacks it, so the
+# merged total doesn't drop when one platform's job fails.
+flag_management:
+  default_rules:
+    carryforward: true
