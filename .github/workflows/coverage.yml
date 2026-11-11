@@ -1,0 +1,61 @@
+name: Coverage
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# GitHub code coverage: each job writes a Cobertura report and uploads it, and the
+# github-code-quality bot posts a summary on the pull request. This needs Code Quality enabled for
+# the repository.
+permissions:
+  contents: read
+  code-quality: write
+
+concurrency:
+  group: coverage-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - macos
+          - ubuntu
+          - windows
+
+    name: "Coverage on ${{ matrix.platform }}"
+    runs-on: "${{ matrix.platform }}-latest"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update nightly
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+          rustup component add llvm-tools-preview
+
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-llvm-cov
+
+      - run: tests/multiproc_helper.rs 1 1
+
+      - name: Measure coverage
+        run: cargo llvm-cov --locked --all-features --all-targets --cobertura --output-path cobertura.xml
+
+      - uses: actions/upload-code-coverage@2b21a77928be8d5168c2b9581a67f2adbebacc52 # v1.4.4
+        # Reporting coverage doesn't gate the change, and the upload can fail after its work is
+        # done: it polls for processing with no retry, so a dropped connection fails the step.
+        continue-on-error: true
+        with:
+          file: cobertura.xml
+          language: Rust
+          label: code-coverage/${{ matrix.platform }}
