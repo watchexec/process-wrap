@@ -42,18 +42,18 @@ use crate::linux::thread_death_hook;
 /// use nix::sys::signal::SIGKILL;
 ///
 /// let mut command = CommandWrap::with_new("ls", |_cmd| {});
-/// command.wrap(PropagateThreadDeath::new(Some(SIGKILL as _))?);
+/// command.wrap(PropagateThreadDeath::new(SIGKILL as _)?);
 /// # Ok::<(), std::io::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct PropagateThreadDeath {
-	death_signal: Option<Signal>,
+	death_signal: Signal,
 }
 
 impl Default for PropagateThreadDeath {
 	fn default() -> Self {
 		Self {
-			death_signal: Some(nix::sys::signal::SIGTERM),
+			death_signal: Signal::SIGTERM,
 		}
 	}
 }
@@ -61,9 +61,12 @@ impl Default for PropagateThreadDeath {
 impl PropagateThreadDeath {
 	/// Creates a new [`Self`] with a custom signal to send to the child process.
 	/// This overrides the default `SIGTERM` signal.
-	pub fn new(death_signal: Option<i32>) -> Result<Self> {
-		let death_signal = death_signal.map(Signal::try_from).transpose()?;
-		Ok(Self { death_signal })
+	///
+	/// Fails if `death_signal` isn't a valid signal number.
+	pub fn new(death_signal: i32) -> Result<Self> {
+		Ok(Self {
+			death_signal: Signal::try_from(death_signal)?,
+		})
 	}
 }
 

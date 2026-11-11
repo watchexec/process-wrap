@@ -21,14 +21,14 @@ use nix::sys::signal::Signal;
 ///     and does not allocate;
 ///   * it cannot panic: the error paths return `Err` rather than unwinding.
 pub(crate) fn thread_death_hook(
-	death_signal: Option<Signal>,
+	death_signal: Signal,
 ) -> impl FnMut() -> Result<()> + Send + Sync + 'static {
 	let parent_tgid = nix::unistd::getpid().as_raw();
 	let parent_tid = nix::unistd::gettid().as_raw();
 
 	move || {
 		// Tie the child to the parent: request the death signal when the parent thread dies.
-		nix::sys::prctl::set_pdeathsig(death_signal).map_err(Error::from)?;
+		nix::sys::prctl::set_pdeathsig(Some(death_signal)).map_err(Error::from)?;
 
 		// The spawning *thread* may have exited between fork and prctl, in which
 		// case the kernel never queued our death signal. Signal 0 delivers nothing and
