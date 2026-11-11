@@ -21,6 +21,8 @@ mod job_handle;
 #[cfg(feature = "job-object")]
 mod job_wait;
 mod kill_and_try_wait;
+#[cfg(feature = "kill-on-drop")]
+mod kill_on_drop;
 #[cfg(feature = "job-object")]
 mod process_handle;
 mod try_wait_after_die;

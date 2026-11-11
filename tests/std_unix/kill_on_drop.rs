@@ -16,3 +16,19 @@ fn kill_on_drop() -> Result<()> {
 	}
 	Ok(())
 }
+
+#[test]
+fn into_inner_disarms() -> Result<()> {
+	let child = CommandWrap::with_new("yes", |cmd| {
+		cmd.stderr(Stdio::null()).stdout(Stdio::null());
+	})
+	.wrap(KillOnDrop)
+	.spawn()?;
+	let pid = Pid::try_from(child.id()).expect("Failed to fit pid");
+
+	let mut inner = child.into_inner();
+	assert!(pid_alive(pid), "unwrapping the child must not kill it");
+
+	inner.kill()?;
+	Ok(())
+}
