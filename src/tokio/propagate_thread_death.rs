@@ -22,6 +22,10 @@ use crate::linux::thread_death_hook;
 /// So outside of `spawn_blocking` and `block_in_place`, the child is signalled when the runtime
 /// shuts down or the process dies, including when it is killed and can't clean up after itself.
 ///
+/// For control over which thread the child is tied to, use the std frontend's
+/// `PropagateThreadDeath` instead, and spawn the child from a thread you manage. The `std` and
+/// `tokio1` features can be enabled together.
+///
 /// # Caveats
 /// - The setting is not inherited by grandchildren, is cleared when the child
 ///   execs a setuid/setgid or file-capability binary, and the default signal `SIGTERM` can be
