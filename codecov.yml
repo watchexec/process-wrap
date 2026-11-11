@@ -3,3 +3,15 @@
 flag_management:
   default_rules:
     carryforward: true
+
+coverage:
+  status:
+    # Small drops come and go with which code a change moves around.
+    project:
+      default:
+        threshold: 0.5%
+    # Code in pre_exec hooks runs in the forked child, which execs before it can write its
+    # coverage, so a change to a hook never shows as covered: report patch coverage, don't gate on it.
+    patch:
+      default:
+        informational: true
