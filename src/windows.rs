@@ -13,7 +13,9 @@ use std::{
 use tracing::{debug, instrument};
 use windows::{
 	Win32::{
-		Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
+		Foundation::{
+			CloseHandle, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+		},
 		System::{
 			Diagnostics::ToolHelp::{
 				CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
@@ -312,7 +314,9 @@ pub(crate) fn resume_threads(child_process: HANDLE) -> Result<()> {
 		if resumed {
 			Ok(())
 		} else {
-			Err(Error::other("no suspended thread belonging to the child was resumed"))
+			Err(Error::other(
+				"no suspended thread belonging to the child was resumed",
+			))
 		}
 	}
 
