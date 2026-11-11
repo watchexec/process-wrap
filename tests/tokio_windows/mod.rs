@@ -19,6 +19,8 @@ mod into_inner_write_stdin;
 mod job_handle;
 #[cfg(all(feature = "job-object", feature = "kill-on-drop"))]
 mod job_object_kill_on_drop;
+#[cfg(feature = "job-object")]
+mod job_wait;
 mod kill_and_try_wait;
 #[cfg(feature = "job-object")]
 mod process_handle;

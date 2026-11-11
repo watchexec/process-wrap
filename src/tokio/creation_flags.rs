@@ -15,7 +15,7 @@ use crate::windows::job_creation_flags;
 /// This wrapper is only available on Windows.
 ///
 /// It exists to be able to set creation flags on a [`Command`] and also store them in the wrapper, so
-/// that they're no overwritten by other wrappers. Notably this is the only way to use creation
+/// that they're not overwritten by other wrappers. Notably this is the only way to use creation
 /// flags and the `JobObject` wrapper together.
 ///
 /// When both [`CreationFlags`] and `JobObject` are used, process-wrap preserves these flags while
