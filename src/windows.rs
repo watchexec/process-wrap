@@ -236,24 +236,23 @@ pub(crate) fn make_job_object(process_handle: HANDLE, kill_on_drop: bool) -> Res
 		"done SetInformationJobObject(completion)"
 	);
 
-	let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-
 	if kill_on_drop {
+		let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
 		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-	}
 
-	unsafe {
-		SetInformationJobObject(
-			job.0,
-			JobObjectExtendedLimitInformation,
-			&info as *const _ as _,
-			std::mem::size_of_val(&info)
-				.try_into()
-				.expect("cannot safely cast to DWORD"),
-		)
-	}?;
-	#[cfg(feature = "tracing")]
-	debug!(?info, "done SetInformationJobObject(limit)");
+		unsafe {
+			SetInformationJobObject(
+				job.0,
+				JobObjectExtendedLimitInformation,
+				&info as *const _ as _,
+				std::mem::size_of_val(&info)
+					.try_into()
+					.expect("cannot safely cast to DWORD"),
+			)
+		}?;
+		#[cfg(feature = "tracing")]
+		debug!(?info, "done SetInformationJobObject(limit)");
+	}
 
 	unsafe { AssignProcessToJobObject(job.0, process_handle) }?;
 	#[cfg(feature = "tracing")]
