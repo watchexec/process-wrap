@@ -1,0 +1,59 @@
+name: Coverage
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Each platform uploads its report to Codecov under its own flag, and Codecov merges them: much of
+# the crate only runs on one platform. Uploads authenticate with OIDC, so there's no token secret;
+# this needs the Codecov app installed for the repository.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: coverage-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - macos
+          - ubuntu
+          - windows
+
+    name: "Coverage on ${{ matrix.platform }}"
+    runs-on: "${{ matrix.platform }}-latest"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure Rust
+        run: |
+          rustup toolchain install --profile minimal --no-self-update nightly
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+          rustup component add llvm-tools-preview
+
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-llvm-cov
+
+      - run: tests/multiproc_helper.rs 1 1
+
+      - name: Measure coverage
+        run: cargo llvm-cov --locked --all-features --all-targets --lcov --output-path lcov.info
+
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: lcov.info
+          disable_search: true
+          flags: ${{ matrix.platform }}
+          use_oidc: true
