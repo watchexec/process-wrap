@@ -24,6 +24,7 @@ mod kill_on_drop;
 mod multiproc_linux;
 mod propagate_thread_death;
 mod signals;
+mod spawn_twice;
 mod try_wait_after_die;
 mod try_wait_twice_after_sigterm;
 mod wait_after_die;
