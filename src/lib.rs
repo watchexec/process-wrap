@@ -36,7 +36,7 @@
 //!
 //! # Usage
 //!
-//! The core API is [`CommandWrap`](std::CommandWrap) and [`CommandWrap`](tokio::CommandWrap),
+//! The core API is [`CommandWrap`][std-CommandWrap] and [`CommandWrap`][tokio-CommandWrap],
 //! which can be constructed either directly from an existing `process::Command`:
 //!
 #![cfg_attr(not(feature = "std"), doc = "```ignore")]
@@ -131,8 +131,8 @@
 //! underlying APIs. Of course you can (and should) re-use/share code wherever possible if
 //! implementing both.
 //!
-//! At minimum, you must implement [`CommandWrapper`](crate::std::CommandWrapper) and/or
-//! [`CommandWrapper`](crate::tokio::CommandWrapper). These provide the same functionality
+//! At minimum, you must implement [`CommandWrapper`][std-CommandWrapper] and/or
+//! [`CommandWrapper`][tokio-CommandWrapper]. These provide the same functionality
 //! (and indeed internally are generated using a common macro), but differ in the exact types used.
 //! Here's the most basic impl (shown for Tokio):
 //!
@@ -491,6 +491,53 @@
 //! - `reset-sigmask`: enables the sigmask reset wrapper (Unix-only).
 //! - `propagate-thread-death`: enables the propagate thread death wrapper (Linux-only).
 //!
+//!
+// Links to items of a frontend which may not be enabled: to docs.rs when it isn't.
+#![cfg_attr(feature = "std", doc = "[std-CommandWrap]: crate::std::CommandWrap")]
+#![cfg_attr(
+	not(feature = "std"),
+	doc = concat!(
+		"[std-CommandWrap]: https://docs.rs/process-wrap/",
+		env!("CARGO_PKG_VERSION"),
+		"/process_wrap/std/struct.CommandWrap.html"
+	)
+)]
+#![cfg_attr(
+	feature = "std",
+	doc = "[std-CommandWrapper]: crate::std::CommandWrapper"
+)]
+#![cfg_attr(
+	not(feature = "std"),
+	doc = concat!(
+		"[std-CommandWrapper]: https://docs.rs/process-wrap/",
+		env!("CARGO_PKG_VERSION"),
+		"/process_wrap/std/trait.CommandWrapper.html"
+	)
+)]
+#![cfg_attr(
+	feature = "tokio1",
+	doc = "[tokio-CommandWrap]: crate::tokio::CommandWrap"
+)]
+#![cfg_attr(
+	not(feature = "tokio1"),
+	doc = concat!(
+		"[tokio-CommandWrap]: https://docs.rs/process-wrap/",
+		env!("CARGO_PKG_VERSION"),
+		"/process_wrap/tokio/struct.CommandWrap.html"
+	)
+)]
+#![cfg_attr(
+	feature = "tokio1",
+	doc = "[tokio-CommandWrapper]: crate::tokio::CommandWrapper"
+)]
+#![cfg_attr(
+	not(feature = "tokio1"),
+	doc = concat!(
+		"[tokio-CommandWrapper]: https://docs.rs/process-wrap/",
+		env!("CARGO_PKG_VERSION"),
+		"/process_wrap/tokio/trait.CommandWrapper.html"
+	)
+)]
 #![doc(html_favicon_url = "https://watchexec.github.io/logo:command-group.svg")]
 #![doc(html_logo_url = "https://watchexec.github.io/logo:command-group.svg")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
