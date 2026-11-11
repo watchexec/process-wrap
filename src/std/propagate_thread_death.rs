@@ -14,6 +14,9 @@ use crate::linux::SpawningThread;
 /// - The setting is not inherited by grandchildren, is cleared when the child
 ///   execs a setuid/setgid or file-capability binary, and the default signal `SIGTERM` can be
 ///   caught or ignored by the child.
+/// - The wrapper installs its `pre_exec` hook on the command at the first spawn, and reuses it for
+///   later spawns. Replacing the command through `CommandWrap::command_mut()` after that drops the
+///   hook.
 ///
 /// # Examples
 ///

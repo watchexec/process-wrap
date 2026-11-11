@@ -245,8 +245,9 @@ let dead_pid = handle
 ```
 
 The signal is sent when the thread that spawned the child exits, or the whole process does.
-With Tokio, that's the runtime thread which called `spawn()`, so usually when the runtime shuts down;
-see the Tokio wrapper's documentation for `spawn_blocking` and `block_in_place`, where it's sooner.
+With Tokio, that's whichever runtime thread calls `spawn()`: a worker thread of a
+multi-thread runtime exits when the runtime shuts down, but the thread calling `block_on` keeps
+running after it. See the Tokio wrapper's documentation for the other cases.
 For control over which thread the child is tied to, use the std wrapper from a thread you manage;
 both frontends can be enabled together.
 

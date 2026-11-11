@@ -11,16 +11,17 @@ use crate::linux::SpawningThread;
 ///
 /// This wrapper is only available on Linux.
 ///
-/// The child is tied to whichever thread calls `spawn()`, which under Tokio is a runtime thread:
-/// - from a task on a multi-thread runtime, a worker thread, which lives as long as the runtime;
-/// - from a current-thread runtime, the thread that runs it;
+/// The child is tied to whichever thread calls `spawn()`, and signalled when that thread exits or
+/// the process dies, including when it is killed and can't clean up after itself. Under Tokio,
+/// that thread is:
+/// - from a task spawned onto a multi-thread runtime, one of its worker threads, which exit when the
+///   runtime shuts down;
+/// - from the future passed to `block_on`, and from any task of a current-thread runtime, the
+///   thread which called `block_on`, which keeps running after the runtime is dropped;
 /// - from [`spawn_blocking`](tokio::task::spawn_blocking), a blocking pool thread, which the pool
-///   retires once it has been idle for a while (10 seconds by default), signalling the child then;
+///   retires once it has been idle for a while (10 seconds by default);
 /// - from [`block_in_place`](https://docs.rs/tokio/1/tokio/task/fn.block_in_place.html), a worker
 ///   thread which may move to the blocking pool afterwards, and be retired like one.
-///
-/// So outside of `spawn_blocking` and `block_in_place`, the child is signalled when the runtime
-/// shuts down or the process dies, including when it is killed and can't clean up after itself.
 ///
 /// For control over which thread the child is tied to, use the std frontend's
 /// `PropagateThreadDeath` instead, and spawn the child from a thread you manage. The `std` and
@@ -30,6 +31,9 @@ use crate::linux::SpawningThread;
 /// - The setting is not inherited by grandchildren, is cleared when the child
 ///   execs a setuid/setgid or file-capability binary, and the default signal `SIGTERM` can be
 ///   caught or ignored by the child.
+/// - The wrapper installs its `pre_exec` hook on the command at the first spawn, and reuses it for
+///   later spawns. Replacing the command through `CommandWrap::command_mut()` after that drops the
+///   hook.
 ///
 /// # Examples
 ///
