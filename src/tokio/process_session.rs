@@ -1,6 +1,9 @@
 use std::io::{Error, Result};
 
-use nix::unistd::{Pid, setsid};
+use nix::{
+	errno::Errno,
+	unistd::{Pid, getpid, getsid, setsid},
+};
 use tokio::process::Command;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
@@ -35,7 +38,13 @@ impl CommandWrapper for ProcessSession {
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn pre_spawn(&mut self, command: &mut Command, _core: &CommandWrap) -> Result<()> {
 		unsafe {
-			command.pre_exec(|| setsid().map_err(Error::from).map(|_| ()));
+			command.pre_exec(|| match setsid() {
+				Ok(_) => Ok(()),
+				// A command keeps its `pre_exec` hooks, so a command spawned again runs this once
+				// per spawn so far: after the first, the child already leads its session.
+				Err(Errno::EPERM) if getsid(None) == Ok(getpid()) => Ok(()),
+				Err(err) => Err(Error::from(err)),
+			});
 		}
 
 		Ok(())
