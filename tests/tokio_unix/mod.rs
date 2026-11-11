@@ -18,6 +18,7 @@ mod inner_read_stdout;
 mod into_inner_write_stdin;
 mod kill_and_try_wait;
 mod multiproc_linux;
+mod propagate_thread_death;
 mod signals;
 mod try_wait_after_die;
 mod try_wait_twice_after_sigterm;
