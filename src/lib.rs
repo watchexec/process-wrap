@@ -4,7 +4,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! process-wrap = { version = "10.0.1", features = ["std"] }
+//! process-wrap = { version = "11.0.0", features = ["std"] }
 //! ```
 //!
 #![cfg_attr(not(feature = "std"), doc = "```ignore")]

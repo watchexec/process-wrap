@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 ---
+## [11.0.0](https://github.com/watchexec/process-wrap/compare/v10.0.2..v11.0.0) - 2026-11-24
+
+
+- **Deps:** Bump MSRV to 1.88 - ([889a600](https://github.com/watchexec/process-wrap/commit/889a6002ccc8d73674b702f4a98d096a64189267))
+- **Deps:** Update the lockfile - ([d6649ec](https://github.com/watchexec/process-wrap/commit/d6649ec296ce51dfc14fee226f8d2e221200c0d3))
+- **Deps:** Update all dependencies, bump MSRV to 1.88 (#79) - ([ff2ab66](https://github.com/watchexec/process-wrap/commit/ff2ab66480a8977073c65aa90c3437bcb60e0e47))
+- **Deps:** Bump nix from 0.31.3 to 0.32.0 in the cargo group - ([d5c1eb6](https://github.com/watchexec/process-wrap/commit/d5c1eb6ef5fbe4dcf93d42c57d45e3fb8a585d61))
+- **Deps:** Bump nix from 0.31.3 to 0.32.0 in the cargo group (#86) - ([eadd4b8](https://github.com/watchexec/process-wrap/commit/eadd4b867774514015fadfe23a48b9542f7e7869))
+- **Documentation:** Fix `DETACHED_PROCESS` in the example. (#66) - ([b0e2d0c](https://github.com/watchexec/process-wrap/commit/b0e2d0c437fa520d9b9b1e80b27c0655fdd48fb5))
+- **Documentation:** Build crate docs with only one frontend enabled - ([51e3c63](https://github.com/watchexec/process-wrap/commit/51e3c63f65a70edd52e5834c1787a55ebe469d0e))
+- **Documentation:** Build crate docs with only one frontend enabled (#78) - ([52648b3](https://github.com/watchexec/process-wrap/commit/52648b3fc3b9b67c1c6aac284f2b7bc9392af9bc))
+- **Feature:** Add std PropagateThreadDeath and std KillOnDrop support. (#69) - ([4764ac6](https://github.com/watchexec/process-wrap/commit/4764ac6741f7296d69cc973202ca25dd572c9061))
+- **Style:** Rustfmt - ([6148fa3](https://github.com/watchexec/process-wrap/commit/6148fa32ba484d25a1d7ff5a56e2ea0d2d57a55f))
+- **Test:** Spawn the same command twice with each Unix wrapper - ([d5faf63](https://github.com/watchexec/process-wrap/commit/d5faf633740e6677b3289aa7e56f72fdd8ac15f2))
+- **Test:** Cover untested wrapper behaviour (#83) - ([2f4bc39](https://github.com/watchexec/process-wrap/commit/2f4bc393d8bd03b4b1c81fee2e13ce82dd42906e))
+
+### Creation-flags
+
+- **Documentation:** Fix typo - ([8e475cd](https://github.com/watchexec/process-wrap/commit/8e475cd78f9f038d7c97b5e7a9df291a74ffe737))
+- **Test:** Pass flags through unchanged without JobObject - ([55f67c3](https://github.com/watchexec/process-wrap/commit/55f67c34021ade113abfd2e10d723c3f6f7399b0))
+
+### Deps
+
+- **Bugfix:** Drop redundant homepage, make indexmap optional - ([250e189](https://github.com/watchexec/process-wrap/commit/250e189d7479bd6d6aa6f624572acdf2c2105fe7))
+- **Bugfix:** Don't enable tracing by default - ([2d88eef](https://github.com/watchexec/process-wrap/commit/2d88eef7f3c2e9e9409f8e9f89c87c2dc1288589))
+
+### Job-object
+
+- **Bugfix:** Wait until every process in the job has exited - ([f460a7f](https://github.com/watchexec/process-wrap/commit/f460a7fe1cb57f945ca4211b410105250886fcfc))
+- **Bugfix:** Only count a thread as resumed once it runs - ([f860581](https://github.com/watchexec/process-wrap/commit/f8605818689849eed29df015d8bf4d69e867730c))
+- **Bugfix:** Wait until every process in the job has exited (#76) - ([ccb5885](https://github.com/watchexec/process-wrap/commit/ccb58857b0bad6e3d8b85b7c9041bd407aa4cd1b))
+- **Refactor:** Only set job limits when there are some - ([1c37063](https://github.com/watchexec/process-wrap/commit/1c37063f1013a92f64305cb7388d4a1852fb28c8))
+- **Test:** Wait for descendants that outlive the leader - ([695e2ae](https://github.com/watchexec/process-wrap/commit/695e2ae80812351096c5a512796420bbda93ff73))
+- **Test:** Exit the helper before the harness writes to a closed pipe - ([5089b55](https://github.com/watchexec/process-wrap/commit/5089b5551c835d87368bcc8ddae3c1c834815ff8))
+
+### Kill-on-drop
+
+- **Test:** Run the Windows test, and check into_inner disarms it - ([d95b322](https://github.com/watchexec/process-wrap/commit/d95b32217049cebf5bcf50cf6c9a9f72ce34f4d0))
+- **Test:** Check the unwrapped child is running through try_wait - ([49a603b](https://github.com/watchexec/process-wrap/commit/49a603bc16def12c8a2db0819dfc382535cd7f39))
+- **Test:** Check the dropped child is gone through kill(pid, 0) - ([5d60015](https://github.com/watchexec/process-wrap/commit/5d600150760661b33c06fc375126d6029f3889ed))
+
+### Process-group
+
+- **Test:** Attach to a leader's group, and read its pgid - ([33c0fe5](https://github.com/watchexec/process-wrap/commit/33c0fe5c20a8f2bbc97d3faa783a1eaca27b2da0))
+
+### Process-session
+
+- **Bugfix:** Spawn the same command more than once - ([a64e7a9](https://github.com/watchexec/process-wrap/commit/a64e7a911045f792853ce0d0da92aa62bf0e7818))
+- **Bugfix:** Spawn the same command more than once (#80) - ([97e4c6d](https://github.com/watchexec/process-wrap/commit/97e4c6d96c85bfa1c14bd7ff815c43d14944c548))
+
+### Propagate-thread-death
+
+- **Bugfix:** Install one hook per command - ([c4fe68d](https://github.com/watchexec/process-wrap/commit/c4fe68dbd2c95f5283cba6876f3cb27495af5b6b))
+- **Documentation:** Describe the Tokio thread semantics, fix prctl typo - ([f6e9a26](https://github.com/watchexec/process-wrap/commit/f6e9a266af3da1b09b481727ca0f1c6f3851d0db))
+- **Documentation:** Point to the std wrapper for control over the thread - ([a1227d3](https://github.com/watchexec/process-wrap/commit/a1227d389f8d44f336a5459716dbb06ed2b7ee6c))
+- **Documentation:** Correct which thread a Tokio child is tied to - ([b6b4ff9](https://github.com/watchexec/process-wrap/commit/b6b4ff98ed2cff75ab3bb309c42ff1d239d7da58))
+- **Feature:** Take a plain signal number in new() - ([b499629](https://github.com/watchexec/process-wrap/commit/b499629625aba1a2bb24255262af59cb2f844fb8))
+- **Refactor:** Move the pre_exec hook to a shared module - ([3083dd4](https://github.com/watchexec/process-wrap/commit/3083dd46dc3b2c4c93fd007ce86460556c40710e))
+- **Test:** Reuse a command after its spawning thread exits - ([a6fccc1](https://github.com/watchexec/process-wrap/commit/a6fccc163f6b58a60be6b373c8e82c496c6b8002))
+- **Test:** Deliver a custom death signal - ([59b585a](https://github.com/watchexec/process-wrap/commit/59b585ac7c78a0ee09ecfdac1f770ad1a534a06c))
+
+### Reset-sigmask
+
+- **Test:** Check the child's blocked signals are cleared - ([370de6a](https://github.com/watchexec/process-wrap/commit/370de6a9be6e3bffdf5753b9c64cd7c0ea14cc9c))
+
+### Std
+
+- **Test:** Wait_with_output with stderr, and with both streams beyond a pipe's buffer - ([3b2909e](https://github.com/watchexec/process-wrap/commit/3b2909e24f057b46e6837ad7483961549585e46b))
+
+### Tokio
+
+- **Feature:** Add PropagateThreadDeath - ([69b0dc3](https://github.com/watchexec/process-wrap/commit/69b0dc3e20afb471438f7d7e01b95316edbb8d4f))
+- **Feature:** Add PropagateThreadDeath (#77) - ([e8647dd](https://github.com/watchexec/process-wrap/commit/e8647dd8f12c0eae424cac797bbc39a57b03bb37))
+
+### Windows
+
+- **Feature:** Add shareable job handles to JobObjectChild - ([cd75359](https://github.com/watchexec/process-wrap/commit/cd75359ecdab0f6a788da4792ac5bea65765f49c))
+- **Feature:** Add shareable job handles to JobObjectChild (#68) - ([33dd928](https://github.com/watchexec/process-wrap/commit/33dd9288cdd5c3d2b4f024bfad1ebc10c156975c))
+
+---
 ## [10.0.1](https://github.com/watchexec/process-wrap/compare/v10.0.0..v10.0.1) - 2026-09-23
 
 
